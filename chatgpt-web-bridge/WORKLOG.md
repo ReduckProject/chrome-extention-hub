@@ -48,3 +48,13 @@
 - 将安装说明改为相对子项目目录和可配置绝对路径；将本机验收文档整理为可入库摘要。
 - 本机 runtime、认证配置、聊天记录、图片、日志和 node_modules 不提交。当前已安装实例继续使用原运行配置，本次入库不自动迁移 Chrome 已加载目录。
 - 在新目录通过 npm ci 安装锁定依赖，运行既有测试，检查将提交的文件，再建立 main 分支初始提交并关联 origin。
+
+## 重新加载后的测试与图片加载修补 — 2026-09-09
+
+- 用户确认重新加载扩展，要求验证切模型、新聊天、生图、进度和下载。以新连接创建独立空白聊天，通过实际 MCP SDK/stdio 执行全部步骤。
+- GPT-5.6 Sol 和 GPT-5.5 两次切换均确认选中；发送一个相机测试图，观察 generating、finalizing 和 completed，最终下载、哈希匹配、解码和查看均通过。
+- 诊断记录显示图片在后台 tab 中为 loading:lazy、loadState:pending、naturalWidth/Height:0，但回答结束控件已出现。这会阻止原先的完成条件。
+- extension/adapter.js 版本 18 增加 loadState/loading 观测，并在最新回答已结束时启动尚未加载的同源 lazy 图片。旧回答、外域图片和仍在生成中的图片不会被该处理改动；不把 pending 图片伪装成 loaded。
+- 新增一项对应的行为回归测试。使用 setAttribute 更新 loading，兼容测试 DOM 与真实浏览器的属性反映差异；32/32 测试通过。
+- npm run setup 更新安装目录，refresh_observers 更新现有页面，无需再次让用户重新加载整个扩展。没有更改 MCP/Skill 的用户级注册位置。
+- 更详细的本次测试数据和生成图仍只保留在本机 artifacts，Git 中记录可公开的结果摘要。整体等待含诊断过程，不用于声称生图性能改善。

@@ -1,5 +1,5 @@
 (() => {
-  const adapterVersion = 15;
+  const adapterVersion = 18;
   if (globalThis.ChatGPTBridgeAdapter?.version === adapterVersion) return;
   const doc = document;
   const normalize = value => String(value || '').replace(/\r\n/g, '\n').trim();
@@ -56,15 +56,27 @@
     else if (thinking || statusNodes.some(n => n.getAttribute('aria-busy') === 'true')) activity = 'thinking';
     else if (input && !input.disabled && input.getAttribute('aria-disabled') !== 'true') activity = 'idle';
     const lastId = messageId(last);
-    const images = imageElements(turnRoot(last)).map((img, index) => ({
-      key: `${lastId || assistants.length}:${index}:${fingerprint(img.currentSrc || img.src)}`,
-      loaded: !!img.complete && img.naturalWidth >= 256 && img.naturalHeight >= 256,
-      width: img.naturalWidth, height: img.naturalHeight, alt: normalize(img.alt).slice(0, 200),
-      source: 'rendered_image', originalDownloadVerified: false,
-    }));
     const actionRoot = turnRoot(last);
     const finalActions = !!actionRoot && buttons(actionRoot).some(n =>
       /^(copy( response| message)?|复制(回答|回复|消息)?|good response|bad response|回答不错|回答不好|download( image| original| file)?|下载(此图片|图片|原图|文件)?)$/i.test(label(n)));
+    const imageNodes = imageElements(actionRoot);
+    if (activity === 'idle' && finalActions) for (const img of imageNodes) {
+      const source = img.currentSrc || img.getAttribute('src');
+      // Background tabs may never intersect a lazy image with the viewport. Start
+      // loading the observed completed-turn asset without claiming it has decoded.
+      if (img.getAttribute('loading') === 'lazy' && !img.complete && source) {
+        try { if (new URL(source, location.href).origin === location.origin) img.setAttribute('loading', 'eager'); }
+        catch { /* Leave malformed page URLs for the normal image error state. */ }
+      }
+    }
+    const images = imageNodes.map((img, index) => ({
+      key: `${lastId || assistants.length}:${index}:${fingerprint(img.currentSrc || img.src)}`,
+      loaded: !!img.complete && img.naturalWidth >= 256 && img.naturalHeight >= 256,
+      loadState: img.complete ? (img.naturalWidth ? 'loaded' : 'error') : 'pending',
+      loading: img.getAttribute('loading') || 'auto',
+      width: img.naturalWidth, height: img.naturalHeight, alt: normalize(img.alt).slice(0, 200),
+      source: 'rendered_image', originalDownloadVerified: false,
+    }));
     return {
       url: location.href, title: doc.title, activity, model,
       attention: (attention || error || '').slice(0, 500) || null,

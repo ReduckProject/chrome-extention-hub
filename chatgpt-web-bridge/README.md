@@ -120,11 +120,13 @@ setup 生成 runtime/extension、固定扩展 ID、本机认证配置，不代�
 
 已有实例的源码可以独立纳入本仓库，当前安装不会自动迁移。迁移运行实例时需保留其 runtime 配置和状态；环境变量 CHATGPT_BRIDGE_RUNTIME 可指定现有 runtime 目录。Chrome 扩展仍从加载时的目录运行，重新加载前应保留该目录。每个实例的认证配置需与其本地服务一致。
 
-页面适配层更新后，npm run setup 和 node src/cli.mjs refresh_observers 可更新当前文档的观察器。修改 manifest 或 background 时需要在 Chrome 中重新加载扩展；本次 adapter 版本 15 已在实际页面读回。
+页面适配层更新后，npm run setup 和 node src/cli.mjs refresh_observers 可更新当前文档的观察器。修改 manifest 或 background 时需要在 Chrome 中重新加载扩展；当前 adapter 版本 18 已在实际页面读回。
 
 ## 验证范围与限制
 
-- 当前本机 Chrome 152、已登录 ChatGPT 中文页面、GPT-5.5 菜单、三 tab 文生图和原图获取已验证；60 次真实 MCP 状态查询及 31 个自动化测试通过。
+- 当前本机 Chrome 152、已登录 ChatGPT 中文页面、GPT-5.5 菜单、三 tab 文生图和原图获取已验证；初次验收完成 60 次真实 MCP 状态查询，当前 32 个自动化测试通过。
+- 重新加载扩展后，另行验证了 GPT-5.6 Sol → GPT-5.5 切换、新聊天、图片生成、阶段查询和原图下载。进度按 generating、finalizing、completed 等阶段返回，当前不提供生成百分比。
+- 完成回答中的同源图片如果仍处于 lazy/pending，会启动加载；只有浏览器实际加载成功才允许任务完成。原始图片观测含 loadState 和 loading，便于区分等待加载与加载失败。
 - 实际重启本地服务后约 619 ms 恢复五个 tab，期间返回 unknown，三个任务和下载哈希保留。
 - 完整 Chrome 重启会产生新的 browserSessionId，目前不把旧 run 自动绑定到新 tab。可查旧记录，继续操作前重新获取 tabKey，不用旧数字 ID 猜关联。
 - 网页改版可能需要更新 extension/adapter.js。图片编辑、附件、复杂研究模式、多 profile 并发和长期压力运行未纳入本次验收。

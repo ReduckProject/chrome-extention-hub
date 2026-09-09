@@ -84,3 +84,17 @@ test('retry reuses the matching image viewer and never clicks an unrelated save 
   assert.equal(openings, 0); adapter.clickDownload('image-run', 0);
   assert.equal(rightClicks, 1); assert.equal(wrongClicks, 0); dom.window.close();
 });
+
+test('completed response loads its pending same-origin lazy image without falsely marking completion', () => {
+  const { dom, adapter, document } = page('<article><div data-message-author-role="assistant" data-message-id="old"><img id="old-image" src="https://chatgpt.com/old.png" width="1254" height="1254" loading="lazy" alt="old"></div></article><section data-turn="assistant"><img id="pending-image" src="https://chatgpt.com/current.png" width="1254" height="1254" loading="lazy" alt="generated"><img id="external-image" src="https://example.org/image.png" width="1254" height="1254" loading="lazy" alt="external"><div data-message-author-role="assistant" data-message-id="current">Done</div><button aria-label="复制回复">Copy</button></section>');
+  const pending = document.querySelector('#pending-image');
+  const busy = document.createElement('button'); busy.dataset.testid = 'stop-button'; document.querySelector('form').append(busy);
+  adapter.snapshot(); assert.equal(pending.getAttribute('loading'), 'lazy');
+  busy.remove();
+  const status = adapter.snapshot();
+  assert.equal(pending.getAttribute('loading'), 'eager');
+  assert.equal(status.images[0].loaded, false); assert.equal(status.images[0].loadState, 'pending');
+  assert.equal(document.querySelector('#old-image').getAttribute('loading'), 'lazy');
+  assert.equal(document.querySelector('#external-image').getAttribute('loading'), 'lazy');
+  dom.window.close();
+});
