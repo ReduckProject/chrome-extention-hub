@@ -253,6 +253,24 @@ test('English rate-limit alerts are recognized without classifying quoted assist
   } finally { dom.window.close(); }
 });
 
+test('diagnostics read buffered request metadata without fetching or exposing signed URL queries', async () => {
+  const { dom, adapter } = page();
+  try {
+    dom.window.fetch = () => { throw new Error('Diagnostics must not issue requests'); };
+    Object.defineProperty(dom.window.performance, 'getEntriesByType', { value: () => [
+      { name: 'https://chatgpt.com/backend-api/conversation/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa?secret=private-token', startTime: 1, duration: 50, initiatorType: 'fetch', responseStatus: 429, transferSize: 300, encodedBodySize: 100 },
+      { name: 'https://unrelated.example/private', startTime: 2, duration: 10 },
+    ] });
+    const info = await adapter.read({ operation: 'diagnostics' });
+    assert.equal(info.requests.length, 1);
+    assert.equal(info.requests[0].status, 429);
+    assert.equal(info.requests[0].path, '/backend-api/conversation/:id');
+    assert.equal(info.coverage, 'browser_buffer_only_not_a_complete_network_log');
+    assert.ok(!JSON.stringify(info).includes('private-token'));
+    assert.ok(!JSON.stringify(info).includes('unrelated.example'));
+  } finally { dom.window.close(); }
+});
+
 test('optional image hashing and concurrent chunks reuse one in-memory asset fetch', async () => {
   const { dom, adapter, document } = page('<div data-message-author-role="assistant" data-message-id="cached-image">Done<img src="/no-store-image.png"></div>');
   try {

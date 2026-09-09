@@ -7,7 +7,7 @@ export async function call(method, params = {}, { timeoutMs = 30000, config = nu
   config ||= await loadConfig();
   const response = await fetch(`http://127.0.0.1:${config.port}/rpc`, {
     method: 'POST', headers: { Authorization: `Bearer ${config.token}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ method, params }), signal: AbortSignal.timeout(timeoutMs),
+    body: JSON.stringify({ method, params, client: { pid: process.pid, entry: path.basename(process.argv[1] || 'node') } }), signal: AbortSignal.timeout(timeoutMs),
   });
   const body = await response.json();
   if (!response.ok) { const error = new Error(body.error || `HTTP ${response.status}`); error.status = response.status; throw error; }

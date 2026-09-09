@@ -13,7 +13,7 @@ try {
   await client.connect(transport);
   const listed = await client.listTools();
   const first = await client.callTool({ name: 'chatgpt_status', arguments: {} });
-  if (first.isError || listed.tools.length !== 9) throw new Error(`MCP smoke test failed: ${JSON.stringify(first)}`);
+  if (first.isError || listed.tools.length !== 12) throw new Error(`MCP smoke test failed: ${JSON.stringify(first)}`);
   const durations = [];
   for (let i = 0; i < 40; i++) {
     const start = performance.now();

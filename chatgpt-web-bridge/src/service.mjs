@@ -1,4 +1,5 @@
 import http from 'node:http';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import { WebSocketServer } from 'ws';
 import { StateStore } from './store.mjs';
@@ -21,6 +22,7 @@ export class BridgeService {
     this.clients = new Map();
     this.pending = new Map();
     this.locks = new Map();
+    this.operationContext = new AsyncLocalStorage();
     this.observerDocuments = new Set();
     this.observerRefreshTimers = new Map();
     this.wss = new WebSocketServer({ noServer: true, maxPayload: 2 * 1024 * 1024 });
@@ -134,7 +136,8 @@ export class BridgeService {
 
   command(profileId, command, params = {}, timeoutMs = 5000, id = randomUUID()) {
     const passive = command === 'probe' || (command === 'read' &&
-      params.assistantId?.operation === 'response' && !params.assistantId.loadImages && !params.assistantId.includeAssets);
+      (params.assistantId?.operation === 'diagnostics' ||
+        (params.assistantId?.operation === 'response' && !params.assistantId.loadImages && !params.assistantId.includeAssets)));
     if (!passive && command !== 'stop') this.store.assertAccessAllowed(profileId);
     const ws = this.clients.get(profileId);
     if (!ws || ws.readyState !== 1) return Promise.reject(new Error('Chrome extension is not connected'));
@@ -143,6 +146,8 @@ export class BridgeService {
         this.pending.delete(id); reject(new Error(`${command} observation timed out; execution outcome may be unknown`));
       }, timeoutMs);
       this.pending.set(id, { resolve, reject, timer, profileId });
+      this.operationContext.getStore()?.browserCommands.push({ at: Date.now(), command,
+        operation: params.assistantId?.operation, tabId: params.tabId });
       ws.send(JSON.stringify({ type: 'command', id, command, params, expiresAt: Date.now() + timeoutMs }), error => {
         if (error) { clearTimeout(timer); this.pending.delete(id); reject(error); }
       });
@@ -168,7 +173,37 @@ export class BridgeService {
     return tab;
   }
 
-  async dispatch(method, params = {}) {
+  async dispatch(method, params = {}, caller = null) {
+    const tracked = ['send', 'new_chat', 'models', 'select_model', 'download', 'recover_images', 'stop'].includes(method) ||
+      (method === 'tabs' && params.action === 'new') || (method === 'result' && (params.includeAssets || params.loadImages)) ||
+      (method === 'access' && ['pause', 'resume'].includes(params.action));
+    if (!tracked) return this.perform(method, params);
+    const run = this.store.data.runs[params.runId];
+    const tab = this.store.data.tabs[params.tabKey || run?.tabKey];
+    const operation = { id: randomUUID(), requestedAt: Date.now(), method, action: params.action,
+      profileId: params.profileId || tab?.profileId || (this.clients.size === 1 ? [...this.clients.keys()][0] : null),
+      tabKey: params.tabKey || run?.tabKey, runId: params.runId, caller, outcome: 'started', browserCommands: [] };
+    this.store.data.operations.push(operation);
+    this.store.data.operations = this.store.data.operations.slice(-400);
+    this.store.changed(); await this.store.save();
+    return this.operationContext.run(operation, async () => {
+      try {
+        const result = await this.perform(method, params);
+        operation.outcome = result.resultError ? 'result_unavailable' : 'returned';
+        operation.runId ||= result.run?.id;
+        operation.existing = result.existing;
+        operation.runPhase = result.run?.phase;
+        operation.error = result.resultError?.slice(0, 500);
+        return result;
+      } catch (error) {
+        operation.outcome = 'error'; operation.error = error.message.slice(0, 500); throw error;
+      } finally {
+        operation.finishedAt = Date.now(); this.store.changed(); await this.store.save();
+      }
+    });
+  }
+
+  async perform(method, params = {}) {
     switch (method) {
       case 'health': return { ok: true, service: 'chatgpt-web-bridge', protocol: 1, version: '0.1.0', connectedProfiles: [...this.clients.keys()], revision: this.store.data.revision };
       case 'refresh_observers': {
@@ -192,6 +227,7 @@ export class BridgeService {
         return { profiles: [...this.clients.keys()], tabs: this.store.list(), revision: this.store.data.revision };
       }
       case 'status': {
+        if (params.diagnostics && !params.tabKey) throw new Error('Diagnostics require one exact tabKey');
         const keys = params.tabKey ? [params.tabKey] : Object.keys(this.store.data.tabs);
         const errors = [];
         if (params.refresh) {
@@ -203,7 +239,32 @@ export class BridgeService {
           }));
         }
         this.store.reconcile();
-        return { revision: this.store.data.revision, tabs: keys.filter(k => this.store.data.tabs[k]).map(key => this.store.tabView(key)), runs: Object.values(this.store.data.runs).filter(r => !params.tabKey || r.tabKey === params.tabKey).map(r => this.store.runView(r.id)), errors };
+        let diagnostics;
+        if (params.diagnostics) {
+          const tab = this.store.data.tabs[params.tabKey];
+          if (!tab) throw new Error('Unknown tab');
+          diagnostics = await this.command(tab.profileId, 'read', { tabId: tab.tabId, documentId: tab.documentId,
+            assistantId: { operation: 'diagnostics' } }, 5000);
+        }
+        return { revision: this.store.data.revision, tabs: keys.filter(k => this.store.data.tabs[k]).map(key => this.store.tabView(key)), runs: Object.values(this.store.data.runs).filter(r => !params.tabKey || r.tabKey === params.tabKey).map(r => this.store.runView(r.id)), errors,
+          ...(diagnostics ? { diagnostics, recentOperations: this.store.data.operations.filter(op => op.tabKey === params.tabKey ||
+            op.profileId === this.store.data.tabs[params.tabKey]?.profileId).slice(-30) } : {}) };
+      }
+      case 'access': {
+        const profileId = params.profileId || (this.clients.size === 1 ? [...this.clients.keys()][0] : null);
+        if (!profileId) throw new Error('Choose a profileId explicitly');
+        const action = params.action || 'status';
+        if (!['status', 'pause', 'resume'].includes(action)) throw new Error('Unknown access action');
+        if (action === 'pause') {
+          if (!this.clients.has(profileId)) throw new Error('Choose a connected profileId');
+          this.store.data.accessPauses[profileId] ||= { reason: 'rate_limit', message: 'User reported a website access restriction',
+            observedAt: Date.now(), retryAt: Date.now() + 300000, basis: 'user_report' };
+          this.store.changed(); await this.store.save();
+        }
+        const recovery = action === 'resume' ? this.store.resumeAccess(profileId) : {};
+        if (action === 'resume') await this.store.save();
+        return { profileId, accessPause: this.store.accessPause(profileId), ...recovery,
+          recentOperations: this.store.data.operations.filter(operation => operation.profileId === profileId).slice(-30) };
       }
       case 'new_chat': return this.withLock(params.tabKey, async () => {
         const tab = this.target(params.tabKey);
@@ -358,8 +419,10 @@ export class BridgeService {
         if (length > 1024 * 1024) throw new Error('Request too large');
         chunks.push(chunk);
       }
-      const { method, params } = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-      const result = await this.dispatch(method, params);
+      const { method, params, client } = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      const caller = client && Number.isInteger(client.pid) && client.pid > 0
+        ? { reportedPid: client.pid, entry: typeof client.entry === 'string' ? client.entry.slice(0, 80) : null } : null;
+      const result = await this.dispatch(method, params, caller);
       respond(200, { result });
     } catch (error) { respond(400, { error: error.message }); }
   }

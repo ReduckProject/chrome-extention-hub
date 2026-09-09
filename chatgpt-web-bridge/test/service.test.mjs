@@ -72,6 +72,35 @@ test('lazy loading is an explicit completed-result operation, never a default qu
   assert.deepEqual(received, { operation: 'response', assistantId: 'pending-image', loadImages: true, includeAssets: false });
   assert.equal(result.result.complete, true); assert.equal(result.result.images[0].loaded, false);
 });
+
+test('an expired pause stays latched across clients; diagnostics and audit never cause a page mutation', async t => {
+  const { service, ws, rpc, snapshot, until } = await fixture(t);
+  snapshot(snap(1)); await until(() => service.store.list().length === 1);
+  const tabKey = service.store.list()[0].key;
+  const commands = [];
+  ws.on('message', data => {
+    const message = JSON.parse(data); if (message.type !== 'command') return;
+    commands.push(message);
+    ws.send(JSON.stringify({ type: 'result', id: message.id, result: { source: 'existing_browser_resource_timing', requests: [] } }));
+  });
+  await rpc('access', { action: 'pause', profileId });
+  service.store.data.accessPauses[profileId].retryAt = Date.now() - 1;
+  assert.equal((await rpc('access', { profileId })).accessPause.resumeRequired, true);
+  await assert.rejects(rpc('send', { tabKey, prompt: 'private prompt must not appear in audit', requestId: 'paused-client' }), /access paused/);
+  await assert.rejects(rpc('tabs', { action: 'new', count: 1, profileId }), /access paused/);
+  assert.equal(commands.length, 0);
+  const inspected = await rpc('status', { tabKey, diagnostics: true });
+  assert.equal(inspected.diagnostics.source, 'existing_browser_resource_timing');
+  assert.equal(commands.length, 1);
+  assert.equal(commands[0].params.assistantId.operation, 'diagnostics');
+  const audit = (await rpc('access', { profileId })).recentOperations;
+  assert.equal(audit.find(operation => operation.method === 'send').browserCommands.length, 0);
+  assert.equal(audit.find(operation => operation.method === 'send').caller.reportedPid, process.pid);
+  assert.ok(!JSON.stringify(audit).includes('private prompt'));
+  const recovered = await rpc('access', { action: 'resume', profileId });
+  assert.equal(recovered.resumed, true); assert.equal(recovered.websiteRecoveryVerified, false);
+  assert.equal(commands.length, 1, 'Explicit recovery changes local policy and does not retry a website request');
+});
 async function fixture(t) {
   const config = { port: 0, token, extensionId: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' };
   const service = new BridgeService({ config }); config.port = await service.start();

@@ -13,7 +13,7 @@ export class StateStore extends EventEmitter {
     this.file = file;
     this.staleMs = staleMs;
     this.now = now;
-    this.data = { schema: 1, revision: 0, tabs: {}, runs: {}, requests: {}, accessPauses: {} };
+    this.data = { schema: 1, revision: 0, tabs: {}, runs: {}, requests: {}, accessPauses: {}, operations: [] };
     this.connections = new Set();
     this.saves = Promise.resolve();
   }
@@ -25,6 +25,7 @@ export class StateStore extends EventEmitter {
       if (data.schema !== 1 || !data.tabs || !data.runs || !data.requests) throw new Error('Unsupported or invalid state file');
       this.data = data;
       this.data.accessPauses ||= {};
+      this.data.operations ||= [];
       // Cached observations survive restarts; live connection claims do not.
       for (const tab of Object.values(this.data.tabs)) tab.restartPending = true;
     } catch (error) { if (error.code !== 'ENOENT') throw error; }
@@ -101,15 +102,28 @@ export class StateStore extends EventEmitter {
     const noticeVisible = notices.some(tab => !tab.restartPending && !tab.observationError &&
       this.connections.has(profileId) && this.now() - tab.receivedAt <= this.staleMs) ? true : notices.length ? null : false;
     const remainingMs = Math.max(0, pause.retryAt - this.now());
-    if (!remainingMs && noticeVisible === false) return null;
     return { ...pause, retryAfter: new Date(pause.retryAt).toISOString(), remainingMs, noticeVisible,
-      observationPending: noticeVisible === null };
+      observationPending: noticeVisible === null, resumeRequired: true };
   }
 
   assertAccessAllowed(profileId) {
     const pause = this.accessPause(profileId);
     if (pause) throw new Error('ChatGPT access paused: ' + pause.message +
-      '. Recheck after ' + pause.retryAfter + '; the visible restriction must also be cleared. No automatic retry.');
+      '. Access remains paused after ' + pause.retryAfter +
+      '; resume only on an explicit user request after checking the current page. No automatic retry.');
+  }
+
+  resumeAccess(profileId) {
+    const pause = this.accessPause(profileId);
+    if (!pause) return { resumed: false, alreadyUnpaused: true };
+    if (pause.remainingMs > 0) throw new Error('The local access backoff has not elapsed');
+    if (pause.noticeVisible !== false) throw new Error('The website restriction is still visible or its observation is stale');
+    if (!this.list().some(tab => tab.profileId === profileId && !tab.freshness.stale)) {
+      throw new Error('A fresh page observation is required before explicit access recovery');
+    }
+    delete this.data.accessPauses[profileId];
+    this.changed();
+    return { resumed: true, websiteRecoveryVerified: false };
   }
 
   list() { return Object.keys(this.data.tabs).map(key => this.tabView(key)); }

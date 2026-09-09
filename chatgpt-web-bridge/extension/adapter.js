@@ -1,5 +1,5 @@
 (() => {
-  const adapterVersion = 31;
+  const adapterVersion = 32;
   if (globalThis.ChatGPTBridgeAdapter?.version === adapterVersion) return;
   const doc = document;
   const normalize = value => String(value || '').replace(/\r\n/g, '\n').trim();
@@ -293,6 +293,25 @@
     })();
     return entry.task;
   }
+  function diagnostics() {
+    const entries = performance.getEntriesByType?.('resource') || [];
+    const requests = entries.flatMap(entry => {
+      try {
+        const url = new URL(entry.name);
+        if (url.origin !== location.origin) return [];
+        return [{ at: new Date(performance.timeOrigin + entry.startTime).toISOString(),
+          path: url.pathname.replace(/[0-9a-f]{8}-[0-9a-f-]{27,}/gi, ':id'),
+          resourceKey: fingerprint(entry.name), initiator: entry.initiatorType,
+          status: entry.responseStatus > 0 ? entry.responseStatus : null,
+          durationMs: Math.round(entry.duration), transferSize: entry.transferSize,
+          encodedBodySize: entry.encodedBodySize }];
+      } catch { return []; }
+    });
+    return { capturedAt: new Date().toISOString(), source: 'existing_browser_resource_timing',
+      coverage: 'browser_buffer_only_not_a_complete_network_log', totalResourceEntries: entries.length,
+      sameOriginEntries: requests.length, earliestAt: requests[0]?.at || null,
+      latestAt: requests.at(-1)?.at || null, requests: requests.slice(-200) };
+  }
   function readResponse(assistantId) {
     const list = messages('assistant');
     const target = assistantId ? list.find(n => messageId(n) === assistantId) : list.at(-1);
@@ -304,6 +323,7 @@
     // Older installed content scripts already route read payloads. The service
     // validates and locks these fixed operations before using this envelope.
     if (assistantId && typeof assistantId === 'object') {
+      if (assistantId.operation === 'diagnostics') return diagnostics();
       if (assistantId.operation === 'new_chat') return newChat();
       if (assistantId.operation === 'response') {
         if (assistantId.loadImages === true) loadPendingImages(assistantId.assistantId);

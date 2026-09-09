@@ -39,6 +39,9 @@ test('a visible access limit pauses every tab in its profile and preserves idemp
   assert.equal(run.phase, 'submission_unknown');
   assert.equal(store.accessPause(profile).remainingMs, 290000, 'Dismissing the popup does not skip the backoff');
   advance(290001); snap(1); snap(2);
+  assert.equal(store.accessPause(profile).resumeRequired, true);
+  assert.throws(() => store.assertAccessAllowed(profile), /access paused/);
+  assert.equal(store.resumeAccess(profile).resumed, true);
   assert.equal(store.accessPause(profile), null);
   assert.equal(store.data.runs[run.id].accepted, false, 'Expiry must never resend an uncertain request');
   assert.equal(store.accessPause('different-profile'), null);
@@ -70,6 +73,23 @@ test('a stale restriction observation is unknown and cannot silently release the
   assert.equal(store.accessPause(profile).observationPending, true);
   assert.throws(() => store.assertAccessAllowed(profile), /access paused/);
   snap(1);
+  assert.equal(store.accessPause(profile).resumeRequired, true);
+  assert.equal(store.resumeAccess(profile).resumed, true);
+  assert.equal(store.accessPause(profile), null);
+});
+
+test('explicit recovery requires elapsed backoff and a fresh clear page but never proves website recovery', () => {
+  const { store, snap, advance } = fixture();
+  const limit = { activity: 'needs_attention', attentionType: 'rate_limit', attention: 'Too many requests' };
+  snap(1, limit);
+  assert.throws(() => store.resumeAccess(profile), /not elapsed/);
+  advance(1800000);
+  assert.equal(store.accessPause(profile).resumeRequired, true);
+  assert.throws(() => store.resumeAccess(profile), /still visible or.*stale/);
+  snap(1, limit);
+  assert.throws(() => store.resumeAccess(profile), /still visible/);
+  snap(1);
+  assert.equal(store.resumeAccess(profile).websiteRecoveryVerified, false);
   assert.equal(store.accessPause(profile), null);
 });
 test('three image runs overlap and complete independently on their own conversations', async () => {
