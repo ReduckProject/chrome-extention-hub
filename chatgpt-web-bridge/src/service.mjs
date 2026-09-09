@@ -10,7 +10,7 @@ function requireCompleteImageAssets(run, result) {
   if (!images.length) throw new Error('The completed response contains no images');
   if (images.some(image => !image.loaded)) throw new Error('Response finished, but images are still loading or failed to load; inspect result.images');
   if (!Array.isArray(result.assets) || result.assets.length < Math.max(images.length, run.images?.length || 0)) {
-    throw new Error('Incomplete image result: some completed images are no longer loaded; refresh this conversation before saving');
+    throw new Error('Incomplete image result: some response images are no longer loaded; inspect result.images without reloading the conversation');
   }
 }
 
@@ -133,6 +133,9 @@ export class BridgeService {
   logError(error) { console.error(`[bridge] ${error.message}`); }
 
   command(profileId, command, params = {}, timeoutMs = 5000, id = randomUUID()) {
+    const passive = command === 'probe' || (command === 'read' &&
+      params.assistantId?.operation === 'response' && !params.assistantId.loadImages && !params.assistantId.includeAssets);
+    if (!passive && command !== 'stop') this.store.assertAccessAllowed(profileId);
     const ws = this.clients.get(profileId);
     if (!ws || ws.readyState !== 1) return Promise.reject(new Error('Chrome extension is not connected'));
     return new Promise((resolve, reject) => {
@@ -156,6 +159,7 @@ export class BridgeService {
 
   target(tabKey, { allowBusy = false } = {}) {
     const tab = this.store.tabView(tabKey);
+    if (!allowBusy) this.store.assertAccessAllowed(tab.profileId);
     if (tab.freshness.stale) throw new Error('Page state is stale; refresh or reconnect first');
     if (!allowBusy) {
       const owned = Object.values(this.store.data.runs).find(r => r.tabKey === tabKey && !['completed', 'error', 'stopped'].includes(r.phase));
@@ -233,6 +237,9 @@ export class BridgeService {
       });
       case 'result': {
         const run = this.store.runView(params.runId);
+        if (params.loadImages === true && (params.includeText === false || run.phase !== 'completed')) {
+          throw new Error('loadImages requires a completed response and includeText enabled');
+        }
         if (params.includeText === false) return { run };
         const assistantId = run.resultAssistantId || run.responseAssistantId;
         if (!assistantId) return { run, result: null, resultSource: null };
@@ -241,7 +248,9 @@ export class BridgeService {
         if (tab && this.clients.has(tab.profileId) && !tab.closed && tab.documentId === run.documentIdAtSend &&
             (!run.conversationId || run.conversationId === tab.conversationId)) {
           try {
-            const target = params.includeAssets === true ? assistantId : { operation: 'response', assistantId };
+            const target = params.loadImages === true
+              ? { operation: 'response', assistantId, loadImages: true, includeAssets: params.includeAssets === true }
+              : params.includeAssets === true ? assistantId : { operation: 'response', assistantId };
             const read = await this.command(tab.profileId, 'read', { tabId: tab.tabId, documentId: tab.documentId, assistantId: target }, 5000);
             if (read.assistantId !== assistantId || typeof read.text !== 'string') throw new Error('Response identity or text could not be verified');
             const current = this.store.runView(run.id);

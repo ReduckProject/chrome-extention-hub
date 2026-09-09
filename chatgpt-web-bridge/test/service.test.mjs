@@ -12,6 +12,66 @@ function snap(tabId, overrides = {}) {
     activity: 'idle', model: { label: 'Test model' }, composerReady: true, draftLength: 0,
     userCount: 0, lastUserText: '', assistantCount: 0, lastAssistantId: null, images: [], finalActions: false, contentSignature: 'initial', ...overrides };
 }
+
+test('a profile rate limit blocks browser requests across tabs but permits passive status and response reads', async t => {
+  const { service, ws, rpc, snapshot, until } = await fixture(t);
+  snapshot(snap(1)); snapshot(snap(2));
+  await until(() => service.store.list().length === 2);
+  const [first, second] = service.store.list().map(tab => tab.key);
+  const params = { tabKey: second, prompt: 'answer', requestId: 'finished-before-rate-limit' };
+  const { run } = await service.store.reserve(params);
+  Object.assign(run, { phase: 'completed', resultAssistantId: 'preserved-answer', accepted: true });
+  const commands = [];
+  ws.on('message', data => {
+    const message = JSON.parse(data); if (message.type !== 'command') return;
+    commands.push(message);
+    ws.send(JSON.stringify({ type: 'result', id: message.id, result:
+      message.command === 'read' ? { assistantId: 'preserved-answer', text: 'Preserved response', images: [], assets: [] } : { observed: true } }));
+  });
+  snapshot(snap(1, { activity: 'needs_attention', attentionType: 'rate_limit', attention: '请求过于频繁，请稍等几分钟后再重试。' }));
+  await until(() => service.store.tabView(first).accessPause);
+  const status = await rpc('status');
+  assert.equal(status.tabs[1].accessPause.reason, 'rate_limit'); assert.equal(commands.length, 0);
+  assert.equal((await rpc('send', params)).existing, true);
+  for (const [method, args] of [
+    ['tabs', { action: 'new', count: 1, profileId }],
+    ['new_chat', { tabKey: second }],
+    ['models', { tabKey: second }],
+    ['select_model', { tabKey: second, label: 'Test model' }],
+    ['send', { tabKey: second, prompt: 'next', requestId: 'must-not-reserve' }],
+    ['download', { runId: run.id }],
+    ['recover_images', { runId: run.id }],
+  ]) await assert.rejects(rpc(method, args), /access paused/);
+  assert.equal(service.store.data.requests['must-not-reserve'], undefined);
+  assert.equal(commands.length, 0);
+  await rpc('status', { refresh: true });
+  const read = await rpc('result', { runId: run.id });
+  assert.equal(read.result.text, 'Preserved response'); assert.equal(read.run.phase, 'completed');
+  assert.equal(commands.length, 3); assert.deepEqual(commands.map(command => command.command), ['probe', 'probe', 'read']);
+  for (const flag of ['includeAssets', 'loadImages']) {
+    const blocked = await rpc('result', { runId: run.id, [flag]: true });
+    assert.equal(blocked.resultSource, 'cache'); assert.match(blocked.resultError, /access paused/);
+  }
+  assert.equal(commands.length, 3, 'Neither hashing nor lazy loading may reach the extension during backoff');
+});
+
+test('lazy loading is an explicit completed-result operation, never a default query side effect', async t => {
+  const { service, ws, rpc, snapshot, until } = await fixture(t);
+  snapshot(snap(1)); await until(() => service.store.list().length === 1);
+  const tabKey = service.store.list()[0].key;
+  const { run } = await service.store.reserve({ tabKey, prompt: 'image', requestId: 'explicit-image-loading' });
+  await assert.rejects(rpc('result', { runId: run.id, loadImages: true }), /completed response/);
+  Object.assign(run, { phase: 'completed', resultAssistantId: 'pending-image', accepted: true });
+  let received;
+  ws.on('message', data => {
+    const message = JSON.parse(data); if (message.type !== 'command') return;
+    received = message.params.assistantId;
+    ws.send(JSON.stringify({ type: 'result', id: message.id, result: { assistantId: 'pending-image', text: 'Done', images: [{ loaded: false, loading: 'eager' }], assets: [] } }));
+  });
+  const result = await rpc('result', { runId: run.id, loadImages: true });
+  assert.deepEqual(received, { operation: 'response', assistantId: 'pending-image', loadImages: true, includeAssets: false });
+  assert.equal(result.result.complete, true); assert.equal(result.result.images[0].loaded, false);
+});
 async function fixture(t) {
   const config = { port: 0, token, extensionId: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' };
   const service = new BridgeService({ config }); config.port = await service.start();

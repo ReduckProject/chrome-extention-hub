@@ -13,7 +13,7 @@ export class StateStore extends EventEmitter {
     this.file = file;
     this.staleMs = staleMs;
     this.now = now;
-    this.data = { schema: 1, revision: 0, tabs: {}, runs: {}, requests: {} };
+    this.data = { schema: 1, revision: 0, tabs: {}, runs: {}, requests: {}, accessPauses: {} };
     this.connections = new Set();
     this.saves = Promise.resolve();
   }
@@ -24,6 +24,7 @@ export class StateStore extends EventEmitter {
       const data = JSON.parse(await fs.readFile(this.file, 'utf8'));
       if (data.schema !== 1 || !data.tabs || !data.runs || !data.requests) throw new Error('Unsupported or invalid state file');
       this.data = data;
+      this.data.accessPauses ||= {};
       // Cached observations survive restarts; live connection claims do not.
       for (const tab of Object.values(this.data.tabs)) tab.restartPending = true;
     } catch (error) { if (error.code !== 'ENOENT') throw error; }
@@ -66,6 +67,12 @@ export class StateStore extends EventEmitter {
       lastContentChangeAt: signatureChanged ? now : previous.lastContentChangeAt,
       lastResponseChangeAt: responseChanged ? now : previous.lastResponseChangeAt ?? previous.lastContentChangeAt,
     };
+    if (incoming.attentionType === 'rate_limit' && (previous?.attentionType !== 'rate_limit' ||
+        previous.documentId !== incoming.documentId || !this.data.accessPauses[profileId])) {
+      // Five minutes is our conservative backoff, not a claimed website reset time.
+      this.data.accessPauses[profileId] = { reason: 'rate_limit', message: incoming.attention,
+        observedAt: now, retryAt: now + 300000, sourceTabKey: key, basis: 'bridge_backoff' };
+    }
     this.reconcile();
     this.changed();
     return key;
@@ -82,7 +89,27 @@ export class StateStore extends EventEmitter {
       freshness: { ageMs, stale, observedAt: new Date(tab.receivedAt).toISOString() },
       activity: stale ? 'unknown' : tab.activity,
       lastKnownActivity: tab.activity,
+      accessPause: this.accessPause(tab.profileId),
     };
+  }
+
+  accessPause(profileId) {
+    const pause = this.data.accessPauses[profileId];
+    if (!pause) return null;
+    const notices = Object.values(this.data.tabs).filter(tab => tab.profileId === profileId &&
+      tab.attentionType === 'rate_limit' && !tab.closed);
+    const noticeVisible = notices.some(tab => !tab.restartPending && !tab.observationError &&
+      this.connections.has(profileId) && this.now() - tab.receivedAt <= this.staleMs) ? true : notices.length ? null : false;
+    const remainingMs = Math.max(0, pause.retryAt - this.now());
+    if (!remainingMs && noticeVisible === false) return null;
+    return { ...pause, retryAfter: new Date(pause.retryAt).toISOString(), remainingMs, noticeVisible,
+      observationPending: noticeVisible === null };
+  }
+
+  assertAccessAllowed(profileId) {
+    const pause = this.accessPause(profileId);
+    if (pause) throw new Error('ChatGPT access paused: ' + pause.message +
+      '. Recheck after ' + pause.retryAfter + '; the visible restriction must also be cleared. No automatic retry.');
   }
 
   list() { return Object.keys(this.data.tabs).map(key => this.tabView(key)); }
@@ -101,6 +128,7 @@ export class StateStore extends EventEmitter {
     }
     this.reconcile();
     const tab = this.tabView(tabKey);
+    this.assertAccessAllowed(tab.profileId);
     if (tab.freshness.stale || !tab.composerReady || tab.activity !== 'idle') throw new Error('Target tab is not freshly observed and idle');
     if (tab.draftLength > 0) {
       const recoverable = Object.values(this.data.runs).some(run =>
@@ -183,9 +211,21 @@ export class StateStore extends EventEmitter {
         if (JSON.stringify(run) !== before) changed = true;
         continue;
       }
+      if (tab.attentionType === 'rate_limit' && tab.documentId === run.documentIdAtSend) {
+        run.phase = 'awaiting_user'; run.attention = tab.attention; run.attentionType = 'rate_limit';
+        if (JSON.stringify(run) !== before) { run.updatedAt = this.now(); changed = true; }
+        continue;
+      }
+      if (run.attentionType === 'rate_limit') {
+        delete run.attentionType; delete run.attention;
+        if (run.phase === 'awaiting_user') run.phase = run.accepted ? 'submitted' : 'submission_unknown';
+      }
       const userConfirmed = tab.userCount > run.baseline.userCount && textMatches;
       if (!run.accepted && userConfirmed) run.accepted = true;
-      if (!run.accepted) continue;
+      if (!run.accepted) {
+        if (JSON.stringify(run) !== before) { run.updatedAt = this.now(); changed = true; }
+        continue;
+      }
       // A later human message or a changed branch must never become this run's result.
       if (!textMatches || (run.userMessageId && tab.lastUserId !== run.userMessageId)) {
         run.observationIssue = 'latest_user_message_does_not_match';
@@ -225,11 +265,14 @@ export class StateStore extends EventEmitter {
     if (!run) throw new Error(`Unknown run: ${id}`);
     const tab = this.data.tabs[run.tabKey] ? this.tabView(run.tabKey) : null;
     const { responseCache, ...publicRun } = run;
-    return { ...publicRun, observation: tab ? { connection: tab.connection, freshness: tab.freshness, activity: tab.activity, model: tab.model } : null };
+    return { ...publicRun, observation: tab ? { connection: tab.connection, freshness: tab.freshness, activity: tab.activity, model: tab.model, accessPause: tab.accessPause } : null };
   }
 
   async wait({ runId, afterRevision = this.data.revision, timeoutMs = 20000 }) {
-    if (terminal.has(this.runView(runId).phase)) return { revision: this.data.revision, run: this.runView(runId) };
+    const run = this.runView(runId);
+    if (terminal.has(run.phase) || run.phase === 'awaiting_user' || run.observation?.accessPause) {
+      return { revision: this.data.revision, run };
+    }
     if (this.data.revision <= afterRevision) {
       await new Promise(resolve => {
         const done = () => { clearTimeout(timer); this.off('change', done); resolve(); };

@@ -167,7 +167,7 @@ test('image transfer is bounded and reads only the requested loaded same-origin 
   await assert.rejects(adapter.read({ ...args, offset: -1 }), /Invalid/);
   img.src = 'https://outside.example/image.png';
   await assert.rejects(adapter.read(args), /same-origin/);
-  assert.equal(calls, 2); dom.window.close();
+  assert.equal(calls, 1); dom.window.close();
 });
 test('image results require loaded full-size rendered media and keep original verification false', async () => {
   const { dom, adapter, document } = page('<article><div data-message-author-role="assistant" data-message-id="image-message"><img src="https://chatgpt.com/example.png" width="1024" height="1024" alt="generated"></div><button aria-label="Download image">Download</button></article>');
@@ -201,18 +201,77 @@ test('retry reuses the matching image viewer and never clicks an unrelated save 
   assert.equal(rightClicks, 1); assert.equal(wrongClicks, 0); dom.window.close();
 });
 
-test('completed response loads its pending same-origin lazy image without falsely marking completion', () => {
+test('observations stay passive and only an explicit result request loads the target lazy image', async () => {
   const { dom, adapter, document } = page('<article><div data-message-author-role="assistant" data-message-id="old"><img id="old-image" src="https://chatgpt.com/old.png" width="1254" height="1254" loading="lazy" alt="old"></div></article><section data-turn="assistant"><img id="pending-image" src="https://chatgpt.com/current.png" width="1254" height="1254" loading="lazy" alt="generated"><img id="external-image" src="https://example.org/image.png" width="1254" height="1254" loading="lazy" alt="external"><div data-message-author-role="assistant" data-message-id="current">Done</div><button aria-label="复制回复">Copy</button></section>');
   const pending = document.querySelector('#pending-image');
   const busy = document.createElement('button'); busy.dataset.testid = 'stop-button'; document.querySelector('form').append(busy);
   adapter.snapshot(); assert.equal(pending.getAttribute('loading'), 'lazy');
+  await assert.rejects(adapter.read({ operation: 'response', assistantId: 'current', loadImages: true }), /finished response/);
   busy.remove();
   const status = adapter.snapshot();
+  await adapter.read({ operation: 'response', assistantId: 'current' });
+  assert.equal(pending.getAttribute('loading'), 'lazy');
+  await adapter.read({ operation: 'response', assistantId: 'current', loadImages: true });
   assert.equal(pending.getAttribute('loading'), 'eager');
   assert.equal(status.images[0].loaded, false); assert.equal(status.images[0].loadState, 'pending');
   assert.equal(document.querySelector('#old-image').getAttribute('loading'), 'lazy');
   assert.equal(document.querySelector('#external-image').getAttribute('loading'), 'lazy');
   dom.window.close();
+});
+
+test('Chinese access restriction blocks actions and asset loading while preserving response reads', async () => {
+  const notice = '请求过于频繁。你的请求过于频繁。为保障数据安全，我们已暂时限制你访问对话记录。请稍等几分钟后再重试。';
+  const { dom, adapter, document } = page('<article><div data-message-author-role="assistant" data-message-id="answer">已生成的回答<img src="/pending.png" loading="lazy"></div><button aria-label="Copy response">Copy</button></article>');
+  try {
+    let fetches = 0, clicks = 0;
+    dom.window.fetch = async () => { fetches++; throw new Error('No request should be made'); };
+    document.querySelector('[data-testid="send-button"]').onclick = () => { clicks++; };
+    document.body.insertAdjacentHTML('beforeend', '<div role="dialog">' + notice + '</div>');
+    const state = adapter.snapshot();
+    assert.equal(state.activity, 'needs_attention'); assert.equal(state.attentionType, 'rate_limit');
+    assert.equal(state.attention, notice);
+    assert.equal((await adapter.read({ operation: 'response', assistantId: 'answer' })).text, '已生成的回答');
+    await assert.rejects(adapter.submit('next', 'Thinking'), /not ready/);
+    await assert.rejects(adapter.newChat(), /rate limited/);
+    await assert.rejects(adapter.read('answer'), /rate limited/);
+    await assert.rejects(adapter.read({ operation: 'response', assistantId: 'answer', loadImages: true }), /rate limited/);
+    await assert.rejects(adapter.downloadInfo('answer'), /rate limited/);
+    await assert.rejects(adapter.clickDownload('answer', 0), /rate limited/);
+    assert.equal(document.querySelector('img').getAttribute('loading'), 'lazy');
+    assert.equal(fetches, 0); assert.equal(clicks, 0);
+  } finally { dom.window.close(); }
+});
+
+test('English rate-limit alerts are recognized without classifying quoted assistant content', () => {
+  const { dom, adapter, document } = page('<article><div data-message-author-role="assistant" data-message-id="quote"><div role="status">Too many requests; temporarily restricting access to conversation history.</div></div></article>');
+  try {
+    assert.equal(adapter.snapshot().attentionType, null);
+    document.body.insertAdjacentHTML('beforeend', '<div role="alert" id="notice">Too many requests. Please try again in a few minutes.</div>');
+    assert.equal(adapter.snapshot().attentionType, 'rate_limit');
+    document.querySelector('#notice').hidden = true;
+    assert.equal(adapter.snapshot().attentionType, null);
+  } finally { dom.window.close(); }
+});
+
+test('optional image hashing and concurrent chunks reuse one in-memory asset fetch', async () => {
+  const { dom, adapter, document } = page('<div data-message-author-role="assistant" data-message-id="cached-image">Done<img src="/no-store-image.png"></div>');
+  try {
+    const bytes = Buffer.alloc(700000, 23); let fetches = 0;
+    Object.defineProperties(document.querySelector('img'), { complete: { value: true }, naturalWidth: { value: 1024 }, naturalHeight: { value: 1024 } });
+    Object.defineProperty(dom.window.crypto, 'subtle', { value: { digest: async () => new ArrayBuffer(32) } });
+    dom.window.fetch = async () => {
+      fetches++;
+      await new Promise(resolve => setTimeout(resolve, 10));
+      return { ok: true, headers: { get: () => 'image/png' }, arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.length) };
+    };
+    const args = { operation: 'image_chunk', assistantId: 'cached-image', index: 0 };
+    const [hashed, first, second] = await Promise.all([
+      adapter.read('cached-image'), adapter.read({ ...args, offset: 0 }), adapter.read({ ...args, offset: 512 * 1024 }),
+    ]);
+    assert.equal(hashed.assets[0].byteLength, bytes.length);
+    assert.deepEqual(Buffer.concat([Buffer.from(first.base64, 'base64'), Buffer.from(second.base64, 'base64')]), bytes);
+    assert.equal(fetches, 1);
+  } finally { dom.window.close(); }
 });
 
 test('multi-image saving selects the requested full image in a short viewport instead of its thumbnail', async () => {

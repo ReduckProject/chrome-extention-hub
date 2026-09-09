@@ -99,6 +99,12 @@ MCP 返回 structuredContent JSON，并附带相同内容的文本。状态字�
 
 ## 逐张生图与并行流程
 
+状态观察、`status`（含 `refresh:true`）及默认 `result` 只读取已有页面，不刷新会话、不主动加载图片。需要获取后台 lazy 图片时，在回答 completed 后明确调用一次 `result({runId,loadImages:true})`，再间隔 10–20 秒读取默认 result，最多检查 3 次；`eager/pending` 不重复启动加载。哈希读取及原图分块传输共用页面内字节缓存，最多 4 个资源、64 MiB、5 分钟，避免每个 512 KiB 分块重新请求完整图片。
+
+网页显示“请求过于频繁／暂时限制访问对话记录”时，状态返回 `attentionType:rate_limit`。服务对同一 Chrome profile 的所有 tab 共享 `accessPause`，包含 `message`、`retryAfter`、`remainingMs` 和 `noticeVisible`。至少退避 5 分钟，弹窗仍可见时继续暂停。该时间是桥接器的本地保护策略，不代表网站公布的恢复时间，也不会自动重发任务。新的聊天、发送、模型操作、图片加载、哈希、下载和恢复均暂停；默认正文读取、状态查询仍可用，wait 对此提示立即返回。已完成回答保留 completed；本次提交尚未确认时也会通知 awaiting_user，保留原 requestId。
+
+此处的 profile 级暂停是本地保守范围；不同 profile 是否登录同一账号无法确定。截图能确认网站限制，但没有网站请求日志，不能据此认定具体触发请求或阈值。不要靠刷新网页、新开 tab 或切换工具重试来诊断。
+
 串行生图默认只在第一张调用 `chatgpt_tabs({action:"new",count:1})` 打开专用 tab。每张完成并保存验证原图后，用 `chatgpt_new_chat({tabKey})` 在同一 tab 新建聊天，检查 `confirmed:true`，重新确认模型，再提交下一张。新工具尚未加载到客户端时，可用同一服务的 CLI `new_chat --input <UTF-8参数文件>`。当前已实测同 tab 连续新建聊天、重新选择模型、逐张生图和原图保存。
 
 仅在用户明确要求并行时采用以下三 tab 流程：
@@ -152,13 +158,14 @@ setup 生成 runtime/extension、固定扩展 ID、本机认证配置，不代�
 
 已有实例的源码可以独立纳入本仓库，当前安装不会自动迁移。迁移运行实例时需保留其 runtime 配置和状态；环境变量 CHATGPT_BRIDGE_RUNTIME 可指定现有 runtime 目录。Chrome 扩展仍从加载时的目录运行，重新加载前应保留该目录。每个实例的认证配置需与其本地服务一致。
 
-页面适配层更新后，npm run setup 和 node src/cli.mjs refresh_observers 可更新当前文档的观察器。content.js 新增命令通常需要重新加载对应页面；修改 manifest 或 background 时需要在 Chrome 中重新加载扩展。当前 adapter 源码版本 30 在同 tab 新聊天、多图保存、原图传输及小窗口选图适配上，增加了独立的回答结束观测和正文/图片信息读取。新聊天、正文读取和原图传输兼容现有 content.js 的固定 read 消息格式；服务端也须重启以加载新的完成语义。
+页面适配层更新后，npm run setup 和 node src/cli.mjs refresh_observers 可更新当前文档的观察器。content.js 新增命令通常需要重新加载对应页面；修改 manifest 或 background 时需要在 Chrome 中重新加载扩展。当前 adapter 源码版本 31 加入访问限制识别、纯读取观察、显式图片加载及字节复用，兼容现有 content.js 的固定 read 消息格式；服务端也须重启以加载 profile 共享退避。
 
 ## 验证范围与限制
 
-- 当前本机 Chrome 152、已登录 ChatGPT 中文页面、GPT-5.5 菜单、三 tab 文生图和原图获取已验证；初次验收完成 60 次真实 MCP 状态查询，当前 53 个自动化测试通过。
+- 既有本机 Chrome 152、已登录 ChatGPT 中文页面、GPT-5.5 菜单、三 tab 文生图和原图获取已验证；初次验收完成 60 次真实 MCP 状态查询，当前 61 个自动化测试通过。访问限流修正采用本地 DOM／WebSocket 测试；部署后通过真实观察器捕获用户截图中的弹窗，并通过 MCP 缓存状态确认同 profile 共享暂停。未对受限账号重新发送提示词或进行压力测试。
+- `noticeVisible:null` / `observationPending:true` 表示原限流页面的观察已过期，不能据此认定提示消失；恢复前须取得一次新的页面观察，默认状态查询不会为此刷新网页。
 - 重新加载扩展后，另行验证了 GPT-5.6 Sol → GPT-5.5 切换、新聊天、图片生成、阶段查询和原图下载。进度按 generating、finalizing、completed 等阶段返回，当前不提供生成百分比。
-- 回答结束即完成任务，纯文字及拒绝回复不再卡在 finalizing。完成回答中的同源图片如果仍处于 lazy/pending，会启动加载；图片状态单独通过 loadState 和 loading 返回。
+- 回答结束即完成任务，纯文字及拒绝回复不再卡在 finalizing。lazy/pending 图片状态通过 loadState 和 loading 返回，只有显式 loadImages:true 才会启动同源图片加载。
 - 保存或恢复原图须检查图片是否存在、加载成功且字节校验通过。图片尚未加载或缺失时，下载操作会说明原因，任务仍保持 completed，不将其误报为回答未结束或将部分图片冒充全部已保存。
 - 通用完成语义已通过真实 MCP 验证：kind:image 的纯文字无图任务返回 completed，并可取得缓存的完整正文；另一图文回答可实时返回正文及图片尺寸、URL 和加载状态。对已完成任务调用最长 25 秒的 wait，实测约 4 ms 返回。
 - 实际重启本地服务后约 619 ms 恢复五个 tab，期间返回 unknown，三个任务和下载哈希保留。

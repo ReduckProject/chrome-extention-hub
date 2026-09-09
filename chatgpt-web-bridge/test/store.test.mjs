@@ -18,6 +18,60 @@ function fixture(options = {}) {
   });
   return { store, snap, advance: ms => { time += ms; } };
 }
+
+test('a visible access limit pauses every tab in its profile and preserves idempotent retries', async () => {
+  const { store, snap, advance } = fixture();
+  const first = snap(1), second = snap(2);
+  const params = { tabKey: first, prompt: 'pending request', requestId: 'rate-limit-request' };
+  const { run } = await store.reserve(params);
+  store.submissionResult(run.id, { accepted: false });
+  snap(1, { activity: 'needs_attention', attentionType: 'rate_limit', attention: '请求过于频繁，请稍等几分钟后再重试。' });
+  assert.equal(run.phase, 'awaiting_user'); assert.equal(run.accepted, false);
+  assert.equal(store.tabView(second).accessPause.remainingMs, 300000);
+  assert.equal((await store.reserve(params)).existing, true);
+  await assert.rejects(store.reserve({ tabKey: second, prompt: 'another', requestId: 'another-request' }), /access paused/);
+  const wait = await store.wait({ runId: run.id, afterRevision: store.data.revision, timeoutMs: 25000 });
+  assert.equal(wait.run.attentionType, 'rate_limit');
+  advance(10000);
+  snap(1, { activity: 'needs_attention', attentionType: 'rate_limit', attention: '请求过于频繁，请稍等几分钟后再重试。' });
+  assert.equal(store.tabView(second).accessPause.remainingMs, 290000, 'The observer heartbeat must not extend the backoff');
+  snap(1);
+  assert.equal(run.phase, 'submission_unknown');
+  assert.equal(store.accessPause(profile).remainingMs, 290000, 'Dismissing the popup does not skip the backoff');
+  advance(290001); snap(1); snap(2);
+  assert.equal(store.accessPause(profile), null);
+  assert.equal(store.data.runs[run.id].accepted, false, 'Expiry must never resend an uncertain request');
+  assert.equal(store.accessPause('different-profile'), null);
+});
+
+test('a persistent visible restriction outlasts the local backoff and survives a service restart', async () => {
+  const { store, snap, advance } = fixture();
+  const limit = { activity: 'needs_attention', attentionType: 'rate_limit', attention: 'Too many requests' };
+  snap(1, limit); advance(300001); snap(1, limit);
+  assert.equal(store.accessPause(profile).remainingMs, 0);
+  assert.equal(store.accessPause(profile).noticeVisible, true);
+  assert.throws(() => store.assertAccessAllowed(profile), /access paused/);
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'bridge-rate-limit-'));
+  try {
+    store.file = path.join(directory, 'state.json');
+    // Record a newly displayed notice to persist a fresh backoff.
+    snap(1); snap(1, limit); await store.save();
+    const restored = new StateStore({ file: store.file, now: store.now });
+    await restored.load();
+    assert.equal(restored.accessPause(profile).remainingMs, 300000);
+  } finally { await fs.rm(directory, { recursive: true, force: true }); }
+});
+
+test('a stale restriction observation is unknown and cannot silently release the profile pause', () => {
+  const { store, snap, advance } = fixture();
+  snap(1, { activity: 'needs_attention', attentionType: 'rate_limit', attention: 'Too many requests' });
+  advance(300001); snap(2);
+  assert.equal(store.accessPause(profile).noticeVisible, null);
+  assert.equal(store.accessPause(profile).observationPending, true);
+  assert.throws(() => store.assertAccessAllowed(profile), /access paused/);
+  snap(1);
+  assert.equal(store.accessPause(profile), null);
+});
 test('three image runs overlap and complete independently on their own conversations', async () => {
   const { store, snap, advance } = fixture();
   const runs = [];

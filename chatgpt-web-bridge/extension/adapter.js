@@ -1,5 +1,5 @@
 (() => {
-  const adapterVersion = 30;
+  const adapterVersion = 31;
   if (globalThis.ChatGPTBridgeAdapter?.version === adapterVersion) return;
   const doc = document;
   const normalize = value => String(value || '').replace(/\r\n/g, '\n').trim();
@@ -65,6 +65,18 @@
   const downloadButtons = assistant => all('button,[role="button"],a[download]', turnRoot(assistant) || doc.createElement('div'))
     .filter(n => /^(download( image| original| file)?|下载(此图片|图片|原图|文件)?|保存图片)$/i.test(label(n)));
   const imageViewer = () => all('[role="dialog"]').find(root => imageElements(root).length && buttons(root).some(n => /^(关闭全屏显示|Close full screen|Close fullscreen)$/i.test(label(n))));
+  function accessNotice() {
+    // Match website UI, never quoted instructions or refusal prose in messages.
+    const nodes = all('[role="dialog"],[role="alertdialog"],[role="alert"],[role="status"],[data-testid="conversation-error"]')
+      .filter(n => !n.closest('[data-message-author-role],article,[data-turn],form,[data-testid="composer"]'));
+    const message = nodes.map(text).find(t =>
+      /请求过于频繁|访问.{0,12}频繁|暂时限制.{0,20}(对话|会话|聊天)|too many requests|rate limit|requests.{0,20}(too (quickly|frequently)|too often)|temporarily.{0,30}(restrict|limit).{0,50}(conversation|chat)/i.test(t));
+    return message ? { type: 'rate_limit', message: message.slice(0, 500) } : null;
+  }
+  function assertAccessAllowed() {
+    const notice = accessNotice();
+    if (notice) throw new Error('ChatGPT access is rate limited: ' + notice.message);
+  }
   function snapshot() {
     const input = editor(), root = controls(), users = messages('user'), assistants = messages('assistant');
     const lastUser = users.at(-1), last = assistants.at(-1), output = text(last);
@@ -78,7 +90,8 @@
     const busy = stop();
     const alerts = [...all('[role="alert"]'), ...all('[data-testid="conversation-error"]')];
     const error = alerts.map(text).find(t => /error|something went wrong|failed|unable|出错|失败|出了.*问题|无法/i.test(t));
-    const attention = all('[role="dialog"],[role="alertdialog"]').map(text).find(t => /sign in|log in|verify|captcha|limit|upgrade|登录|验证|上限|限额|升级/i.test(t));
+    const access = accessNotice();
+    const attention = access?.message || all('[role="dialog"],[role="alertdialog"]').map(text).find(t => /sign in|log in|verify|captcha|limit|upgrade|登录|验证|上限|限额|升级/i.test(t));
     let activity = 'unknown';
     if (attention) activity = 'needs_attention';
     else if (error) activity = 'error';
@@ -90,19 +103,11 @@
     const finalActions = !!actionRoot && buttons(actionRoot).some(n =>
       /^(copy( response| message)?|复制(回答|回复|消息)?|good response|bad response|回答不错|回答不好|download( image| original| file)?|下载(此图片|图片|原图|文件)?)$/i.test(label(n)));
     const imageNodes = imageElements(actionRoot);
-    if (activity === 'idle' && finalActions) for (const img of imageNodes) {
-      const source = img.currentSrc || img.getAttribute('src');
-      // Background tabs may never intersect a lazy image with the viewport. Start
-      // loading the observed completed-turn asset without claiming it has decoded.
-      if (img.getAttribute('loading') === 'lazy' && !img.complete && source) {
-        try { if (new URL(source, location.href).origin === location.origin) img.setAttribute('loading', 'eager'); }
-        catch { /* Leave malformed page URLs for the normal image error state. */ }
-      }
-    }
     const images = imageNodes.map((img, index) => imageInfo(img, index, lastId || assistants.length));
     return {
       url: location.href, title: doc.title, activity, model,
       attention: (attention || error || '').slice(0, 500) || null,
+      attentionType: access?.type || null,
       surface: imageViewer() ? 'image_viewer' : 'conversation',
       composerReady: !!input && !input.disabled && input.getAttribute('aria-disabled') !== 'true' && !imageViewer(),
       draftLength: draft(input).length, userCount: users.length, assistantCount: assistants.length,
@@ -135,6 +140,7 @@
     if (!await until(() => button.getAttribute('aria-expanded') !== before, 250)) button.click();
   }
   async function closeEmptyViewer() {
+    assertAccessAllowed();
     const viewer = imageViewer();
     if (viewer) {
       const viewerInput = viewer.querySelector('#prompt-textarea');
@@ -247,6 +253,46 @@
     button.click();
     return { stopped: !!await until(() => !stop(), 1800) };
   }
+  function loadPendingImages(assistantId) {
+    assertAccessAllowed();
+    const state = snapshot();
+    if (state.activity !== 'idle' || !state.finalActions || state.lastAssistantId !== assistantId) {
+      throw new Error('Image loading requires the finished response in an idle page');
+    }
+    const assistant = messages('assistant').find(n => messageId(n) === assistantId);
+    for (const img of imageElements(turnRoot(assistant))) {
+      const source = img.currentSrc || img.getAttribute('src');
+      if (img.getAttribute('loading') !== 'lazy' || img.complete || !source) continue;
+      try { if (new URL(source, location.href).origin === location.origin) img.setAttribute('loading', 'eager'); }
+      catch { /* A malformed or external source is not eligible for loading. */ }
+    }
+  }
+  // Hashing and 512 KiB transfers share fetched bytes. force-cache alone cannot
+  // prevent repeated requests for assets whose server headers forbid caching.
+  const assetCache = new Map();
+  async function assetBytes(source) {
+    assertAccessAllowed();
+    const now = Date.now();
+    for (const [key, entry] of assetCache) if (entry.expiresAt <= now) assetCache.delete(key);
+    if (assetCache.has(source)) return assetCache.get(source).task;
+    while (assetCache.size >= 4) assetCache.delete(assetCache.keys().next().value);
+    const entry = { expiresAt: now + 300000, size: 0 };
+    assetCache.set(source, entry);
+    entry.task = (async () => {
+      try {
+        const response = await fetch(source, { credentials: 'same-origin', cache: 'force-cache' });
+        const mimeType = response.headers.get('content-type');
+        if (!response.ok || !mimeType?.startsWith('image/')) throw new Error('Displayed image bytes unavailable');
+        const bytes = new Uint8Array(await response.arrayBuffer());
+        entry.size = bytes.byteLength;
+        while ([...assetCache.values()].reduce((sum, value) => sum + value.size, 0) > 64 * 1024 * 1024) {
+          assetCache.delete(assetCache.keys().next().value);
+        }
+        return { bytes, mimeType };
+      } catch (error) { if (assetCache.get(source) === entry) assetCache.delete(source); throw error; }
+    })();
+    return entry.task;
+  }
   function readResponse(assistantId) {
     const list = messages('assistant');
     const target = assistantId ? list.find(n => messageId(n) === assistantId) : list.at(-1);
@@ -259,10 +305,14 @@
     // validates and locks these fixed operations before using this envelope.
     if (assistantId && typeof assistantId === 'object') {
       if (assistantId.operation === 'new_chat') return newChat();
-      if (assistantId.operation === 'response') return readResponse(assistantId.assistantId);
+      if (assistantId.operation === 'response') {
+        if (assistantId.loadImages === true) loadPendingImages(assistantId.assistantId);
+        return assistantId.includeAssets === true ? read(assistantId.assistantId) : readResponse(assistantId.assistantId);
+      }
       if (assistantId.operation !== 'image_chunk') throw new Error('Unknown image read operation');
       return imageChunk(assistantId.assistantId, assistantId.index, assistantId.offset);
     }
+    assertAccessAllowed();
     const result = readResponse(assistantId);
     for (const img of result.images) {
       if (!img.loaded) continue;
@@ -270,11 +320,9 @@
         const url = new URL(img.sourceUrl, location.href);
         if (url.origin !== location.origin || !crypto.subtle) { img.assetError = 'Exact same-origin image hashing is unavailable'; continue; }
         // Hashing is optional; media failures must not hide the response text.
-        const response = await fetch(img.sourceUrl, { credentials: 'same-origin', cache: 'force-cache' });
-        if (!response.ok || !response.headers.get('content-type')?.startsWith('image/')) throw new Error('Rendered image bytes are not available');
-        const bytes = await response.arrayBuffer();
+        const { bytes, mimeType } = await assetBytes(img.sourceUrl);
         const digest = await crypto.subtle.digest('SHA-256', bytes);
-        result.assets.push({ sourceUrl: img.sourceUrl, sha256: [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join(''), byteLength: bytes.byteLength, mimeType: response.headers.get('content-type'), width: img.width, height: img.height, alt: img.alt, browserDecoded: true });
+        result.assets.push({ sourceUrl: img.sourceUrl, sha256: [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join(''), byteLength: bytes.byteLength, mimeType, width: img.width, height: img.height, alt: img.alt, browserDecoded: true });
       } catch (error) { img.assetError = error.message; }
     }
     const viewer = imageViewer();
@@ -290,9 +338,7 @@
     const img = images[index]; if (!img) throw new Error('Loaded image index is out of bounds');
     const source = img.currentSrc || img.src, url = new URL(source, location.href);
     if (url.origin !== location.origin) throw new Error('Only the exact displayed same-origin image can be transferred');
-    const response = await fetch(source, { credentials: 'same-origin', cache: 'force-cache' });
-    if (!response.ok || !response.headers.get('content-type')?.startsWith('image/')) throw new Error('Displayed image bytes unavailable');
-    const bytes = new Uint8Array(await response.arrayBuffer());
+    const { bytes } = await assetBytes(source);
     if (offset >= bytes.length) throw new Error('Image chunk offset is out of bounds');
     const chunk = bytes.subarray(offset, Math.min(offset + 512 * 1024, bytes.length));
     let binary = ''; for (let start = 0; start < chunk.length; start += 8192) binary += String.fromCharCode(...chunk.subarray(start, start + 8192));
@@ -301,6 +347,7 @@
   const matchingViewer = source => all('[role="dialog"]').find(root => [...root.querySelectorAll('img')].some(img => (img.currentSrc || img.src) === source));
   const viewerDownloads = root => root ? all('button,[role="button"],a[download]', root).filter(n => !n.disabled && /^(download( image| original| file)?|下载(此图片|图片|原图|文件)?|保存(图片)?)$/i.test(label(n))) : [];
   async function downloadInfo(assistantId) {
+    assertAccessAllowed();
     const assistant = assistantId ? messages('assistant').find(n => messageId(n) === assistantId) : messages('assistant').at(-1);
     if (!assistant) throw new Error('Image message is no longer present');
     const loaded = imageElements(turnRoot(assistant)).filter(n => n.complete && n.naturalWidth > 0 && n.naturalHeight > 0);
@@ -331,6 +378,7 @@
     return { count: controls.length, assistantId: messageId(assistant) };
   }
   async function clickDownload(assistantId, index) {
+    assertAccessAllowed();
     if (downloadTarget?.assistantId === assistantId && downloadTarget.images) {
       const source = downloadTarget.images[index];
       if (!source) throw new Error('Image index is out of bounds');
