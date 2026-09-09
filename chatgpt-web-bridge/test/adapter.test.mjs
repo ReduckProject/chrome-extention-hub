@@ -115,6 +115,40 @@ test('result reads requested assistant identity instead of whichever message is 
   await assert.rejects(adapter.read('missing'), /not present/); dom.window.close();
 });
 
+test('response reads return full text and small, pending or failed image metadata without fetching bytes', async () => {
+  const { dom, adapter, document } = page('<article><div data-message-author-role="assistant" data-message-id="response-owner"><p>网页正文与拒绝说明。</p><img id="small" src="/diagram.png" alt="小图表"><img id="pending" src="/pending.png" alt="等待加载"><img id="failed" src="/failed.png" alt="加载失败"></div><button aria-label="Copy response">Copy</button></article>');
+  try {
+    for (const [id, complete, naturalWidth, naturalHeight] of [['small', true, 120, 80], ['pending', false, 0, 0], ['failed', true, 0, 0]]) {
+      for (const [key, value] of Object.entries({ complete, naturalWidth, naturalHeight }))
+        Object.defineProperty(document.querySelector(`#${id}`), key, { value, configurable: true });
+    }
+    dom.window.fetch = () => { throw new Error('Response queries must not fetch image bytes'); };
+    const before = adapter.snapshot();
+    const result = await adapter.read({ operation: 'response', assistantId: 'response-owner' });
+    assert.equal(result.text, '网页正文与拒绝说明。'); assert.equal(result.images.length, 3);
+    assert.deepEqual(Array.from(result.images, image => image.loadState), ['loaded', 'pending', 'error']);
+    assert.equal(result.images[0].width, 120); assert.equal(result.images[1].sourceUrl, 'https://chatgpt.com/pending.png');
+    assert.equal(result.assets.length, 0);
+    for (const [key, value] of Object.entries({ complete: true, naturalWidth: 1024, naturalHeight: 1024 }))
+      Object.defineProperty(document.querySelector('#pending'), key, { value, configurable: true });
+    const after = adapter.snapshot();
+    assert.equal(before.responseSignature, after.responseSignature);
+    assert.notEqual(before.contentSignature, after.contentSignature);
+  } finally { dom.window.close(); }
+});
+
+test('optional image hash failures preserve response text and report the failing asset', async () => {
+  const { dom, adapter, document } = page('<div data-message-author-role="assistant" data-message-id="hash-error">The answer remains readable.<img src="/unavailable.png" alt="result"></div>');
+  try {
+    Object.defineProperties(document.querySelector('img'), { complete: { value: true }, naturalWidth: { value: 1024 }, naturalHeight: { value: 1024 } });
+    Object.defineProperty(dom.window.crypto, 'subtle', { value: { digest: async () => new ArrayBuffer(32) } });
+    dom.window.fetch = async () => { throw new Error('Image byte read failed'); };
+    const result = await adapter.read('hash-error');
+    assert.equal(result.text, 'The answer remains readable.'); assert.equal(result.assets.length, 0);
+    assert.equal(result.images[0].assetError, 'Image byte read failed');
+  } finally { dom.window.close(); }
+});
+
 test('image transfer is bounded and reads only the requested loaded same-origin asset', async () => {
   const { dom, adapter, document } = page('<article><div data-message-author-role="assistant" data-message-id="asset-owner"><img id="asset" alt="generated image" src="/displayed-original.png"></div></article>');
   const img = document.querySelector('#asset');

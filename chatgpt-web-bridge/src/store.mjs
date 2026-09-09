@@ -58,10 +58,13 @@ export class StateStore extends EventEmitter {
     const previous = this.data.tabs[key];
     const now = this.now();
     const signatureChanged = !previous || previous.contentSignature !== incoming.contentSignature || previous.documentId !== incoming.documentId;
+    const responseChanged = !previous || previous.documentId !== incoming.documentId ||
+      (previous.responseSignature ?? previous.contentSignature) !== (incoming.responseSignature ?? incoming.contentSignature);
     this.data.tabs[key] = {
       ...incoming, key, profileId, conversationId: conversationId(incoming.url),
       receivedAt: now, restartPending: false,
       lastContentChangeAt: signatureChanged ? now : previous.lastContentChangeAt,
+      lastResponseChangeAt: responseChanged ? now : previous.lastResponseChangeAt ?? previous.lastContentChangeAt,
     };
     this.reconcile();
     this.changed();
@@ -84,7 +87,9 @@ export class StateStore extends EventEmitter {
 
   list() { return Object.keys(this.data.tabs).map(key => this.tabView(key)); }
 
-  async reserve({ tabKey, prompt, requestId, kind = 'image', expectedModel }) {
+  async reserve({ tabKey, prompt, requestId, kind, expectedModel }) {
+    // Preserve retries of requests created when the default kind was image.
+    kind ??= this.data.runs[this.data.requests[requestId]?.runId]?.kind ?? 'text';
     if (!['image', 'text'].includes(kind)) throw new Error('kind must be image or text');
     if (typeof prompt !== 'string' || !prompt.trim() || prompt.length > 50000) throw new Error('Prompt must contain 1–50000 characters');
     if (typeof requestId !== 'string' || requestId.length < 4 || requestId.length > 150) throw new Error('A stable requestId of 4–150 characters is required');
@@ -148,11 +153,21 @@ export class StateStore extends EventEmitter {
   reconcile() {
     let changed = false;
     for (const run of Object.values(this.data.runs)) {
-      if (terminal.has(run.phase)) continue;
       const tab = this.data.tabs[run.tabKey];
       if (!tab) continue;
       const view = this.tabView(run.tabKey);
       if (view.freshness.stale) continue;
+      if (terminal.has(run.phase)) {
+        // Media can finish loading after the response ended. Never reopen the
+        // run or bind images from a later response or a different document.
+        if (run.phase === 'completed' && tab.documentId === run.documentIdAtSend &&
+            tab.conversationId === run.conversationId && tab.lastAssistantId === run.resultAssistantId &&
+            (!run.userMessageId || tab.lastUserId === run.userMessageId)) {
+          const images = (tab.images || []).filter(image => !run.baseline.imageKeys.includes(image.key));
+          if (JSON.stringify(images) !== JSON.stringify(run.images)) { run.images = images; run.updatedAt = this.now(); changed = true; }
+        }
+        continue;
+      }
       const before = JSON.stringify(run);
       const textMatches = String(tab.lastUserText || '').replace(/\r\n/g, '\n').trim() === run.prompt.replace(/\r\n/g, '\n').trim();
       // ChatGPT replaces its WEB:<uuid> draft URL with a canonical conversation URL
@@ -182,20 +197,21 @@ export class StateStore extends EventEmitter {
       if (!run.conversationId && tab.conversationId && userConfirmed) run.conversationId = tab.conversationId;
       const newAssistant = tab.assistantCount > run.baseline.assistantCount ||
         (tab.lastAssistantId && tab.lastAssistantId !== run.baseline.lastAssistantId);
+      if (newAssistant && tab.lastAssistantId) {
+        run.responseAssistantId = tab.lastAssistantId;
+        run.resultPreview = tab.lastAssistantPreview; run.resultLength = tab.lastAssistantLength;
+        run.images = (tab.images || []).filter(image => !run.baseline.imageKeys.includes(image.key));
+      }
       if (tab.activity === 'generating' || tab.activity === 'thinking') {
         run.observedGeneration = true; run.phase = tab.activity;
       } else if (tab.activity === 'needs_attention') {
         run.phase = 'awaiting_user'; run.attention = tab.attention;
       } else if (tab.activity === 'error') {
         run.phase = 'error'; run.error = tab.attention || 'Page reported an error';
-      } else if (newAssistant && tab.activity === 'idle' && tab.finalActions && this.now() - tab.lastContentChangeAt >= 2500) {
-        const candidates = (tab.images || []).filter(image => !run.baseline.imageKeys.includes(image.key));
-        const images = candidates.filter(image => image.loaded);
-        if (run.kind !== 'image' || (images.length > 0 && images.length === candidates.length)) {
-          run.phase = 'completed'; run.completedAt = this.now(); run.images = images;
-          run.resultAssistantId = tab.lastAssistantId;
-          run.resultPreview = tab.lastAssistantPreview; run.resultLength = tab.lastAssistantLength;
-        } else run.phase = 'finalizing';
+      } else if (newAssistant && tab.lastAssistantId && tab.activity === 'idle' && tab.finalActions &&
+          this.now() - (tab.lastResponseChangeAt ?? tab.lastContentChangeAt) >= 2500) {
+        run.phase = 'completed'; run.completedAt = this.now(); run.completionReason = 'response_finished';
+        run.resultAssistantId = tab.lastAssistantId;
       } else if (newAssistant && tab.activity === 'idle') run.phase = 'finalizing';
       if (JSON.stringify(run) !== before) { run.updatedAt = this.now(); changed = true; }
     }
@@ -208,10 +224,12 @@ export class StateStore extends EventEmitter {
     const run = this.data.runs[id];
     if (!run) throw new Error(`Unknown run: ${id}`);
     const tab = this.data.tabs[run.tabKey] ? this.tabView(run.tabKey) : null;
-    return { ...run, observation: tab ? { connection: tab.connection, freshness: tab.freshness, activity: tab.activity, model: tab.model } : null };
+    const { responseCache, ...publicRun } = run;
+    return { ...publicRun, observation: tab ? { connection: tab.connection, freshness: tab.freshness, activity: tab.activity, model: tab.model } : null };
   }
 
   async wait({ runId, afterRevision = this.data.revision, timeoutMs = 20000 }) {
+    if (terminal.has(this.runView(runId).phase)) return { revision: this.data.revision, run: this.runView(runId) };
     if (this.data.revision <= afterRevision) {
       await new Promise(resolve => {
         const done = () => { clearTimeout(timer); this.off('change', done); resolve(); };

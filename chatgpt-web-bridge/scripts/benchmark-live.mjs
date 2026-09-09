@@ -60,7 +60,7 @@ try {
   });
   const results = [];
   for (const run of runs) {
-    const result = await invoke('result', { runId: run.id, includeText: true });
+    const result = await invoke('result', { runId: run.id, includeText: true, includeAssets: true });
     assert.equal(result.result.assistantId, run.resultAssistantId);
     assert.equal(result.result.assets[0].sha256, run.verifiedDownloads[0].sha256);
     results.push({ runId: run.id, conversationId: run.conversationId, assistantId: result.result.assistantId, path: run.verifiedDownloads[0].path, sha256: result.result.assets[0].sha256 });

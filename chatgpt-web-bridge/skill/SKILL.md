@@ -12,8 +12,9 @@ description: 通过本机 ChatGPT Web Bridge MCP 控制 Chrome 中已登录的 C
 - 模型用 `models` 读取的精确标签选择；检查 `select_model.confirmed`，再将当前选择器名称作为 `send.expectedModel`。例如实测模型选项 GPT-5.5 对应选择器 `5.5\n即时`，两种标签不要混用。模型名称只证明网页选择，不能断言具体响应的实际后端模型。
 - 每个逻辑提交创建一次 `requestId` 并记录。超时重查或重试同一个 requestId；`submission_unknown` 不能换 ID 重发。不要覆盖未完成草稿。
 - 用户明确要求并行时，多 tab 生图可一次建立 3 个新聊天，等其空闲且状态新鲜后分别提交。不要等待第一张生成完成才提交下一张。每个任务单独保存提示词、模型、tabKey、runId、聊天链接。
-- 用一次 `status` 查询全部任务；仅需新观测时用 `refresh:true`。连接状态、生成状态和缓存时间分别理解，`unknown` 不代表失败或完成。长等待用 `wait` 的有界请求。
-- `result` 必须按 runId 获取对应回答。`download` 点击该回答的原图保存按钮，匹配浏览器已解码图片的 SHA-256 和本机下载文件字节。只有 `complete:true` 且文件 `originalVerified:true` 才作为已验证下载。文件保存在项目 `artifacts/images/<runId>/`，结果亦保存在 `run.verifiedDownloads`。图片任务交付前完整解码文件并查看内容，不能用截图代替。
+- 用一次 `status` 查询全部任务；仅需新观测时用 `refresh:true`。连接状态、回答状态和缓存时间分别理解，`unknown` 不代表失败或完成。`completed` 只表示网页回答已结束，包含普通文字、拒绝回复及图片尚未加载的回答，不代表已满足用户要求。`kind` 仅记录任务意图，默认 text。长等待用 `wait` 的有界请求，已结束的任务会立即返回。
+- `result({runId})` 默认返回对应回答的完整 `text` 和 `images`，正在输出时也可读取已有内容；`result.complete` 表示这份正文是否已结束。图片信息含实际 URL、尺寸、alt、loaded/loadState；需要图片哈希时额外传 `includeAssets:true`，单张失败以 assetError 返回，不能因此丢失正文。`resultSource:cache` 是此前查询的缓存，结合 observedAt、complete 和 resultError 判断可用性；result:null 不等于网页拒绝，不读取其他回答代替。
+- 调用方检查正文和图片是否满足任务，再决定交付或报出网页原因。生图任务没有图片时，保留并报告正文，不继续 wait 已完成的任务。已有图片仍在加载时，适当间隔后重查 result；只有图片就绪后才调用 download。`download` 点击该回答的原图保存按钮，匹配浏览器已解码图片的 SHA-256 和本机下载文件字节。只有下载 `complete:true` 且文件 `originalVerified:true` 才作为已验证原图，保存在项目 `artifacts/images/<runId>/`，亦记录在 `run.verifiedDownloads`。交付前完整解码文件并查看内容，不能用截图代替。
 - `run.images` 是网页观测，其 originalDownloadVerified:false 不代表 `run.verifiedDownloads` 失效。Chrome 事件收据可能因缺少 referrer 为 outcome_unknown，是否获得文件以字节匹配结果为准。verification_pending 时检查实际下载目录或未完成的保存对话框，再查询同一 run，不重复点击。
 - 本地下载匹配默认使用当前用户 Downloads；Chrome 自定义目录可由 runtime/connection.json 的 downloadDirectory 配置。不要打印该文件，其中含本机认证密钥。
 - 确认无保存对话框且网页保存仍未产生文件时，可用 `chatgpt_recover_images({runId})`，未加载时用同一服务 CLI 的 `recover_images --input <UTF-8参数文件>`。它传输该回答已加载的同源原图字节并核对哈希；检查 `complete:true`、`originalVerified:true`，并记录 `sourceTransport:bridge_byte_transfer`。不能将其称为 Chrome 原生下载，也不用于绕过明确的浏览器策略拒绝。

@@ -52,7 +52,7 @@ node src/cli.mjs status
 | `chatgpt_models` | 读取实际模型菜单；必要时关闭没有草稿的图片查看器 |
 | `chatgpt_select_model` | 按精确标签选择并读回，检查 `confirmed:true` |
 | `chatgpt_send` | 提交 prompt，返回持久化 run；必须提供稳定 requestId |
-| `chatgpt_result` | 按 runId 查询；`includeText:true` 读取对应 assistant 消息与图片哈希 |
+| `chatgpt_result` | 按 runId 默认返回对应回答的完整正文和图片信息；需要图片哈希时传 `includeAssets:true` |
 | `chatgpt_download` | 点击对应图片保存控件，验证下载文件，返回路径 |
 | `chatgpt_recover_images` | 网页保存没有产生本机文件时，经同一扩展传输已加载的同源原图字节，并核对哈希 |
 | `chatgpt_stop` | 停止指定 run 的当前生成 |
@@ -71,7 +71,31 @@ MCP 返回 structuredContent JSON，并附带相同内容的文本。状态字�
 }
 ```
 
-`generating` / `thinking` 表示页面活动；具体任务成功以 `run.phase:completed` 为准。完成还要求关联到本次用户消息、新回答、结束控件、内容稳定以及图片确实加载。
+`generating` / `thinking` 表示页面活动。`run.phase:completed` 和 `completionReason:response_finished` 只表示本次网页回答已经结束：已关联本次用户消息及新回答，页面空闲、出现结束控件，回答内容稳定 2.5 秒。纯文字、拒绝说明、无图回复及图片尚未加载的回复都可完成，`kind` 不参与完成判断。新请求默认 `kind:text`；已有 requestId 的默认类型保持原值，确保升级后仍可幂等重查。
+
+图片加载不重置回答内容的稳定计时。`wait` 在任务结束后立即返回，不再等待图片；完成是否满足提示词、是否真的生图，由调用方检查结果。`imageCount` 是已观测图片数，`loadedImageCount` 是加载成功数，`downloadCount` 是已验证保存的文件数。
+
+## 查询网页回答
+
+`chatgpt_result({runId})` 默认读取绑定到该任务的 assistant 正文和图片信息，不读取其他聊天或其他回答。回答正在输出时也能查询已有内容，`result.complete:false` 表示这份内容尚未确认完整。普通文字拒绝作为网页正文返回，不额外猜测拒绝分类。例如回答已经结束且没有图片时，返回字段节选为：
+
+```json
+{
+  "run": {"phase": "completed", "completionReason": "response_finished"},
+  "result": {
+    "assistantId": "example-assistant-id",
+    "text": "无法根据该请求生成图片。",
+    "complete": true,
+    "images": [],
+    "assets": []
+  },
+  "resultSource": "live"
+}
+```
+
+`result.images` 包含网页中实际观察到的图片 URL、尺寸、alt、`loaded` 和 `loadState:loaded|pending|error`，也包括小图及加载失败的图片。默认读取这些信息不下载图片或计算哈希，因此媒体问题不会阻断正文读取。`includeAssets:true` 才额外读取已加载的同源图片字节并计算 SHA-256，成功的哈希位于 `assets`；单张失败在该图片的 `assetError` 中说明。`includeText:false` 保留为仅查询 run 元数据的兼容参数。
+
+已查询过的正文和图片信息会缓存。原页面离开或断线后，可返回 `resultSource:cache` 及该份内容的 `observedAt`、`complete`，并用 `resultError` 说明为何不能实时读取；未产生或从未缓存过的回答可能返回 `result:null`，不会拿其他回答代替。缓存不是已下载原图，原图保存仍以 `verifiedDownloads` 为准。
 
 ## 逐张生图与并行流程
 
@@ -83,7 +107,7 @@ MCP 返回 structuredContent JSON，并附带相同内容的文本。状态字�
 2. 每页读取 models，选择实际菜单标签并检查 confirmed；把读回的模型名称用于 send.expectedModel。
 3. 为三个任务分别固定 requestId，分别提交，不等待前一个生成完成。
 4. 用一次 status 查看全部任务；需要新观测时 refresh:true，各 tab 最多等 2 秒且并行执行；等待变化可用 wait。
-5. 每个 run 完成后调用 result、download。同一 profile 的下载串行处理。
+5. 每个 run 完成后调用 result，检查正文及图片状态，有实际可下载图片时再调用 download。同一 profile 的下载串行处理。
 
 `submission_unknown` 表示网页是否接受尚未确认。先查询或用**相同 ID、相同参数**重试，不能换 ID 重发。重复请求返回 existing:true 和原 runId。已有草稿不会被覆盖。
 
@@ -128,14 +152,15 @@ setup 生成 runtime/extension、固定扩展 ID、本机认证配置，不代�
 
 已有实例的源码可以独立纳入本仓库，当前安装不会自动迁移。迁移运行实例时需保留其 runtime 配置和状态；环境变量 CHATGPT_BRIDGE_RUNTIME 可指定现有 runtime 目录。Chrome 扩展仍从加载时的目录运行，重新加载前应保留该目录。每个实例的认证配置需与其本地服务一致。
 
-页面适配层更新后，npm run setup 和 node src/cli.mjs refresh_observers 可更新当前文档的观察器。content.js 新增命令通常需要重新加载对应页面；修改 manifest 或 background 时需要在 Chrome 中重新加载扩展。adapter 版本 28 已在实际页面读回，包含多段提示词回读、长消息展开按钮过滤、同 tab 新聊天、多图保存及原图字节传输。当前源码版本 29 修正了小窗口下多图原图与缩略图的识别，已通过回归测试，尚未单独实机验收。新聊天和原图传输兼容现有 content.js 的固定 read 消息格式。
+页面适配层更新后，npm run setup 和 node src/cli.mjs refresh_observers 可更新当前文档的观察器。content.js 新增命令通常需要重新加载对应页面；修改 manifest 或 background 时需要在 Chrome 中重新加载扩展。当前 adapter 源码版本 30 在同 tab 新聊天、多图保存、原图传输及小窗口选图适配上，增加了独立的回答结束观测和正文/图片信息读取。新聊天、正文读取和原图传输兼容现有 content.js 的固定 read 消息格式；服务端也须重启以加载新的完成语义。
 
 ## 验证范围与限制
 
-- 当前本机 Chrome 152、已登录 ChatGPT 中文页面、GPT-5.5 菜单、三 tab 文生图和原图获取已验证；初次验收完成 60 次真实 MCP 状态查询，当前 44 个自动化测试通过。
+- 当前本机 Chrome 152、已登录 ChatGPT 中文页面、GPT-5.5 菜单、三 tab 文生图和原图获取已验证；初次验收完成 60 次真实 MCP 状态查询，当前 53 个自动化测试通过。
 - 重新加载扩展后，另行验证了 GPT-5.6 Sol → GPT-5.5 切换、新聊天、图片生成、阶段查询和原图下载。进度按 generating、finalizing、completed 等阶段返回，当前不提供生成百分比。
-- 完成回答中的同源图片如果仍处于 lazy/pending，会启动加载；只有浏览器实际加载成功才允许任务完成。原始图片观测含 loadState 和 loading，便于区分等待加载与加载失败。
-- 多图任务须等待所有已观测的新图片加载后才完成；保存或恢复时发现已完成图片缺失，会保留任务并报错，不将部分图片报告为全部完成。
+- 回答结束即完成任务，纯文字及拒绝回复不再卡在 finalizing。完成回答中的同源图片如果仍处于 lazy/pending，会启动加载；图片状态单独通过 loadState 和 loading 返回。
+- 保存或恢复原图须检查图片是否存在、加载成功且字节校验通过。图片尚未加载或缺失时，下载操作会说明原因，任务仍保持 completed，不将其误报为回答未结束或将部分图片冒充全部已保存。
+- 通用完成语义已通过真实 MCP 验证：kind:image 的纯文字无图任务返回 completed，并可取得缓存的完整正文；另一图文回答可实时返回正文及图片尺寸、URL 和加载状态。对已完成任务调用最长 25 秒的 wait，实测约 4 ms 返回。
 - 实际重启本地服务后约 619 ms 恢复五个 tab，期间返回 unknown，三个任务和下载哈希保留。
 - 完整 Chrome 重启会产生新的 browserSessionId，目前不把旧 run 自动绑定到新 tab。可查旧记录，继续操作前重新获取 tabKey，不用旧数字 ID 猜关联。
 - 网页改版可能需要更新 extension/adapter.js。图片编辑、附件、复杂研究模式、多 profile 并发和长期压力运行未纳入本次验收。

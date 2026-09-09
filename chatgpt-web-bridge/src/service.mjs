@@ -5,8 +5,11 @@ import { StateStore } from './store.mjs';
 import { tokenEquals } from './config.mjs';
 import { matchDownloadedFiles, saveTransferredOriginal, verifySavedOriginals } from './downloads.mjs';
 
-function requireCompleteImageAssets(run, assets) {
-  if (!Array.isArray(assets) || assets.length < run.images.length) {
+function requireCompleteImageAssets(run, result) {
+  const images = result.images ?? run.images ?? [];
+  if (!images.length) throw new Error('The completed response contains no images');
+  if (images.some(image => !image.loaded)) throw new Error('Response finished, but images are still loading or failed to load; inspect result.images');
+  if (!Array.isArray(result.assets) || result.assets.length < Math.max(images.length, run.images?.length || 0)) {
     throw new Error('Incomplete image result: some completed images are no longer loaded; refresh this conversation before saving');
   }
 }
@@ -230,22 +233,39 @@ export class BridgeService {
       });
       case 'result': {
         const run = this.store.runView(params.runId);
+        if (params.includeText === false) return { run };
+        const assistantId = run.resultAssistantId || run.responseAssistantId;
+        if (!assistantId) return { run, result: null, resultSource: null };
         const tab = this.store.data.tabs[run.tabKey];
-        if (params.includeText && tab && this.clients.has(tab.profileId) && (!run.conversationId || run.conversationId === tab.conversationId)) {
-          if (!run.resultAssistantId) throw new Error('No completed assistant message has been identified for this run');
-          const result = await this.command(tab.profileId, 'read', { tabId: tab.tabId, documentId: tab.documentId, assistantId: run.resultAssistantId }, 3000);
-          return { run, result };
+        let resultError = 'The original response is not available in its tracked tab';
+        if (tab && this.clients.has(tab.profileId) && !tab.closed && tab.documentId === run.documentIdAtSend &&
+            (!run.conversationId || run.conversationId === tab.conversationId)) {
+          try {
+            const target = params.includeAssets === true ? assistantId : { operation: 'response', assistantId };
+            const read = await this.command(tab.profileId, 'read', { tabId: tab.tabId, documentId: tab.documentId, assistantId: target }, 5000);
+            if (read.assistantId !== assistantId || typeof read.text !== 'string') throw new Error('Response identity or text could not be verified');
+            const current = this.store.runView(run.id);
+            const result = { assistantId, text: read.text, images: read.images || [], assets: read.assets || [],
+              complete: current.phase === 'completed' && current.resultAssistantId === assistantId, observedAt: new Date().toISOString() };
+            if (assistantId === (current.resultAssistantId || current.responseAssistantId)) {
+              this.store.data.runs[run.id].responseCache = result;
+              this.store.changed(); await this.store.save();
+            }
+            return { run: this.store.runView(run.id), result, resultSource: 'live' };
+          } catch (error) { resultError = error.message; }
         }
-        return { run };
+        const cached = this.store.data.runs[run.id].responseCache;
+        return { run, result: cached?.assistantId === assistantId ? cached : null,
+          resultSource: cached?.assistantId === assistantId ? 'cache' : null, resultError };
       }
       case 'recover_images': {
         const run = this.store.runView(params.runId);
-        if (run.phase !== 'completed' || !run.images?.length) throw new Error('Only completed loaded image results can be recovered');
+        if (run.phase !== 'completed') throw new Error('The response has not finished');
         return this.withLock(`download:${run.profileId}`, async () => {
           const tab = this.target(run.tabKey, { allowBusy: true });
           if (tab.conversationId !== run.conversationId) throw new Error('Tab no longer displays this run');
           const result = await this.command(tab.profileId, 'read', { tabId: tab.tabId, documentId: tab.documentId, assistantId: run.resultAssistantId }, 5000);
-          requireCompleteImageAssets(run, result.assets);
+          requireCompleteImageAssets(run, result);
           const files = [];
           for (let index = 0; index < result.assets.length; index++) {
             const asset = result.assets[index], chunks = []; let offset = 0;
@@ -264,12 +284,12 @@ export class BridgeService {
       }
       case 'download': {
         const run = this.store.runView(params.runId);
-        if (run.phase !== 'completed' || !(run.images?.length)) throw new Error('The image run is not confirmed complete');
+        if (run.phase !== 'completed') throw new Error('The response has not finished');
         return this.withLock(`download:${run.profileId}`, async () => {
           const tab = this.target(run.tabKey, { allowBusy: true });
           if (tab.conversationId !== run.conversationId) throw new Error('Tab no longer displays this run');
           const result = await this.command(tab.profileId, 'read', { tabId: tab.tabId, documentId: tab.documentId, assistantId: run.resultAssistantId }, 4000);
-          requireCompleteImageAssets(run, result.assets);
+          requireCompleteImageAssets(run, result);
           const saved = await verifySavedOriginals(result.assets, run.verifiedDownloads);
           if (saved) return { runId: run.id, state: 'saved_and_verified', complete: true, files: saved, expectedCount: saved.length, reused: true };
           if (result.assets.length > 1) {

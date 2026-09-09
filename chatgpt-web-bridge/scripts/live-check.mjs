@@ -70,7 +70,7 @@ if (action === 'create') {
   const index = Number(process.argv[3] || 0);
   const status = await call('status');
   const run = status.runs.find(r => r.requestId === evidence.requests[index].requestId);
-  const event = await timed('result', { runId: run.id, includeText: true });
+  const event = await timed('result', { runId: run.id, includeText: true, includeAssets: true });
   console.log(JSON.stringify({ runId: run.id, result: { assistantId: event.result.result.assistantId, text: event.result.result.text, assets: event.result.result.assets } }, null, 2));
 } else if (action === 'download') {
   const index = Number(process.argv[3] || 0);

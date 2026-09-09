@@ -1,5 +1,5 @@
 (() => {
-  const adapterVersion = 29;
+  const adapterVersion = 30;
   if (globalThis.ChatGPTBridgeAdapter?.version === adapterVersion) return;
   const doc = document;
   const normalize = value => String(value || '').replace(/\r\n/g, '\n').trim();
@@ -51,11 +51,17 @@
     for (let i = 0; i < value.length; i++) h = Math.imul(h ^ value.charCodeAt(i), 16777619);
     return (h >>> 0).toString(16);
   };
-  const imageElements = assistant => assistant ? all('img', assistant).filter(img => {
-    const width = img.naturalWidth || Number(img.getAttribute('width')) || img.width;
-    const height = img.naturalHeight || Number(img.getAttribute('height')) || img.height;
-    return width >= 256 && height >= 256 && !/avatar|profile picture|头像/i.test(img.alt || '');
-  }) : [];
+  const imageElements = assistant => assistant ? all('img', assistant).filter(img =>
+    (img.currentSrc || img.getAttribute('src')) && !/avatar|profile picture|头像/i.test(img.alt || '')) : [];
+  const imageInfo = (img, index, assistantId) => ({
+    key: `${assistantId}:${index}:${fingerprint(img.currentSrc || img.src)}`, index,
+    sourceUrl: img.currentSrc || img.src,
+    loaded: !!img.complete && img.naturalWidth > 0 && img.naturalHeight > 0,
+    loadState: img.complete ? (img.naturalWidth ? 'loaded' : 'error') : 'pending',
+    loading: img.getAttribute('loading') || 'auto',
+    width: img.naturalWidth, height: img.naturalHeight, alt: normalize(img.alt),
+    source: 'rendered_image', originalDownloadVerified: false,
+  });
   const downloadButtons = assistant => all('button,[role="button"],a[download]', turnRoot(assistant) || doc.createElement('div'))
     .filter(n => /^(download( image| original| file)?|下载(此图片|图片|原图|文件)?|保存图片)$/i.test(label(n)));
   const imageViewer = () => all('[role="dialog"]').find(root => imageElements(root).length && buttons(root).some(n => /^(关闭全屏显示|Close full screen|Close fullscreen)$/i.test(label(n))));
@@ -93,14 +99,7 @@
         catch { /* Leave malformed page URLs for the normal image error state. */ }
       }
     }
-    const images = imageNodes.map((img, index) => ({
-      key: `${lastId || assistants.length}:${index}:${fingerprint(img.currentSrc || img.src)}`,
-      loaded: !!img.complete && img.naturalWidth >= 256 && img.naturalHeight >= 256,
-      loadState: img.complete ? (img.naturalWidth ? 'loaded' : 'error') : 'pending',
-      loading: img.getAttribute('loading') || 'auto',
-      width: img.naturalWidth, height: img.naturalHeight, alt: normalize(img.alt).slice(0, 200),
-      source: 'rendered_image', originalDownloadVerified: false,
-    }));
+    const images = imageNodes.map((img, index) => imageInfo(img, index, lastId || assistants.length));
     return {
       url: location.href, title: doc.title, activity, model,
       attention: (attention || error || '').slice(0, 500) || null,
@@ -110,6 +109,7 @@
       lastUserId: messageId(lastUser), lastUserText: userText(lastUser), lastAssistantId: lastId,
       lastAssistantPreview: output.slice(-400), lastAssistantLength: output.length,
       images, finalActions,
+      responseSignature: fingerprint(JSON.stringify([output, activity, finalActions, users.length, lastId])),
       contentSignature: fingerprint(JSON.stringify([output, images, activity, finalActions, users.length, lastId])),
       adapterVersion,
     };
@@ -247,32 +247,38 @@
     button.click();
     return { stopped: !!await until(() => !stop(), 1800) };
   }
+  function readResponse(assistantId) {
+    const list = messages('assistant');
+    const target = assistantId ? list.find(n => messageId(n) === assistantId) : list.at(-1);
+    if (!target) throw new Error('Requested assistant message is not present in this page');
+    return { assistantId: messageId(target), text: text(target),
+      images: imageElements(turnRoot(target)).map((img, index) => imageInfo(img, index, messageId(target))), assets: [] };
+  }
   async function read(assistantId) {
     // Older installed content scripts already route read payloads. The service
     // validates and locks these fixed operations before using this envelope.
     if (assistantId && typeof assistantId === 'object') {
       if (assistantId.operation === 'new_chat') return newChat();
+      if (assistantId.operation === 'response') return readResponse(assistantId.assistantId);
       if (assistantId.operation !== 'image_chunk') throw new Error('Unknown image read operation');
       return imageChunk(assistantId.assistantId, assistantId.index, assistantId.offset);
     }
-    const list = messages('assistant');
-    const target = assistantId ? list.find(n => messageId(n) === assistantId) : list.at(-1);
-    if (!target) throw new Error('Requested assistant message is not present in this page');
-    const images = [...turnRoot(target).querySelectorAll('img')].filter(img => img.alt && img.complete && img.naturalWidth >= 256 && img.naturalHeight >= 256);
-    const assets = [];
-    for (const img of images) {
-      const sourceUrl = img.currentSrc || img.src;
-      const url = new URL(sourceUrl, location.href);
-      if (url.origin !== location.origin || !crypto.subtle) continue;
-      // This is the exact already-rendered image URL, never a guessed backend endpoint.
-      const response = await fetch(sourceUrl, { credentials: 'same-origin', cache: 'force-cache' });
-      if (!response.ok || !response.headers.get('content-type')?.startsWith('image/')) throw new Error('Rendered image bytes are not available');
-      const bytes = await response.arrayBuffer();
-      const digest = await crypto.subtle.digest('SHA-256', bytes);
-      assets.push({ sourceUrl, sha256: [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join(''), byteLength: bytes.byteLength, mimeType: response.headers.get('content-type'), width: img.naturalWidth, height: img.naturalHeight, alt: img.alt, browserDecoded: true });
+    const result = readResponse(assistantId);
+    for (const img of result.images) {
+      if (!img.loaded) continue;
+      try {
+        const url = new URL(img.sourceUrl, location.href);
+        if (url.origin !== location.origin || !crypto.subtle) { img.assetError = 'Exact same-origin image hashing is unavailable'; continue; }
+        // Hashing is optional; media failures must not hide the response text.
+        const response = await fetch(img.sourceUrl, { credentials: 'same-origin', cache: 'force-cache' });
+        if (!response.ok || !response.headers.get('content-type')?.startsWith('image/')) throw new Error('Rendered image bytes are not available');
+        const bytes = await response.arrayBuffer();
+        const digest = await crypto.subtle.digest('SHA-256', bytes);
+        result.assets.push({ sourceUrl: img.sourceUrl, sha256: [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join(''), byteLength: bytes.byteLength, mimeType: response.headers.get('content-type'), width: img.width, height: img.height, alt: img.alt, browserDecoded: true });
+      } catch (error) { img.assetError = error.message; }
     }
     const viewer = imageViewer();
-    return { assistantId: messageId(target), text: text(target), assets, snapshot: snapshot(),
+    return { ...result, snapshot: snapshot(),
       viewer: viewer ? { text: text(viewer).slice(-1200), controls: buttons(viewer).map(n => ({ label: label(n), disabled: !!n.disabled })) } : null };
   }
   let downloadTarget;
@@ -280,7 +286,7 @@
     if (!Number.isInteger(index) || index < 0 || !Number.isInteger(offset) || offset < 0) throw new Error('Invalid image chunk parameters');
     const assistant = messages('assistant').find(n => messageId(n) === assistantId);
     if (!assistant) throw new Error('Requested assistant is not present');
-    const images = [...turnRoot(assistant).querySelectorAll('img')].filter(n => n.alt && n.complete && n.naturalWidth >= 256 && n.naturalHeight >= 256);
+    const images = imageElements(turnRoot(assistant)).filter(n => n.complete && n.naturalWidth > 0 && n.naturalHeight > 0);
     const img = images[index]; if (!img) throw new Error('Loaded image index is out of bounds');
     const source = img.currentSrc || img.src, url = new URL(source, location.href);
     if (url.origin !== location.origin) throw new Error('Only the exact displayed same-origin image can be transferred');
@@ -297,7 +303,7 @@
   async function downloadInfo(assistantId) {
     const assistant = assistantId ? messages('assistant').find(n => messageId(n) === assistantId) : messages('assistant').at(-1);
     if (!assistant) throw new Error('Image message is no longer present');
-    const loaded = [...turnRoot(assistant).querySelectorAll('img')].filter(n => n.alt && n.complete && n.naturalWidth >= 256 && n.naturalHeight >= 256);
+    const loaded = imageElements(turnRoot(assistant)).filter(n => n.complete && n.naturalWidth > 0 && n.naturalHeight > 0);
     if (loaded.length > 1) {
       const images = loaded.map(n => n.currentSrc || n.src);
       downloadTarget = { assistantId: messageId(assistant), imageSrc: images[0], images };
@@ -311,7 +317,7 @@
     }
     let controls = downloadButtons(assistant);
     if (!controls.length) {
-      const img = [...turnRoot(assistant).querySelectorAll('img')].find(n => n.alt && n.complete && n.naturalWidth >= 256);
+      const img = loaded[0];
       const opener = img?.closest('[role="button"]');
       if (!opener) throw new Error('No image viewer or original download control is available');
       downloadTarget = { assistantId: messageId(assistant), imageSrc: img.currentSrc || img.src };
@@ -334,7 +340,7 @@
       // Thumbnail images use the same source as the original. Identify their
       // controls instead of assuming the full image has a minimum CSS height.
       const selected = () => all('img', viewer).some(img =>
-        (img.currentSrc || img.src) === source && img.complete && img.naturalWidth >= 256 && img.naturalHeight >= 256 &&
+        (img.currentSrc || img.src) === source && img.complete && img.naturalWidth > 0 && img.naturalHeight > 0 &&
         !thumbnails.some(control => control.contains(img)));
       if (!selected()) {
         const thumb = thumbnails.find(n => label(n).startsWith(`图片 ${index + 1}（共 ${downloadTarget.images.length} 张）：`) ||

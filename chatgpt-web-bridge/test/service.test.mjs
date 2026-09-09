@@ -97,3 +97,63 @@ for (const method of ['download', 'recover_images']) test(`${method} rejects mis
   await assert.rejects(rpc(method, { runId: run.id }), /Incomplete image result/);
   assert.deepEqual(commands, ['read']); assert.equal(run.verifiedDownloads, undefined);
 });
+
+test('result defaults to exact response text and image metadata and preserves a cache across navigation', async t => {
+  const { service, ws, rpc, snapshot, until } = await fixture(t);
+  snapshot(snap(1)); await until(() => Object.keys(service.store.data.tabs).length === 1);
+  const tabKey = Object.keys(service.store.data.tabs)[0];
+  const { run } = await service.store.reserve({ tabKey, prompt: 'show output', requestId: 'default-result-content' });
+  Object.assign(run, { phase: 'completed', accepted: true, resultAssistantId: 'target-answer', images: [] });
+  const commands = [], text = '无法根据该请求生成图片。\n这是网页实际输出的完整说明。';
+  ws.on('message', data => {
+    const message = JSON.parse(data); if (message.type !== 'command') return;
+    commands.push(message);
+    ws.send(JSON.stringify({ type: 'result', id: message.id, result: { assistantId: 'target-answer', text,
+      images: [{ sourceUrl: 'https://chatgpt.com/pending.png', loaded: false, loadState: 'pending', alt: 'pending' }], assets: [] } }));
+  });
+  const first = await rpc('result', { runId: run.id });
+  assert.deepEqual(commands[0].params.assistantId, { operation: 'response', assistantId: 'target-answer' });
+  assert.equal(first.result.text, text); assert.equal(first.result.complete, true);
+  assert.equal(first.result.images[0].loadState, 'pending'); assert.equal(first.resultSource, 'live');
+  assert.equal(first.run.responseCache, undefined);
+  assert.equal((await rpc('result', { runId: run.id, includeText: false })).result, undefined);
+  assert.equal(commands.length, 1);
+  snapshot(snap(1, { url: 'https://chatgpt.com/c/different-chat', lastAssistantId: 'unrelated-answer' }));
+  await until(() => service.store.data.tabs[tabKey].conversationId === 'different-chat');
+  const cached = await rpc('result', { runId: run.id });
+  assert.equal(cached.resultSource, 'cache'); assert.equal(cached.result.text, text); assert.equal(commands.length, 1);
+});
+
+test('result exposes an associated streaming response and leaves completion false', async t => {
+  const { service, ws, rpc, snapshot, until } = await fixture(t);
+  snapshot(snap(1)); await until(() => Object.keys(service.store.data.tabs).length === 1);
+  const tabKey = Object.keys(service.store.data.tabs)[0];
+  const { run } = await service.store.reserve({ tabKey, prompt: 'explain this', requestId: 'streaming-result' });
+  assert.equal((await rpc('result', { runId: run.id })).result, null);
+  snapshot(snap(1, { userCount: 1, lastUserId: 'stream-user', lastUserText: run.prompt, assistantCount: 1,
+    lastAssistantId: 'stream-answer', activity: 'generating', contentSignature: 'streaming' }));
+  await until(() => run.responseAssistantId === 'stream-answer');
+  ws.on('message', data => {
+    const message = JSON.parse(data); if (message.type !== 'command') return;
+    ws.send(JSON.stringify({ type: 'result', id: message.id, result: { assistantId: 'stream-answer', text: 'Partial output', images: [], assets: [] } }));
+  });
+  const result = await rpc('result', { runId: run.id });
+  assert.equal(result.result.text, 'Partial output'); assert.equal(result.result.complete, false);
+  assert.equal(result.run.phase, 'generating');
+});
+
+for (const images of [[], [{ loaded: false, loadState: 'pending' }]]) test(`download checks ${images.length ? 'pending media' : 'no images'} after response completion`, async t => {
+  const { service, ws, rpc, snapshot, until } = await fixture(t);
+  snapshot(snap(1)); await until(() => Object.keys(service.store.data.tabs).length === 1);
+  const tabKey = Object.keys(service.store.data.tabs)[0];
+  const { run } = await service.store.reserve({ tabKey, prompt: 'output', requestId: `download-validation-${images.length}` });
+  Object.assign(run, { phase: 'completed', resultAssistantId: 'finished-answer', images });
+  const commands = [];
+  ws.on('message', data => {
+    const message = JSON.parse(data); if (message.type !== 'command') return;
+    commands.push(message.command);
+    ws.send(JSON.stringify({ type: 'result', id: message.id, result: { assistantId: 'finished-answer', text: 'Finished', images, assets: [] } }));
+  });
+  await assert.rejects(rpc('download', { runId: run.id }), images.length ? /still loading/ : /contains no images/);
+  assert.equal(run.phase, 'completed'); assert.deepEqual(commands, ['read']);
+});

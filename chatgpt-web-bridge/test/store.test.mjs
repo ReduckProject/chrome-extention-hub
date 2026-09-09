@@ -52,14 +52,13 @@ test('network disconnect, frozen tab and old cache are unknown, never completion
   store.connect(profile); snap(1, { frozen: true }); assert.equal(store.tabView(tabKey).freshness.stale, true);
   snap(1); advance(31000); assert.equal(store.tabView(tabKey).activity, 'unknown');
 });
-test('no completion for an older assistant, unloaded image, missing final actions or later user message', async () => {
+test('no completion for an older assistant, missing final actions or later user message', async () => {
   const { store, snap, advance } = fixture(); const tabKey = snap(1);
   const { run } = await store.reserve({ tabKey, prompt: 'draw a pear', requestId: 'pear-job' });
   store.submissionResult(run.id, { accepted: true, userMessageId: 'pear-user' });
   snap(1, { userCount: 1, lastUserId: 'pear-user', lastUserText: 'draw a pear', finalActions: true });
   advance(3000); store.reconcile(); assert.notEqual(run.phase, 'completed');
   const image = { userCount: 1, lastUserId: 'pear-user', lastUserText: 'draw a pear', assistantCount: 1, lastAssistantId: 'pear-assistant', finalActions: true, images: [{ key: 'pear-image', loaded: false }], contentSignature: 'unloaded' };
-  snap(1, image); advance(3000); store.reconcile(); assert.notEqual(run.phase, 'completed');
   snap(1, { ...image, images: [{ key: 'pear-image', loaded: true }], finalActions: false, contentSignature: 'no-controls' });
   advance(3000); store.reconcile(); assert.notEqual(run.phase, 'completed');
   snap(1, { ...image, images: [{ key: 'pear-image', loaded: true }], lastUserId: 'human-next', lastUserText: 'another picture', contentSignature: 'other' });
@@ -72,18 +71,45 @@ test('another tab showing the same conversation cannot submit concurrently', asy
   await assert.rejects(store.reserve({ tabKey: second, prompt: 'two', requestId: 'second-request' }), /already owns/);
 });
 
-test('a multi-image run waits for every new image to load before completing', async () => {
+test('a finished response completes independently of image loading and wakes wait immediately', { timeout: 1000 }, async () => {
   const { store, snap, advance } = fixture(); const tabKey = snap(1);
-  const { run } = await store.reserve({ tabKey, prompt: 'draw two pears', requestId: 'two-pear-job' });
+  const { run } = await store.reserve({ tabKey, prompt: 'draw two pears', requestId: 'two-pear-job', kind: 'image' });
   store.submissionResult(run.id, { accepted: true, userMessageId: 'two-pear-user' });
   const answer = { userCount: 1, lastUserId: 'two-pear-user', lastUserText: run.prompt,
     assistantCount: 1, lastAssistantId: 'two-pear-answer', finalActions: true,
-    images: [{ key: 'first-pear', loaded: true }, { key: 'second-pear', loaded: false }], contentSignature: 'one-image-pending' };
-  snap(1, answer); advance(3000); store.reconcile();
-  assert.equal(run.phase, 'finalizing'); assert.equal(run.completedAt, undefined);
+    images: [{ key: 'first-pear', loaded: true }, { key: 'second-pear', loaded: false }], contentSignature: 'one-image-pending', responseSignature: 'answer-ended' };
+  snap(1, answer); advance(2000);
+  snap(1, { ...answer, contentSignature: 'image-progress-changed' }); advance(600); store.reconcile();
+  assert.equal(run.phase, 'completed'); assert.equal(run.completionReason, 'response_finished');
+  assert.equal(run.images.length, 2); assert.equal(run.images[1].loaded, false);
+  const completedAt = run.completedAt;
+  assert.equal((await store.wait({ runId: run.id, afterRevision: store.data.revision, timeoutMs: 25000 })).run.phase, 'completed');
   snap(1, { ...answer, images: answer.images.map(image => ({ ...image, loaded: true })), contentSignature: 'both-images-loaded' });
+  assert.equal(run.images[1].loaded, true); assert.equal(run.completedAt, completedAt);
+  snap(1, { ...answer, lastAssistantId: 'another-answer', images: [{ key: 'unrelated', loaded: true }] });
+  assert.deepEqual(run.images.map(image => image.key), ['first-pear', 'second-pear']);
+});
+
+for (const kind of ['text', 'image']) test(`${kind} intent completes a text-only refusal and notifies a waiting caller`, async () => {
+  const { store, snap, advance } = fixture(); const tabKey = snap(1);
+  const { run } = await store.reserve({ tabKey, prompt: 'requested output', requestId: `refusal-${kind}`, kind });
+  store.submissionResult(run.id, { accepted: true, userMessageId: 'refusal-user' });
+  snap(1, { userCount: 1, lastUserId: 'refusal-user', lastUserText: run.prompt, assistantCount: 1,
+    lastAssistantId: 'refusal-answer', lastAssistantPreview: '无法根据该请求生成图片。', finalActions: true, contentSignature: 'refusal-ended' });
+  const notification = store.wait({ runId: run.id, afterRevision: store.data.revision, timeoutMs: 1000 });
   advance(2600); store.reconcile();
-  assert.equal(run.phase, 'completed'); assert.equal(run.images.length, 2);
+  const result = await notification;
+  assert.equal(result.run.phase, 'completed'); assert.equal(result.run.resultAssistantId, 'refusal-answer');
+  assert.equal(result.run.resultPreview, '无法根据该请求生成图片。'); assert.deepEqual(result.run.images, []);
+});
+
+test('new requests default to text while legacy default-image request IDs stay idempotent', async () => {
+  const { store, snap } = fixture(); const tabKey = snap(1);
+  const params = { tabKey, prompt: 'legacy prompt', requestId: 'legacy-default-kind' };
+  const original = await store.reserve({ ...params, kind: 'image' });
+  assert.equal((await store.reserve(params)).run.id, original.run.id);
+  await assert.rejects(store.reserve({ ...params, kind: 'text' }), /different input/);
+  assert.equal((await store.reserve({ tabKey: snap(2), prompt: 'new prompt', requestId: 'new-default-kind' })).run.kind, 'text');
 });
 test('browser session ID isolates reused numeric tab IDs', () => {
   const { store, snap } = fixture(); const a = snap(1), b = snap(1, { browserSessionId: 'new-browser-session' });
