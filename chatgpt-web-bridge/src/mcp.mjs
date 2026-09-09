@@ -26,7 +26,7 @@ export const toolDefinitions = specs.map(([name, description, inputSchema, readO
   annotations: { readOnlyHint: !!readOnly, destructiveHint: false, openWorldHint: true },
 }));
 const compactRun = run => ({ runId: run.id, tabKey: run.tabKey, phase: run.phase, accepted: run.accepted,
-  completionReason: run.completionReason, completedAt: run.completedAt,
+  completionReason: run.completionReason, completionEvidence: run.completionEvidence, completedAt: run.completedAt,
   conversationId: run.conversationId, selectedAtSend: run.selectedAtSend, observation: run.observation,
   observationIssue: run.observationIssue, error: run.error || run.submissionError, attention: run.attention, attentionType: run.attentionType,
   imageCount: run.images?.length || 0, loadedImageCount: run.images?.filter(image => image.loaded).length || 0,
@@ -36,7 +36,7 @@ function compact(method, result) {
     tabKey: tab.key, tabId: tab.tabId, profileId: tab.profileId, browserSessionId: tab.browserSessionId,
     title: tab.title, url: tab.url, conversationId: tab.conversationId, model: tab.model,
     activity: tab.activity, connection: tab.connection, freshness: tab.freshness, attention: tab.attention,
-    attentionType: tab.attentionType, accessPause: tab.accessPause,
+    attentionType: tab.attentionType, accessPause: tab.accessPause, adapterVersion: tab.adapterVersion,
     surface: tab.surface, composerReady: tab.composerReady, draftLength: tab.draftLength, observationError: tab.observationError,
   }));
   if (result.runs) result.runs = result.runs.map(compactRun);

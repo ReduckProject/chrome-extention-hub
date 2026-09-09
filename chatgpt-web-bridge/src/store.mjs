@@ -7,6 +7,16 @@ import { conversationId, isChatGPT } from './config.mjs';
 const terminal = new Set(['completed', 'stopped', 'error']);
 export const hash = value => createHash('sha256').update(String(value)).digest('hex');
 
+function finishedResponseStream(run, tab) {
+  const baseline = new Set(run.baseline.responseStreamKeys || []);
+  const latest = (tab.responseStreams || []).filter(stream => !baseline.has(stream.key) &&
+    Number.isFinite(stream.startedAt) && stream.startedAt >= run.createdAt &&
+    Number.isFinite(stream.endedAt) && stream.endedAt > stream.startedAt && stream.endedAt <= tab.receivedAt)
+    .sort((a, b) => b.startedAt - a.startedAt)[0];
+  // Never let an earlier successful request mask a later failed response.
+  return latest?.status === 200 ? latest : null;
+}
+
 export class StateStore extends EventEmitter {
   constructor({ file = null, staleMs = 30000, now = Date.now } = {}) {
     super();
@@ -163,7 +173,8 @@ export class StateStore extends EventEmitter {
       phase: 'submitting', createdAt: this.now(), updatedAt: this.now(),
       conversationId: tab.conversationId, selectedAtSend: tab.model,
       documentIdAtSend: tab.documentId,
-      baseline: { userCount: tab.userCount, assistantCount: tab.assistantCount, lastAssistantId: tab.lastAssistantId, imageKeys: (tab.images || []).map(image => image.key) },
+      baseline: { userCount: tab.userCount, assistantCount: tab.assistantCount, lastAssistantId: tab.lastAssistantId, imageKeys: (tab.images || []).map(image => image.key),
+        responseStreamKeys: (tab.responseStreams || []).map(stream => stream.key) },
       accepted: false, observedGeneration: false, downloads: [],
     };
     this.data.requests[requestId] = { digest, runId: run.id };
@@ -211,6 +222,11 @@ export class StateStore extends EventEmitter {
         continue;
       }
       const before = JSON.stringify(run);
+      if (tab.documentId !== run.documentIdAtSend) {
+        run.observationIssue = 'page_document_changed';
+        if (JSON.stringify(run) !== before) changed = true;
+        continue;
+      }
       const textMatches = String(tab.lastUserText || '').replace(/\r\n/g, '\n').trim() === run.prompt.replace(/\r\n/g, '\n').trim();
       // ChatGPT replaces its WEB:<uuid> draft URL with a canonical conversation URL
       // after accepting a new chat. Bind only with the same document and exact user message.
@@ -256,15 +272,20 @@ export class StateStore extends EventEmitter {
         run.resultPreview = tab.lastAssistantPreview; run.resultLength = tab.lastAssistantLength;
         run.images = (tab.images || []).filter(image => !run.baseline.imageKeys.includes(image.key));
       }
+      const stream = finishedResponseStream(run, tab);
+      const completionEvidence = stream ? { source: 'response_stream_end', requestKey: stream.key,
+        startedAt: stream.startedAt, endedAt: stream.endedAt } : tab.finalActions ? { source: 'response_actions' } : null;
+      const stableSince = Math.max(tab.lastResponseChangeAt ?? tab.lastContentChangeAt, stream?.endedAt || 0);
       if (tab.activity === 'generating' || tab.activity === 'thinking') {
         run.observedGeneration = true; run.phase = tab.activity;
       } else if (tab.activity === 'needs_attention') {
         run.phase = 'awaiting_user'; run.attention = tab.attention;
       } else if (tab.activity === 'error') {
         run.phase = 'error'; run.error = tab.attention || 'Page reported an error';
-      } else if (newAssistant && tab.lastAssistantId && tab.activity === 'idle' && tab.finalActions &&
-          this.now() - (tab.lastResponseChangeAt ?? tab.lastContentChangeAt) >= 2500) {
+      } else if (newAssistant && tab.lastAssistantId && tab.activity === 'idle' && completionEvidence &&
+          this.now() - stableSince >= 2500) {
         run.phase = 'completed'; run.completedAt = this.now(); run.completionReason = 'response_finished';
+        run.completionEvidence = completionEvidence;
         run.resultAssistantId = tab.lastAssistantId;
       } else if (newAssistant && tab.activity === 'idle') run.phase = 'finalizing';
       if (JSON.stringify(run) !== before) { run.updatedAt = this.now(); changed = true; }

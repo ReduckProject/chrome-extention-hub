@@ -72,7 +72,9 @@ MCP 返回 structuredContent JSON，并附带相同内容的文本。状态字�
 }
 ```
 
-`generating` / `thinking` 表示页面活动。`run.phase:completed` 和 `completionReason:response_finished` 只表示本次网页回答已经结束：已关联本次用户消息及新回答，页面空闲、出现结束控件，回答内容稳定 2.5 秒。纯文字、拒绝说明、无图回复及图片尚未加载的回复都可完成，`kind` 不参与完成判断。新请求默认 `kind:text`；已有 requestId 的默认类型保持原值，确保升级后仍可幂等重查。
+`generating` / `thinking` 表示页面活动。`run.phase:completed` 和 `completionReason:response_finished` 只表示本次网页回答已经结束：已关联本次用户消息及新回答，页面空闲，取得回答结束证据并稳定 2.5 秒。adapter v33 被动记录网页自身的响应流 Resource Timing；本次提交之后成功结束的响应流可作为证据，不要求复制／下载按钮出现，也不要求图片加载。`completionEvidence.source:response_stream_end` 附带流开始／结束时间；缺少可用时序时仍可使用 `response_actions` 控件证据，不仅凭长时间空闲推定完成。旧请求、不同文档／用户消息、仍在生成及未知／过期观察不能据此完成。纯文字、拒绝说明、无图回复及图片尚未加载的回复都可完成，`kind` 不参与完成判断。新请求默认 `kind:text`；已有 requestId 的默认类型保持原值，确保升级后仍可幂等重查。
+
+后台 tab 的定时器可能被浏览器节流。仅在已提交且尚未结束的任务上，服务会补充有界 DOM 探测：同一 tab 正常间隔至少 3 秒、最多 4 个并发、单次超时 2 秒，失败逐步退避至 30 秒；近期已有新观察时跳过，任务结束／访问暂停后停止。探测不激活 tab、不刷新网页、不请求会话列表或图片。默认状态查询仍直接读取缓存。
 
 图片加载不重置回答内容的稳定计时。`wait` 在任务结束后立即返回，不再等待图片；完成是否满足提示词、是否真的生图，由调用方检查结果。`imageCount` 是已观测图片数，`loadedImageCount` 是加载成功数，`downloadCount` 是已验证保存的文件数。
 
@@ -165,7 +167,8 @@ setup 生成 runtime/extension、固定扩展 ID、本机认证配置，不代�
 
 ## 验证范围与限制
 
-- 既有本机 Chrome 152、已登录 ChatGPT 中文页面、GPT-5.5 菜单、三 tab 文生图和原图获取已验证；初次验收完成 60 次真实 MCP 状态查询，当前 64 个自动化测试通过。访问限流保护采用本地 DOM／WebSocket 测试；部署后通过真实观察器捕获弹窗、读取三个页面已有的请求时序并确认暂停保持。未对受限账号重新发送提示词或进行压力测试。
+- 既有本机 Chrome 152、已登录 ChatGPT 中文页面、GPT-5.5 菜单、三 tab 文生图和原图获取已验证；初次验收完成 60 次真实 MCP 状态查询，当前 71 个自动化测试通过。访问限流保护采用本地 DOM／WebSocket 测试；部署后通过真实观察器捕获弹窗、读取三个页面已有的请求时序并确认暂停保持。没有在限制提示仍存在时重新发送提示词或进行压力测试。
+- 2026-09-10 adapter v33 实测：一个后台 tab 的回答流结束后约 3.8 秒返回 completed，完成时 visibility:hidden、hasFocus:false、finalActions:false，图片仍 lazy/pending。证明此次完成不依赖前台激活、图片加载或完成按钮；该窗口未观察到 HTTP 429。只是一轮样本，不证明此前多 tab 会话列表限流的根因已消除。
 - `noticeVisible:null` / `observationPending:true` 表示原限流页面的观察已过期，不能据此认定提示消失；恢复前须取得一次新的页面观察，默认状态查询不会为此刷新网页。
 - 重新加载扩展后，另行验证了 GPT-5.6 Sol → GPT-5.5 切换、新聊天、图片生成、阶段查询和原图下载。进度按 generating、finalizing、completed 等阶段返回，当前不提供生成百分比。
 - 回答结束即完成任务，纯文字及拒绝回复不再卡在 finalizing。lazy/pending 图片状态通过 loadState 和 loading 返回，只有显式 loadImages:true 才会启动同源图片加载。

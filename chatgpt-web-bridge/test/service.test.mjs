@@ -61,7 +61,7 @@ test('lazy loading is an explicit completed-result operation, never a default qu
   const tabKey = service.store.list()[0].key;
   const { run } = await service.store.reserve({ tabKey, prompt: 'image', requestId: 'explicit-image-loading' });
   await assert.rejects(rpc('result', { runId: run.id, loadImages: true }), /completed response/);
-  Object.assign(run, { phase: 'completed', resultAssistantId: 'pending-image', accepted: true });
+  Object.assign(run, { phase: 'completed', resultAssistantId: 'pending-image', userMessageId: 'image-user', completedAt: Date.now(), accepted: true });
   let received;
   ws.on('message', data => {
     const message = JSON.parse(data); if (message.type !== 'command') return;
@@ -69,7 +69,8 @@ test('lazy loading is an explicit completed-result operation, never a default qu
     ws.send(JSON.stringify({ type: 'result', id: message.id, result: { assistantId: 'pending-image', text: 'Done', images: [{ loaded: false, loading: 'eager' }], assets: [] } }));
   });
   const result = await rpc('result', { runId: run.id, loadImages: true });
-  assert.deepEqual(received, { operation: 'response', assistantId: 'pending-image', loadImages: true, includeAssets: false });
+  assert.deepEqual(received, { operation: 'response', assistantId: 'pending-image', loadImages: true, includeAssets: false,
+    completedResponse: { assistantId: 'pending-image', userMessageId: 'image-user', completedAt: run.completedAt } });
   assert.equal(result.result.complete, true); assert.equal(result.result.images[0].loaded, false);
 });
 
@@ -113,6 +114,73 @@ async function fixture(t) {
   const until = async condition => { for (let i = 0; i < 100; i++) { if (condition()) return; await new Promise(r => setTimeout(r, 10)); } throw new Error('Fixture did not settle'); };
   return { config, service, ws, rpc, snapshot, until };
 }
+
+test('a background page with no push heartbeat completes through passive probes before lazy media loads', { timeout: 10000 }, async t => {
+  const { service, ws, snapshot, until } = await fixture(t);
+  snapshot(snap(1)); await until(() => service.store.list().length === 1);
+  const tabKey = service.store.list()[0].key;
+  const { run } = await service.store.reserve({ tabKey, prompt: 'background image', requestId: 'background-no-heartbeat', kind: 'image' });
+  const answer = { userCount: 1, lastUserText: run.prompt, lastUserId: 'background-user',
+    assistantCount: 1, lastAssistantId: 'background-answer', finalActions: false,
+    images: [{ key: 'lazy-image', loaded: false, loading: 'lazy' }] };
+  snapshot(snap(1, { ...answer, activity: 'generating', responseSignature: 'generating' }));
+  await until(() => run.phase === 'generating');
+  const commands = [];
+  ws.on('message', data => {
+    const message = JSON.parse(data); if (message.type !== 'command') return;
+    commands.push(message);
+    if (message.command === 'probe') snapshot(snap(1, { ...answer, responseSignature: 'ended',
+      responseStreams: [{ key: 'finished-stream', startedAt: run.createdAt + 1, endedAt: run.createdAt + 2, status: 200 }] }));
+    ws.send(JSON.stringify({ type: 'result', id: message.id, result: { observed: true } }));
+  });
+  let observed;
+  do { observed = await service.store.wait({ runId: run.id, afterRevision: service.store.data.revision, timeoutMs: 7000 }); }
+  while (observed.run.phase !== 'completed');
+  assert.equal(observed.run.completionEvidence.source, 'response_stream_end');
+  assert.equal(observed.run.images[0].loaded, false);
+  assert.ok(commands.length > 0 && commands.length <= 3);
+  assert.ok(commands.every(command => command.command === 'probe'));
+  assert.ok(run.completedAt - run.createdAt < 8000, 'Completion must not wait for the throttled page heartbeat');
+  await service.refreshRunningTabs();
+  assert.equal(service.runProbes.size, 0, 'Completed tasks stop probing');
+});
+
+test('active DOM probes bound concurrency, avoid overlaps, back off errors and stop with the task', async t => {
+  const { service } = await fixture(t); clearInterval(service.tick);
+  let time = 100000; service.store.now = () => time;
+  const runs = [];
+  for (let i = 1; i <= 6; i++) {
+    const tabKey = service.store.snapshot(profileId, snap(i));
+    const { run } = await service.store.reserve({ tabKey, prompt: `prompt ${i}`, requestId: `probe-limit-${i}` });
+    service.store.snapshot(profileId, snap(i, { userCount: 1, lastUserId: `user-${i}`, lastUserText: run.prompt, activity: 'generating' }));
+    runs.push(run);
+  }
+  const commands = [], replies = [];
+  service.command = (profile, command, params, timeoutMs) => new Promise((resolve, reject) => {
+    commands.push({ profile, command, params, timeoutMs }); replies.push({ resolve, reject });
+  });
+  time += 2000;
+  const first = service.refreshRunningTabs();
+  assert.equal(commands.length, 4);
+  await service.refreshRunningTabs(); assert.equal(commands.length, 4, 'Pending probes cannot overlap');
+  replies.splice(0).forEach(reply => reply.resolve()); await first;
+  const rest = service.refreshRunningTabs();
+  assert.equal(commands.length, 6, 'Other tabs get their turn before recently probed tabs');
+  replies.splice(0).forEach(reply => reply.resolve()); await rest;
+  for (const run of runs.slice(1)) run.phase = 'completed';
+  time += 3000;
+  const failed = service.refreshRunningTabs(); assert.equal(commands.length, 7);
+  replies.shift().reject(new Error('Observation timeout')); await failed;
+  time += 3000;
+  await service.refreshRunningTabs(); assert.equal(commands.length, 7, 'A failed probe backs off');
+  time += 3000;
+  const retry = service.refreshRunningTabs(); assert.equal(commands.length, 8);
+  replies.shift().resolve(); await retry;
+  runs[0].phase = 'completed'; time += 30000;
+  await service.refreshRunningTabs(); assert.equal(commands.length, 8);
+  assert.equal(service.runProbes.size, 0);
+  assert.ok(commands.every(command => command.command === 'probe' && command.timeoutMs === 2000));
+});
 test('HTTP requires the local token and rejects browser Origin headers', async t => {
   const { config } = await fixture(t);
   const url = `http://127.0.0.1:${config.port}/health`;

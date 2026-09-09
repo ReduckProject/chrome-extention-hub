@@ -3,10 +3,11 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import { JSDOM } from 'jsdom';
 const source = await fs.readFile(new URL('../extension/adapter.js', import.meta.url), 'utf8');
-function page(extra = '') {
+function page(extra = '', setup = () => {}) {
   const dom = new JSDOM(`<html><body><header><button data-testid="model-switcher-dropdown-button">Thinking</button></header>
     <main>${extra}</main><form><textarea id="prompt-textarea"></textarea><button data-testid="send-button" type="button">Send</button></form></body></html>`, { url: 'https://chatgpt.com/c/fixture', runScripts: 'outside-only' });
   dom.window.Element.prototype.getClientRects = function () { return this.hidden ? [] : [{ x: 0, y: 0, width: 100, height: 20 }]; };
+  setup(dom.window);
   dom.window.eval(source);
   return { dom, document: dom.window.document, adapter: dom.window.ChatGPTBridgeAdapter };
 }
@@ -268,6 +269,61 @@ test('diagnostics read buffered request metadata without fetching or exposing si
     assert.equal(info.coverage, 'browser_buffer_only_not_a_complete_network_log');
     assert.ok(!JSON.stringify(info).includes('private-token'));
     assert.ok(!JSON.stringify(info).includes('unrelated.example'));
+  } finally { dom.window.close(); }
+});
+
+test('response stream observation survives timing-buffer clearing without fetching or loading images', async () => {
+  let onEntries, disconnected = 0, fetched = 0;
+  const timing = { name: 'https://chatgpt.com/backend-api/f/conversation?private=do-not-expose',
+    startTime: 100, responseEnd: 32000, responseStatus: 200, initiatorType: 'fetch' };
+  let buffered = [timing,
+    { ...timing, name: 'https://chatgpt.com/backend-api/conversations' },
+    { ...timing, name: 'https://chatgpt.com/backend-api/f/conversation/prepare' },
+    { ...timing, name: 'https://other.example/backend-api/f/conversation' }];
+  const { dom, adapter, document } = page('<article><div data-message-author-role="assistant" data-message-id="a">Done<img src="/pending.png" loading="lazy"></div></article>', window => {
+    Object.defineProperty(window.performance, 'timeOrigin', { value: 100000 });
+    window.performance.getEntriesByType = () => buffered;
+    window.fetch = () => { fetched++; throw new Error('Observation must not fetch'); };
+    window.PerformanceObserver = class {
+      constructor(callback) { onEntries = callback; }
+      observe(options) { assert.equal(options.type, 'resource'); assert.equal(options.buffered, true); }
+      disconnect() { disconnected++; }
+    };
+  });
+  try {
+    let state = adapter.snapshot();
+    assert.equal(state.finalActions, false); assert.equal(state.responseStreams.length, 1);
+    assert.equal(state.responseStreams[0].startedAt, 100100);
+    assert.equal(state.responseStreams[0].endedAt, 132000);
+    assert.ok(!JSON.stringify(state.responseStreams).includes('do-not-expose'));
+    onEntries({ getEntries: () => [{ ...timing, startTime: 33000, responseEnd: 34000, responseStatus: 429 }] });
+    buffered = [];
+    state = adapter.snapshot();
+    assert.deepEqual(Array.from(state.responseStreams, x => x.status), [200, 429]);
+    assert.equal(document.querySelector('img').getAttribute('loading'), 'lazy');
+    await adapter.read({ operation: 'response', assistantId: 'a' });
+    assert.equal(fetched, 0);
+    adapter.dispose(); assert.equal(disconnected, 1);
+  } finally { dom.window.close(); }
+});
+
+test('a completed-run identity permits explicit lazy loading without final controls and rejects other turns', async () => {
+  const { dom, adapter, document } = page('<div data-message-author-role="user" data-message-id="u">draw</div><article><div data-message-author-role="assistant" data-message-id="a">Done<img src="/pending.png" loading="lazy"></div></article>');
+  try {
+    const request = { operation: 'response', assistantId: 'a', loadImages: true };
+    await assert.rejects(adapter.read(request), /finished response/);
+    for (const completedResponse of [
+      { assistantId: 'old', userMessageId: 'u', completedAt: Date.now() },
+      { assistantId: 'a', userMessageId: 'old-user', completedAt: Date.now() },
+      { assistantId: 'a', userMessageId: 'u' },
+    ]) await assert.rejects(adapter.read({ ...request, completedResponse }), /finished response/);
+    const completedResponse = { assistantId: 'a', userMessageId: 'u', completedAt: Date.now() };
+    document.querySelector('form').insertAdjacentHTML('beforeend', '<button data-testid="stop-button">Stop</button>');
+    await assert.rejects(adapter.read({ ...request, completedResponse }), /finished response/);
+    document.querySelector('[data-testid="stop-button"]').remove();
+    assert.equal(document.querySelector('img').getAttribute('loading'), 'lazy');
+    await adapter.read({ ...request, completedResponse });
+    assert.equal(document.querySelector('img').getAttribute('loading'), 'eager');
   } finally { dom.window.close(); }
 });
 

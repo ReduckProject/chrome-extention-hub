@@ -25,6 +25,7 @@ export class BridgeService {
     this.operationContext = new AsyncLocalStorage();
     this.observerDocuments = new Set();
     this.observerRefreshTimers = new Map();
+    this.runProbes = new Map();
     this.wss = new WebSocketServer({ noServer: true, maxPayload: 2 * 1024 * 1024 });
     this.server = http.createServer((req, res) => this.http(req, res));
     this.server.on('upgrade', (req, socket, head) => {
@@ -41,12 +42,16 @@ export class BridgeService {
       this.server.once('error', reject);
       this.server.listen(this.config.port, '127.0.0.1', resolve);
     });
-    this.tick = setInterval(() => { if (this.store.reconcile()) this.store.save().catch(error => this.logError(error)); }, 1000);
+    this.tick = setInterval(() => {
+      if (this.store.reconcile()) this.store.save().catch(error => this.logError(error));
+      this.refreshRunningTabs().catch(error => this.logError(error));
+    }, 1000);
     this.tick.unref();
     return this.server.address().port;
   }
 
   async close() {
+    this.stopping = true;
     clearInterval(this.tick);
     for (const timer of this.observerRefreshTimers.values()) clearTimeout(timer);
     for (const socket of this.wss.clients) socket.terminate();
@@ -55,6 +60,34 @@ export class BridgeService {
     await this.store.save();
     await new Promise(resolve => this.server.close(resolve));
     this.wss.close();
+  }
+
+  async refreshRunningTabs() {
+    if (this.stopping) return;
+    const active = new Map(), now = this.store.now();
+    for (const run of Object.values(this.store.data.runs)) {
+      if (!['submitted', 'generating', 'thinking', 'finalizing'].includes(run.phase) || run.observationIssue) continue;
+      const tab = this.store.data.tabs[run.tabKey];
+      if (!tab || tab.closed || tab.frozen || tab.discarded || tab.documentId !== run.documentIdAtSend ||
+          this.clients.get(tab.profileId)?.readyState !== 1 || this.store.accessPause(tab.profileId)) continue;
+      active.set(tab.key, tab);
+    }
+    for (const key of this.runProbes.keys()) if (!active.has(key) && !this.runProbes.get(key).pending) this.runProbes.delete(key);
+    let slots = Math.max(0, 4 - [...this.runProbes.values()].filter(entry => entry.pending).length);
+    const jobs = [];
+    for (const tab of [...active.values()].sort((a, b) => (this.runProbes.get(a.key)?.at || 0) - (this.runProbes.get(b.key)?.at || 0))) {
+      const entry = this.runProbes.get(tab.key) || { at: 0, failures: 0 };
+      if (!slots || entry.pending || now - tab.receivedAt < 1500 ||
+          now - entry.at < Math.min(30000, 3000 * 2 ** entry.failures)) continue;
+      slots--; entry.at = now; this.runProbes.set(tab.key, entry);
+      // Local DOM probes bypass background-page timer throttling; they never
+      // reload a page, activate a tab, fetch history, or start lazy image loads.
+      entry.pending = this.command(tab.profileId, 'probe', { tabId: tab.tabId, documentId: tab.documentId }, 2000)
+        .then(() => { entry.failures = 0; }, () => { entry.failures = Math.min(4, entry.failures + 1); })
+        .finally(() => { entry.pending = null; });
+      jobs.push(entry.pending);
+    }
+    await Promise.all(jobs);
   }
 
   extension(ws) {
@@ -310,7 +343,8 @@ export class BridgeService {
             (!run.conversationId || run.conversationId === tab.conversationId)) {
           try {
             const target = params.loadImages === true
-              ? { operation: 'response', assistantId, loadImages: true, includeAssets: params.includeAssets === true }
+              ? { operation: 'response', assistantId, loadImages: true, includeAssets: params.includeAssets === true,
+                completedResponse: { assistantId: run.resultAssistantId, userMessageId: run.userMessageId, completedAt: run.completedAt } }
               : params.includeAssets === true ? assistantId : { operation: 'response', assistantId };
             const read = await this.command(tab.profileId, 'read', { tabId: tab.tabId, documentId: tab.documentId, assistantId: target }, 5000);
             if (read.assistantId !== assistantId || typeof read.text !== 'string') throw new Error('Response identity or text could not be verified');

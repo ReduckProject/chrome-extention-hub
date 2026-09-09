@@ -1,6 +1,7 @@
 (() => {
-  const adapterVersion = 32;
+  const adapterVersion = 33;
   if (globalThis.ChatGPTBridgeAdapter?.version === adapterVersion) return;
+  globalThis.ChatGPTBridgeAdapter?.dispose?.();
   const doc = document;
   const normalize = value => String(value || '').replace(/\r\n/g, '\n').trim();
   const text = node => normalize(node?.innerText ?? node?.textContent);
@@ -51,6 +52,34 @@
     for (let i = 0; i < value.length; i++) h = Math.imul(h ^ value.charCodeAt(i), 16777619);
     return (h >>> 0).toString(16);
   };
+  // Observe the website's own completed response streams. No fetch interception,
+  // response-body copies, history requests, or changes to its timing buffer.
+  const responseTimings = new Map();
+  function rememberResponseTimings(entries) {
+    for (const entry of entries) {
+      try {
+        const url = new URL(entry.name, location.href);
+        if (url.origin !== location.origin || entry.initiatorType !== 'fetch' ||
+            !/^\/backend-api\/(?:f\/)?conversation$/.test(url.pathname)) continue;
+        const startedAt = performance.timeOrigin + entry.startTime;
+        const endedAt = performance.timeOrigin + entry.responseEnd;
+        if (!Number.isFinite(startedAt) || !Number.isFinite(endedAt) || endedAt <= startedAt) continue;
+        const key = fingerprint(`${entry.name}\n${entry.startTime}\n${entry.responseEnd}`);
+        responseTimings.set(key, { key, startedAt, endedAt, status: entry.responseStatus > 0 ? entry.responseStatus : null });
+      } catch { /* Ignore unrelated or unavailable timing entries. */ }
+    }
+    const ordered = [...responseTimings.values()].sort((a, b) => b.startedAt - a.startedAt);
+    for (const entry of ordered.slice(32)) responseTimings.delete(entry.key);
+  }
+  let responseObserver;
+  try {
+    responseObserver = new PerformanceObserver(list => rememberResponseTimings(list.getEntries()));
+    responseObserver.observe({ type: 'resource', buffered: true });
+  } catch { /* DOM evidence remains available in browsers without resource observation. */ }
+  function responseStreams() {
+    try { rememberResponseTimings(performance.getEntriesByType('resource')); } catch {}
+    return [...responseTimings.values()].sort((a, b) => a.startedAt - b.startedAt);
+  }
   const imageElements = assistant => assistant ? all('img', assistant).filter(img =>
     (img.currentSrc || img.getAttribute('src')) && !/avatar|profile picture|头像/i.test(img.alt || '')) : [];
   const imageInfo = (img, index, assistantId) => ({
@@ -113,7 +142,7 @@
       draftLength: draft(input).length, userCount: users.length, assistantCount: assistants.length,
       lastUserId: messageId(lastUser), lastUserText: userText(lastUser), lastAssistantId: lastId,
       lastAssistantPreview: output.slice(-400), lastAssistantLength: output.length,
-      images, finalActions,
+      images, finalActions, responseStreams: responseStreams(),
       responseSignature: fingerprint(JSON.stringify([output, activity, finalActions, users.length, lastId])),
       contentSignature: fingerprint(JSON.stringify([output, images, activity, finalActions, users.length, lastId])),
       adapterVersion,
@@ -253,10 +282,14 @@
     button.click();
     return { stopped: !!await until(() => !stop(), 1800) };
   }
-  function loadPendingImages(assistantId) {
+  function loadPendingImages(assistantId, completedResponse) {
     assertAccessAllowed();
     const state = snapshot();
-    if (state.activity !== 'idle' || !state.finalActions || state.lastAssistantId !== assistantId) {
+    // The authenticated service supplies the identity of an already completed
+    // run. Its completion must not be gated a second time on lazy-image controls.
+    const confirmed = completedResponse?.assistantId === assistantId && !!state.lastUserId &&
+      completedResponse.userMessageId === state.lastUserId && Number.isFinite(completedResponse.completedAt);
+    if (state.activity !== 'idle' || (!state.finalActions && !confirmed) || state.lastAssistantId !== assistantId) {
       throw new Error('Image loading requires the finished response in an idle page');
     }
     const assistant = messages('assistant').find(n => messageId(n) === assistantId);
@@ -310,7 +343,8 @@
     return { capturedAt: new Date().toISOString(), source: 'existing_browser_resource_timing',
       coverage: 'browser_buffer_only_not_a_complete_network_log', totalResourceEntries: entries.length,
       sameOriginEntries: requests.length, earliestAt: requests[0]?.at || null,
-      latestAt: requests.at(-1)?.at || null, requests: requests.slice(-200) };
+      latestAt: requests.at(-1)?.at || null, requests: requests.slice(-200),
+      responseStreams: responseStreams(), visibility: doc.visibilityState, hasFocus: doc.hasFocus() };
   }
   function readResponse(assistantId) {
     const list = messages('assistant');
@@ -326,7 +360,7 @@
       if (assistantId.operation === 'diagnostics') return diagnostics();
       if (assistantId.operation === 'new_chat') return newChat();
       if (assistantId.operation === 'response') {
-        if (assistantId.loadImages === true) loadPendingImages(assistantId.assistantId);
+        if (assistantId.loadImages === true) loadPendingImages(assistantId.assistantId, assistantId.completedResponse);
         return assistantId.includeAssets === true ? read(assistantId.assistantId) : readResponse(assistantId.assistantId);
       }
       if (assistantId.operation !== 'image_chunk') throw new Error('Unknown image read operation');
@@ -429,5 +463,6 @@
     if (!control) throw new Error('Download control is not available');
     control.click(); return { clicked: true };
   }
-  Object.assign(globalThis.ChatGPTBridgeAdapter ||= {}, { version: adapterVersion, snapshot, newChat, models, selectModel, submit, stopGeneration, read, imageChunk, downloadInfo, clickDownload });
+  Object.assign(globalThis.ChatGPTBridgeAdapter ||= {}, { version: adapterVersion, snapshot, newChat, models, selectModel, submit, stopGeneration, read, imageChunk, downloadInfo, clickDownload,
+    dispose: () => responseObserver?.disconnect() });
 })();

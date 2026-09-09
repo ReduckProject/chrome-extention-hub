@@ -13,6 +13,7 @@ description: 通过本机 ChatGPT Web Bridge MCP 控制 Chrome 中已登录的 C
 - 每个逻辑提交创建一次 `requestId` 并记录。超时重查或重试同一个 requestId；`submission_unknown` 不能换 ID 重发。不要覆盖未完成草稿。
 - 用户明确要求并行时，多 tab 生图可一次建立 3 个新聊天，等其空闲且状态新鲜后分别提交。不要等待第一张生成完成才提交下一张。每个任务单独保存提示词、模型、tabKey、runId、聊天链接。
 - 用一次 `status` 查询全部任务；仅需新观测时用 `refresh:true`。连接状态、回答状态和缓存时间分别理解，`unknown` 不代表失败或完成。`completed` 只表示网页回答已结束，包含普通文字、拒绝回复及图片尚未加载的回答，不代表已满足用户要求。`kind` 仅记录任务意图，默认 text。长等待用 `wait` 的有界请求，已结束的任务会立即返回。
+- `completionEvidence.source:response_stream_end` 表示以本次提交后网页自身响应流的结束时序辅助判定完成，不要求完成按钮或图片就绪；`response_actions` 表示使用网页结束控件。服务会对正在运行的任务补充有界 DOM 探测以减少后台计时器节流造成的延迟，结束／暂停后停止；这些探测不请求会话列表。缺少可靠结束证据时仍保留未完成状态，不把网络超时或空闲时长当作完成。可从 status 的 `adapterVersion` 核对页面适配版本。
 - `result({runId})` 默认返回对应回答的完整 `text` 和 `images`，正在输出时也可读取已有内容；`result.complete` 表示这份正文是否已结束。图片信息含实际 URL、尺寸、alt、loaded/loadState；需要图片哈希时额外传 `includeAssets:true`，单张失败以 assetError 返回，不能因此丢失正文。`resultSource:cache` 是此前查询的缓存，结合 observedAt、complete 和 resultError 判断可用性；result:null 不等于网页拒绝，不读取其他回答代替。
 - 调用方检查正文和图片是否满足任务，再决定交付或报出网页原因。生图任务没有图片时，保留并报告正文，不继续 wait 已完成的任务。已有图片仍在加载时，适当间隔后重查 result；只有图片就绪后才调用 download。`download` 点击该回答的原图保存按钮，匹配浏览器已解码图片的 SHA-256 和本机下载文件字节。只有下载 `complete:true` 且文件 `originalVerified:true` 才作为已验证原图，保存在项目 `artifacts/images/<runId>/`，亦记录在 `run.verifiedDownloads`。交付前完整解码文件并查看内容，不能用截图代替。
 - `run.images` 是网页观测，其 originalDownloadVerified:false 不代表 `run.verifiedDownloads` 失效。Chrome 事件收据可能因缺少 referrer 为 outcome_unknown，是否获得文件以字节匹配结果为准。verification_pending 时检查实际下载目录或未完成的保存对话框，再查询同一 run，不重复点击。

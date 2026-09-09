@@ -126,7 +126,7 @@ test('network disconnect, frozen tab and old cache are unknown, never completion
   store.connect(profile); snap(1, { frozen: true }); assert.equal(store.tabView(tabKey).freshness.stale, true);
   snap(1); advance(31000); assert.equal(store.tabView(tabKey).activity, 'unknown');
 });
-test('no completion for an older assistant, missing final actions or later user message', async () => {
+test('no completion for an older assistant, absent end evidence or later user message', async () => {
   const { store, snap, advance } = fixture(); const tabKey = snap(1);
   const { run } = await store.reserve({ tabKey, prompt: 'draw a pear', requestId: 'pear-job' });
   store.submissionResult(run.id, { accepted: true, userMessageId: 'pear-user' });
@@ -162,6 +162,58 @@ test('a finished response completes independently of image loading and wakes wai
   assert.equal(run.images[1].loaded, true); assert.equal(run.completedAt, completedAt);
   snap(1, { ...answer, lastAssistantId: 'another-answer', images: [{ key: 'unrelated', loaded: true }] });
   assert.deepEqual(run.images.map(image => image.key), ['first-pear', 'second-pear']);
+});
+
+for (const kind of ['text', 'image']) test(`${kind} finishes on its response stream without final controls or loaded media`, async () => {
+  const { store, snap, advance } = fixture(); const tabKey = snap(1);
+  const { run } = await store.reserve({ tabKey, prompt: 'one response', requestId: `stream-end-${kind}`, kind });
+  const answer = { userCount: 1, lastUserText: run.prompt, lastUserId: 'u', assistantCount: 1,
+    lastAssistantId: 'a', lastAssistantPreview: kind === 'text' ? '无法满足该请求。' : 'Done',
+    finalActions: false, images: kind === 'image' ? [{ key: 'pending', loaded: false, loading: 'lazy' }] : [] };
+  snap(1, { ...answer, activity: 'generating', responseSignature: 'streaming' });
+  advance(32000);
+  const responseStreams = [{ key: 'current', startedAt: 100010, endedAt: 132000, status: 200 }];
+  snap(1, { ...answer, responseStreams, responseSignature: 'idle' });
+  assert.equal(run.phase, 'finalizing');
+  const notification = store.wait({ runId: run.id, afterRevision: store.data.revision, timeoutMs: 1000 });
+  advance(2600); store.reconcile();
+  assert.equal((await notification).run.phase, 'completed');
+  assert.equal(run.completionEvidence.source, 'response_stream_end');
+  assert.equal(run.completionEvidence.endedAt, 132000);
+  assert.equal(run.completedAt, 134600); assert.equal(run.resultAssistantId, 'a');
+  assert.equal(run.images.length, kind === 'image' ? 1 : 0);
+  if (kind === 'image') assert.equal(run.images[0].loaded, false);
+});
+
+test('stream evidence must belong to this submission and cannot finish a still-busy or unobserved page', async () => {
+  const { store, snap, advance } = fixture();
+  const old = { key: 'old', startedAt: 80000, endedAt: 90000, status: 200 };
+  const tabKey = snap(1, { responseStreams: [old] });
+  const { run } = await store.reserve({ tabKey, prompt: 'current response', requestId: 'stream-identity' });
+  const answer = { userCount: 1, lastUserText: run.prompt, lastUserId: 'u', assistantCount: 1,
+    lastAssistantId: 'a', finalActions: false, responseSignature: 'idle' };
+  const current = { key: 'new', startedAt: 100001, endedAt: 101000, status: 200 };
+  advance(2000);
+  for (const responseStreams of [[old], [{ ...current, status: 429 }], [{ ...current, status: null }],
+    [{ ...current, endedAt: 999999999 }], [current, { ...current, key: 'later-failed', startedAt: 101001, endedAt: 101500, status: 500 }]]) {
+    snap(1, { ...answer, responseStreams }); advance(3000); store.reconcile();
+    assert.notEqual(run.phase, 'completed');
+  }
+  for (const activity of ['generating', 'thinking', 'unknown']) {
+    snap(1, { ...answer, activity, responseStreams: [current] }); advance(3000); store.reconcile();
+    assert.notEqual(run.phase, 'completed');
+  }
+  for (const override of [{ frozen: true }, { discarded: true }, { documentId: 'other-document' },
+    { lastUserId: 'other-user', lastUserText: 'another request' }, { assistantCount: 0, lastAssistantId: null }]) {
+    snap(1, { ...answer, responseStreams: [current], ...override }); advance(3000); store.reconcile();
+    assert.notEqual(run.phase, 'completed');
+  }
+  snap(1, { ...answer, responseStreams: [current], responseSignature: 'before-disconnect' }); store.disconnect(profile); advance(3000); store.reconcile();
+  assert.notEqual(run.phase, 'completed');
+  store.connect(profile); advance(31000); store.reconcile();
+  assert.notEqual(run.phase, 'completed');
+  snap(1, { ...answer, responseStreams: [current], responseSignature: 'fresh-final' });
+  advance(2600); store.reconcile(); assert.equal(run.phase, 'completed');
 });
 
 for (const kind of ['text', 'image']) test(`${kind} intent completes a text-only refusal and notifies a waiting caller`, async () => {
