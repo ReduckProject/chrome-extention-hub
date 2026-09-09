@@ -77,3 +77,23 @@ test('navigation and browser-session inventory invalidate stale tabs immediately
   await until(() => service.store.list()[0].closed);
   assert.equal((await rpc('status')).tabs[0].activity, 'unknown');
 });
+
+for (const method of ['download', 'recover_images']) test(`${method} rejects missing images before any save or transfer`, async t => {
+  const { service, ws, rpc, snapshot, until } = await fixture(t);
+  snapshot(snap(1)); await until(() => Object.keys(service.store.data.tabs).length === 1);
+  const tabKey = Object.keys(service.store.data.tabs)[0];
+  const { run } = await service.store.reserve({ tabKey, prompt: 'two images', requestId: `missing-images-${method}` });
+  Object.assign(run, { phase: 'completed', accepted: true, resultAssistantId: 'two-image-answer',
+    images: [{ key: 'first-image', loaded: true }, { key: 'second-image', loaded: true }] });
+  const commands = [];
+  ws.on('message', data => {
+    const message = JSON.parse(data); if (message.type !== 'command') return;
+    commands.push(message.command);
+    if (message.command === 'read' && message.params.assistantId === run.resultAssistantId) {
+      ws.send(JSON.stringify({ type: 'result', id: message.id, result: { assistantId: run.resultAssistantId,
+        assets: [{ sha256: 'a'.repeat(64), byteLength: 1, browserDecoded: true, mimeType: 'image/png' }] } }));
+    } else ws.send(JSON.stringify({ type: 'result', id: message.id, error: 'Unexpected save or transfer before image set verification' }));
+  });
+  await assert.rejects(rpc(method, { runId: run.id }), /Incomplete image result/);
+  assert.deepEqual(commands, ['read']); assert.equal(run.verifiedDownloads, undefined);
+});

@@ -5,6 +5,28 @@ import { createHash } from 'node:crypto';
 import { projectRoot } from './config.mjs';
 
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
+export async function verifySavedOriginals(assets, files = []) {
+  const verified = [];
+  for (const asset of assets) {
+    const file = files.find(candidate => candidate.originalVerified && candidate.sha256 === asset.sha256 && candidate.byteLength === asset.byteLength);
+    if (!file) return null;
+    const bytes = await fs.readFile(file.path).catch(() => null);
+    if (!bytes || bytes.length !== asset.byteLength || digest(bytes) !== asset.sha256) return null;
+    verified.push(file);
+  }
+  return verified.length ? verified : null;
+}
+export async function saveTransferredOriginal({ asset, bytes, runId, index, outputRoot = path.join(projectRoot, 'artifacts', 'images') }) {
+  if (!/^[0-9a-f-]{36}$/i.test(runId) || !Number.isInteger(index) || index < 0) throw new Error('Invalid original destination');
+  if (!asset.browserDecoded || bytes.length !== asset.byteLength || digest(bytes) !== asset.sha256) throw new Error('Transferred image bytes do not match the exact browser-decoded asset');
+  const extension = asset.mimeType.startsWith('image/png') ? '.png' : asset.mimeType.startsWith('image/webp') ? '.webp' : '.jpg';
+  const directory = path.join(outputRoot, runId); await fs.mkdir(directory, { recursive: true });
+  const output = path.join(directory, `original-${index + 1}${extension}`);
+  try { await fs.writeFile(output, bytes, { flag: 'wx' }); }
+  catch (error) { if (error.code !== 'EEXIST') throw error; if (digest(await fs.readFile(output)) !== asset.sha256) throw new Error('Existing original differs; it was not overwritten'); }
+  return { path: output, sha256: asset.sha256, byteLength: bytes.length, width: asset.width, height: asset.height, mimeType: asset.mimeType, alt: asset.alt,
+    originalVerified: true, verification: 'exact_browser_decoded_asset_sha256_via_bridge_transfer', sourceTransport: 'bridge_byte_transfer', verifiedAt: new Date().toISOString() };
+}
 export async function matchDownloadedFiles({ assets, runId, sinceMs, downloadDirectory = path.join(os.homedir(), 'Downloads'), outputRoot = path.join(projectRoot, 'artifacts', 'images'), waitMs = 4000 }) {
   if (!/^[0-9a-f-]{36}$/i.test(runId)) throw new Error('Invalid run ID for image output');
   if (!Array.isArray(assets) || !assets.length || assets.some(a => !a.browserDecoded || !/^[0-9a-f]{64}$/.test(a.sha256))) throw new Error('Verified browser asset hashes are required');

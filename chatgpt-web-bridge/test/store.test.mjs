@@ -71,6 +71,20 @@ test('another tab showing the same conversation cannot submit concurrently', asy
   await store.reserve({ tabKey: first, prompt: 'one', requestId: 'first-request' });
   await assert.rejects(store.reserve({ tabKey: second, prompt: 'two', requestId: 'second-request' }), /already owns/);
 });
+
+test('a multi-image run waits for every new image to load before completing', async () => {
+  const { store, snap, advance } = fixture(); const tabKey = snap(1);
+  const { run } = await store.reserve({ tabKey, prompt: 'draw two pears', requestId: 'two-pear-job' });
+  store.submissionResult(run.id, { accepted: true, userMessageId: 'two-pear-user' });
+  const answer = { userCount: 1, lastUserId: 'two-pear-user', lastUserText: run.prompt,
+    assistantCount: 1, lastAssistantId: 'two-pear-answer', finalActions: true,
+    images: [{ key: 'first-pear', loaded: true }, { key: 'second-pear', loaded: false }], contentSignature: 'one-image-pending' };
+  snap(1, answer); advance(3000); store.reconcile();
+  assert.equal(run.phase, 'finalizing'); assert.equal(run.completedAt, undefined);
+  snap(1, { ...answer, images: answer.images.map(image => ({ ...image, loaded: true })), contentSignature: 'both-images-loaded' });
+  advance(2600); store.reconcile();
+  assert.equal(run.phase, 'completed'); assert.equal(run.images.length, 2);
+});
 test('browser session ID isolates reused numeric tab IDs', () => {
   const { store, snap } = fixture(); const a = snap(1), b = snap(1, { browserSessionId: 'new-browser-session' });
   assert.notEqual(a, b); assert.equal(store.list().length, 2);
@@ -93,6 +107,19 @@ test('model precondition and existing drafts reject before a run is reserved', a
   await assert.rejects(store.reserve({ tabKey, prompt: 'x', requestId: 'draft-check' }), /existing draft/);
   assert.equal(Object.keys(store.data.runs).length, 0);
 });
+test('an identical draft can recover only a recorded pre-click readback failure in the same document', async () => {
+  const { store, snap } = fixture(); const tabKey = snap(1);
+  const { run } = await store.reserve({ tabKey, prompt: 'first\n\nsecond', requestId: 'draft-original' });
+  store.submissionResult(run.id, { notSubmitted: true, error: 'Draft readback differs; no send click was made' });
+  snap(1, { draftLength: 13 });
+  await assert.rejects(store.reserve({ tabKey, prompt: 'different', requestId: 'draft-different' }), /existing draft/);
+  snap(1, { draftLength: 13, documentId: 'changed-document' });
+  await assert.rejects(store.reserve({ tabKey, prompt: run.prompt, requestId: 'draft-reloaded' }), /existing draft/);
+  snap(1, { draftLength: 13 });
+  const retry = await store.reserve({ tabKey, prompt: run.prompt, requestId: 'draft-recovery' });
+  assert.equal(retry.existing, false); assert.notEqual(retry.run.id, run.id);
+});
+
 test('late submission acknowledgments cannot downgrade a completed run', async () => {
   const { store, snap } = fixture(); const tabKey = snap(1);
   const { run } = await store.reserve({ tabKey, prompt: 'test', requestId: 'late-ack-test' });

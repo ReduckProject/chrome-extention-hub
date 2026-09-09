@@ -1,6 +1,7 @@
 (() => {
   if (globalThis.chatGPTBridgeContentInstalled) return;
   globalThis.chatGPTBridgeContentInstalled = true;
+  globalThis.chatGPTBridgeContentVersion = 3;
   const documentId = crypto.randomUUID();
   const adapter = globalThis.ChatGPTBridgeAdapter;
   let timer, lastSignature;
@@ -30,9 +31,11 @@
       switch (message.command) {
         case 'probe': result = { ...adapter.snapshot(), documentId }; break;
         case 'models': result = await adapter.models(); break;
+        case 'new_chat': result = await adapter.newChat(); break;
         case 'select_model': result = await adapter.selectModel(message.label); break;
         case 'submit': result = await adapter.submit(message.prompt, message.expectedModel); break;
         case 'read': result = adapter.read(message.assistantId); break;
+        case 'image_chunk': result = await adapter.imageChunk(message.assistantId, message.index, message.offset); break;
         case 'stop': result = await adapter.stopGeneration(message.userMessageId, message.prompt); break;
         case 'download_info': result = await adapter.downloadInfo(message.assistantId); break;
         case 'click_download': result = adapter.clickDownload(message.assistantId, message.index); break;

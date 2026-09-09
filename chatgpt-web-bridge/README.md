@@ -25,7 +25,7 @@ flowchart LR
 ## 组件与依赖
 
 - Chrome 扩展 **ChatGPT Web Bridge (local)**，由本机 setup 生成。
-- Codex stdio MCP **chatgpt-web-bridge**，提供 9 个工具。
+- Codex stdio MCP **chatgpt-web-bridge**，提供 11 个工具。
 - Skill **chatgpt-chrome-bridge**，源码见 [skill/SKILL.md](skill/SKILL.md)，可复制到个人 Codex skills 目录下的同名文件夹。
 - 项目依赖：`@modelcontextprotocol/sdk@1.30.0`、`ws@8.21.3`、调研用 `chrome-devtools-mcp@1.9.0`；测试依赖 `jsdom@29.0.2`。使用现有 Node 24.13.0。
 
@@ -47,12 +47,14 @@ node src/cli.mjs status
 | MCP 工具 | 作用 |
 |---|---|
 | `chatgpt_tabs` | 列出 tabKey、profile、网址；`action:new,count:3` 开三个新聊天 |
+| `chatgpt_new_chat` | 在指定的同一个 tab 点击“新聊天”，确认空白输入框；串行生图先保存上一张原图再调用 |
 | `chatgpt_status` | 查询模型、活动、连接、新鲜度、任务；`refresh:true` 并行探测 |
 | `chatgpt_models` | 读取实际模型菜单；必要时关闭没有草稿的图片查看器 |
 | `chatgpt_select_model` | 按精确标签选择并读回，检查 `confirmed:true` |
 | `chatgpt_send` | 提交 prompt，返回持久化 run；必须提供稳定 requestId |
 | `chatgpt_result` | 按 runId 查询；`includeText:true` 读取对应 assistant 消息与图片哈希 |
 | `chatgpt_download` | 点击对应图片保存控件，验证下载文件，返回路径 |
+| `chatgpt_recover_images` | 网页保存没有产生本机文件时，经同一扩展传输已加载的同源原图字节，并核对哈希 |
 | `chatgpt_stop` | 停止指定 run 的当前生成 |
 | `chatgpt_wait` | 最长 25 秒等待状态变化，超时后可继续查同一 run |
 
@@ -71,7 +73,11 @@ MCP 返回 structuredContent JSON，并附带相同内容的文本。状态字�
 
 `generating` / `thinking` 表示页面活动；具体任务成功以 `run.phase:completed` 为准。完成还要求关联到本次用户消息、新回答、结束控件、内容稳定以及图片确实加载。
 
-## 三 tab 流程
+## 逐张生图与并行流程
+
+串行生图默认只在第一张调用 `chatgpt_tabs({action:"new",count:1})` 打开专用 tab。每张完成并保存验证原图后，用 `chatgpt_new_chat({tabKey})` 在同一 tab 新建聊天，检查 `confirmed:true`，重新确认模型，再提交下一张。新工具尚未加载到客户端时，可用同一服务的 CLI `new_chat --input <UTF-8参数文件>`。当前已实测同 tab 连续新建聊天、重新选择模型、逐张生图和原图保存。
+
+仅在用户明确要求并行时采用以下三 tab 流程：
 
 1. 获取 profile，创建三个新聊天，等待空输入框与新鲜 idle 状态，取得各自精确 tabKey。
 2. 每页读取 models，选择实际菜单标签并检查 confirmed；把读回的模型名称用于 send.expectedModel。
@@ -90,6 +96,8 @@ MCP 返回 structuredContent JSON，并附带相同内容的文本。状态字�
 `run.verifiedDownloads` 是已验证文件；`run.images` 仅是网页观测，其中 originalDownloadVerified:false 不代表已验证文件失效。下载事件收据也可能仍是 outcome_unknown：缺少 referrer 时事件关联不足，确切字节匹配可独立证明文件归属。
 
 默认在当前 Windows 用户的 Downloads 文件夹检查近期、大小匹配的候选图片。Chrome 使用其他目录时，可在本机 runtime/connection.json 增加 downloadDirectory，保留其他字段并重启本项目服务。开启“每次询问保存位置”时需完成保存对话框。未匹配返回 verification_pending；重查相同 run 不重复点击。
+
+确认没有待处理的保存对话框，且网页保存仍未产生文件时，可调用 `chatgpt_recover_images({runId})`；工具未加载时用同一服务 CLI 的 `recover_images --input <UTF-8参数文件>`。它只传输对应回答中已加载、同源图片的确切字节，每块不超过 512 KiB，写盘前核对浏览器 SHA-256；记录 `sourceTransport:bridge_byte_transfer`，不冒充 Chrome 下载事件。当前已实测双图结果的原图恢复。明确的浏览器策略拒绝不适用此恢复方式。已验证原图会先重新核对本地字节，重复调用 download 可复用结果。
 
 ## 安装与更新
 
@@ -120,13 +128,14 @@ setup 生成 runtime/extension、固定扩展 ID、本机认证配置，不代�
 
 已有实例的源码可以独立纳入本仓库，当前安装不会自动迁移。迁移运行实例时需保留其 runtime 配置和状态；环境变量 CHATGPT_BRIDGE_RUNTIME 可指定现有 runtime 目录。Chrome 扩展仍从加载时的目录运行，重新加载前应保留该目录。每个实例的认证配置需与其本地服务一致。
 
-页面适配层更新后，npm run setup 和 node src/cli.mjs refresh_observers 可更新当前文档的观察器。修改 manifest 或 background 时需要在 Chrome 中重新加载扩展；当前 adapter 版本 18 已在实际页面读回。
+页面适配层更新后，npm run setup 和 node src/cli.mjs refresh_observers 可更新当前文档的观察器。content.js 新增命令通常需要重新加载对应页面；修改 manifest 或 background 时需要在 Chrome 中重新加载扩展。adapter 版本 28 已在实际页面读回，包含多段提示词回读、长消息展开按钮过滤、同 tab 新聊天、多图保存及原图字节传输。当前源码版本 29 修正了小窗口下多图原图与缩略图的识别，已通过回归测试，尚未单独实机验收。新聊天和原图传输兼容现有 content.js 的固定 read 消息格式。
 
 ## 验证范围与限制
 
-- 当前本机 Chrome 152、已登录 ChatGPT 中文页面、GPT-5.5 菜单、三 tab 文生图和原图获取已验证；初次验收完成 60 次真实 MCP 状态查询，当前 32 个自动化测试通过。
+- 当前本机 Chrome 152、已登录 ChatGPT 中文页面、GPT-5.5 菜单、三 tab 文生图和原图获取已验证；初次验收完成 60 次真实 MCP 状态查询，当前 44 个自动化测试通过。
 - 重新加载扩展后，另行验证了 GPT-5.6 Sol → GPT-5.5 切换、新聊天、图片生成、阶段查询和原图下载。进度按 generating、finalizing、completed 等阶段返回，当前不提供生成百分比。
 - 完成回答中的同源图片如果仍处于 lazy/pending，会启动加载；只有浏览器实际加载成功才允许任务完成。原始图片观测含 loadState 和 loading，便于区分等待加载与加载失败。
+- 多图任务须等待所有已观测的新图片加载后才完成；保存或恢复时发现已完成图片缺失，会保留任务并报错，不将部分图片报告为全部完成。
 - 实际重启本地服务后约 619 ms 恢复五个 tab，期间返回 unknown，三个任务和下载哈希保留。
 - 完整 Chrome 重启会产生新的 browserSessionId，目前不把旧 run 自动绑定到新 tab。可查旧记录，继续操作前重新获取 tabKey，不用旧数字 ID 猜关联。
 - 网页改版可能需要更新 extension/adapter.js。图片编辑、附件、复杂研究模式、多 profile 并发和长期压力运行未纳入本次验收。

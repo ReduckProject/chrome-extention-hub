@@ -37,6 +37,67 @@ test('submit checks the model and does not overwrite a pre-existing draft', asyn
   assert.equal((await adapter.submit('test', 'Thinking')).notSubmitted, true);
   assert.equal(document.querySelector('textarea').value, 'my unfinished draft'); assert.equal(clicks, 0); dom.window.close();
 });
+test('multiline rich-text drafts preserve entered blank lines and can resume an exact unsent prompt', async () => {
+  const { dom, adapter, document } = page();
+  const input = document.createElement('div'); input.id = 'prompt-textarea'; input.setAttribute('contenteditable', 'true');
+  input.innerHTML = '<p>第一段</p><p><br class="ProseMirror-trailingBreak"></p><p>第二段</p><p>最后一行</p>';
+  Object.defineProperty(input, 'innerText', { value: '第一段\n\n\n\n第二段\n\n最后一行' });
+  document.querySelector('textarea').replaceWith(input);
+  const prompt = '第一段\n\n第二段\n最后一行', original = input.innerHTML;
+  let clicks = 0;
+  document.querySelector('[data-testid="send-button"]').onclick = () => {
+    clicks++;
+    const user = document.createElement('div'); user.dataset.messageAuthorRole = 'user'; user.dataset.messageId = 'multiline-user';
+    user.textContent = prompt; document.querySelector('main').append(user); input.replaceChildren();
+  };
+  assert.equal(adapter.snapshot().draftLength, prompt.length);
+  assert.equal((await adapter.submit('第一段\n\n不同内容\n最后一行', 'Thinking')).notSubmitted, true);
+  assert.equal(input.innerHTML, original); assert.equal(clicks, 0);
+  const result = await adapter.submit(prompt, 'Thinking');
+  assert.equal(result.accepted, true); assert.equal(result.userMessageId, 'multiline-user'); assert.equal(clicks, 1);
+  dom.window.close();
+});
+
+test('user message identity excludes a trailing visible expand control but keeps matching prompt words', () => {
+  const { dom, adapter, document } = page('<div data-message-author-role="user" data-message-id="long-user"><span>prompt ending with 展开</span><button>展开</button></div>');
+  const user = document.querySelector('[data-message-author-role="user"]');
+  Object.defineProperty(user, 'innerText', { value: 'prompt ending with 展开\n展开' });
+  assert.equal(adapter.snapshot().lastUserText, 'prompt ending with 展开');
+  dom.window.close();
+});
+
+test('new chat uses the visible control in the same page and confirms an empty composer', async () => {
+  const { dom, adapter, document } = page('<div data-message-author-role="user">prior prompt</div><div data-message-author-role="assistant">prior answer</div>');
+  document.body.insertAdjacentHTML('afterbegin', '<a href="/" id="new-chat">新聊天</a>');
+  let clicks = 0;
+  document.querySelector('#new-chat').onclick = event => {
+    event.preventDefault(); clicks++; document.querySelector('main').replaceChildren(); dom.window.history.pushState({}, '', '/');
+  };
+  document.querySelector('textarea').value = 'unfinished';
+  await assert.rejects(adapter.newChat(), /draft/); assert.equal(clicks, 0);
+  document.querySelector('textarea').value = '';
+  const result = await adapter.read({ operation: 'new_chat' }); assert.equal(result.confirmed, true); assert.equal(clicks, 1);
+  assert.equal(result.previousUrl, 'https://chatgpt.com/c/fixture'); assert.equal(result.url, 'https://chatgpt.com/');
+  assert.equal((await adapter.newChat()).confirmed, true); assert.equal(clicks, 1);
+  dom.window.close();
+});
+
+test('new chat opens the collapsed sidebar to reveal the navigation control', async () => {
+  const { dom, adapter, document } = page('<div data-message-author-role="user">prior prompt</div>');
+  document.body.insertAdjacentHTML('afterbegin', '<button aria-label="打开侧边栏" id="sidebar-open">Open</button><a href="/" id="new-chat" hidden>新聊天</a>');
+  const link = document.querySelector('#new-chat');
+  document.querySelector('#sidebar-open').onclick = () => { link.hidden = false; };
+  link.onclick = event => { event.preventDefault(); document.querySelector('main').replaceChildren(); dom.window.history.pushState({}, '', '/'); };
+  assert.equal((await adapter.newChat()).confirmed, true); assert.equal(link.hidden, false);
+  dom.window.close();
+});
+
+test('new chat does not navigate away from active generation', async () => {
+  const { dom, adapter, document } = page();
+  document.querySelector('form').insertAdjacentHTML('beforeend', '<button data-testid="stop-button">Stop</button>');
+  await assert.rejects(adapter.newChat(), /ready and idle/); dom.window.close();
+});
+
 test('a confirmed send returns the identity of the user message', async () => {
   const { dom, adapter, document } = page(); let clicks = 0;
   document.querySelector('[data-testid="send-button"]').onclick = () => {
@@ -52,6 +113,27 @@ test('result reads requested assistant identity instead of whichever message is 
   const { dom, adapter } = page('<div data-message-author-role="assistant" data-message-id="old">old answer</div><div data-message-author-role="assistant" data-message-id="new">new answer</div>');
   assert.equal((await adapter.read('old')).text, 'old answer');
   await assert.rejects(adapter.read('missing'), /not present/); dom.window.close();
+});
+
+test('image transfer is bounded and reads only the requested loaded same-origin asset', async () => {
+  const { dom, adapter, document } = page('<article><div data-message-author-role="assistant" data-message-id="asset-owner"><img id="asset" alt="generated image" src="/displayed-original.png"></div></article>');
+  const img = document.querySelector('#asset');
+  for (const [key, value] of Object.entries({ complete: true, naturalWidth: 941, naturalHeight: 1672 })) Object.defineProperty(img, key, { value, configurable: true });
+  const bytes = Buffer.alloc(600000, 137); let calls = 0;
+  dom.window.fetch = async (url, options) => {
+    calls++; assert.equal(url, 'https://chatgpt.com/displayed-original.png'); assert.equal(options.credentials, 'same-origin');
+    return { ok: true, headers: { get: () => 'image/png' }, arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.length) };
+  };
+  const args = { operation: 'image_chunk', assistantId: 'asset-owner', index: 0, offset: 0 };
+  const first = await adapter.read(args), firstBytes = Buffer.from(first.base64, 'base64');
+  assert.equal(first.totalBytes, bytes.length); assert.equal(firstBytes.length, 512 * 1024);
+  const second = await adapter.read({ ...args, offset: firstBytes.length });
+  assert.deepEqual(Buffer.concat([firstBytes, Buffer.from(second.base64, 'base64')]), bytes);
+  await assert.rejects(adapter.read({ ...args, assistantId: 'missing' }), /not present/);
+  await assert.rejects(adapter.read({ ...args, offset: -1 }), /Invalid/);
+  img.src = 'https://outside.example/image.png';
+  await assert.rejects(adapter.read(args), /same-origin/);
+  assert.equal(calls, 2); dom.window.close();
 });
 test('image results require loaded full-size rendered media and keep original verification false', async () => {
   const { dom, adapter, document } = page('<article><div data-message-author-role="assistant" data-message-id="image-message"><img src="https://chatgpt.com/example.png" width="1024" height="1024" alt="generated"></div><button aria-label="Download image">Download</button></article>');
@@ -97,4 +179,26 @@ test('completed response loads its pending same-origin lazy image without falsel
   assert.equal(document.querySelector('#old-image').getAttribute('loading'), 'lazy');
   assert.equal(document.querySelector('#external-image').getAttribute('loading'), 'lazy');
   dom.window.close();
+});
+
+test('multi-image saving selects the requested full image in a short viewport instead of its thumbnail', async () => {
+  const { dom, adapter, document } = page('<section data-turn="assistant"><div role="button"><img src="/first.png" alt="first"></div><div role="button"><img src="/second.png" alt="second"></div><div data-message-author-role="assistant" data-message-id="carousel-answer">Done</div></section><div role="dialog"><img id="full-image" src="/first.png"><button aria-label="图片 1（共 2 张）：第一张" id="first-thumb"><img src="/first.png"></button><button aria-label="图片 2（共 2 张）：第二张" id="second-thumb"><img src="/second.png"></button><button aria-label="关闭全屏显示">Close</button><button aria-label="保存" id="save-image">Save</button></div>');
+  try {
+    for (const img of document.querySelectorAll('img')) Object.defineProperties(img, {
+      complete: { value: true }, naturalWidth: { value: 1280 }, naturalHeight: { value: 720 },
+    });
+    const full = document.querySelector('#full-image');
+    full.getClientRects = () => [{ x: 0, y: 0, width: 320, height: 180 }];
+    const selections = [], saves = [];
+    for (const name of ['first', 'second']) document.querySelector(`#${name}-thumb`).onclick = () => {
+      selections.push(name); full.src = `/${name}.png`;
+    };
+    document.querySelector('#save-image').onclick = () => { saves.push(full.src); };
+    const info = await adapter.downloadInfo('carousel-answer');
+    assert.equal(info.count, 2); assert.equal(info.mode, 'image_viewer_carousel');
+    await adapter.clickDownload('carousel-answer', 1);
+    await adapter.clickDownload('carousel-answer', 0);
+    assert.deepEqual(selections, ['second', 'first']);
+    assert.deepEqual(saves, ['https://chatgpt.com/second.png', 'https://chatgpt.com/first.png']);
+  } finally { dom.window.close(); }
 });

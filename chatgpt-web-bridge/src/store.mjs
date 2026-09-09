@@ -97,7 +97,16 @@ export class StateStore extends EventEmitter {
     this.reconcile();
     const tab = this.tabView(tabKey);
     if (tab.freshness.stale || !tab.composerReady || tab.activity !== 'idle') throw new Error('Target tab is not freshly observed and idle');
-    if (tab.draftLength > 0) throw new Error('Target tab contains an existing draft; use a new chat');
+    if (tab.draftLength > 0) {
+      const recoverable = Object.values(this.data.runs).some(run =>
+        run.tabKey === tabKey && run.documentIdAtSend === tab.documentId &&
+        run.phase === 'error' && run.accepted === false && run.prompt === prompt &&
+        run.baseline.userCount === tab.userCount &&
+        run.error === 'Draft readback differs; no send click was made');
+      // The adapter additionally compares the complete editor text. Only a
+      // recorded pre-click failure may reach that check with a nonempty draft.
+      if (!recoverable) throw new Error('Target tab contains an existing draft; use a new chat');
+    }
     if (expectedModel && tab.model?.label !== expectedModel) throw new Error('Current model does not match expectedModel');
     const busy = Object.values(this.data.runs).find(run => !terminal.has(run.phase) &&
       (run.tabKey === tabKey || (tab.conversationId && run.conversationId === tab.conversationId && run.profileId === tab.profileId)));
@@ -180,12 +189,13 @@ export class StateStore extends EventEmitter {
       } else if (tab.activity === 'error') {
         run.phase = 'error'; run.error = tab.attention || 'Page reported an error';
       } else if (newAssistant && tab.activity === 'idle' && tab.finalActions && this.now() - tab.lastContentChangeAt >= 2500) {
-        const images = (tab.images || []).filter(image => !run.baseline.imageKeys.includes(image.key) && image.loaded);
-        if (run.kind !== 'image' || images.length > 0) {
+        const candidates = (tab.images || []).filter(image => !run.baseline.imageKeys.includes(image.key));
+        const images = candidates.filter(image => image.loaded);
+        if (run.kind !== 'image' || (images.length > 0 && images.length === candidates.length)) {
           run.phase = 'completed'; run.completedAt = this.now(); run.images = images;
           run.resultAssistantId = tab.lastAssistantId;
           run.resultPreview = tab.lastAssistantPreview; run.resultLength = tab.lastAssistantLength;
-        }
+        } else run.phase = 'finalizing';
       } else if (newAssistant && tab.activity === 'idle') run.phase = 'finalizing';
       if (JSON.stringify(run) !== before) { run.updatedAt = this.now(); changed = true; }
     }

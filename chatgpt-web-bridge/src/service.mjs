@@ -3,7 +3,13 @@ import { randomUUID } from 'node:crypto';
 import { WebSocketServer } from 'ws';
 import { StateStore } from './store.mjs';
 import { tokenEquals } from './config.mjs';
-import { matchDownloadedFiles } from './downloads.mjs';
+import { matchDownloadedFiles, saveTransferredOriginal, verifySavedOriginals } from './downloads.mjs';
+
+function requireCompleteImageAssets(run, assets) {
+  if (!Array.isArray(assets) || assets.length < run.images.length) {
+    throw new Error('Incomplete image result: some completed images are no longer loaded; refresh this conversation before saving');
+  }
+}
 
 export class BridgeService {
   constructor({ config, stateFile = null }) {
@@ -192,6 +198,12 @@ export class BridgeService {
         this.store.reconcile();
         return { revision: this.store.data.revision, tabs: keys.filter(k => this.store.data.tabs[k]).map(key => this.store.tabView(key)), runs: Object.values(this.store.data.runs).filter(r => !params.tabKey || r.tabKey === params.tabKey).map(r => this.store.runView(r.id)), errors };
       }
+      case 'new_chat': return this.withLock(params.tabKey, async () => {
+        const tab = this.target(params.tabKey);
+        if (tab.draftLength) throw new Error('Existing draft was left intact');
+        const result = await this.command(tab.profileId, 'read', { tabId: tab.tabId, documentId: tab.documentId, assistantId: { operation: 'new_chat' } }, 8000);
+        return { tabKey: params.tabKey, ...result };
+      });
       case 'models': {
         return this.withLock(params.tabKey, () => {
           const tab = this.target(params.tabKey);
@@ -226,6 +238,30 @@ export class BridgeService {
         }
         return { run };
       }
+      case 'recover_images': {
+        const run = this.store.runView(params.runId);
+        if (run.phase !== 'completed' || !run.images?.length) throw new Error('Only completed loaded image results can be recovered');
+        return this.withLock(`download:${run.profileId}`, async () => {
+          const tab = this.target(run.tabKey, { allowBusy: true });
+          if (tab.conversationId !== run.conversationId) throw new Error('Tab no longer displays this run');
+          const result = await this.command(tab.profileId, 'read', { tabId: tab.tabId, documentId: tab.documentId, assistantId: run.resultAssistantId }, 5000);
+          requireCompleteImageAssets(run, result.assets);
+          const files = [];
+          for (let index = 0; index < result.assets.length; index++) {
+            const asset = result.assets[index], chunks = []; let offset = 0;
+            while (offset < asset.byteLength) {
+              const part = await this.command(tab.profileId, 'read', { tabId: tab.tabId, documentId: tab.documentId, assistantId: { operation: 'image_chunk', assistantId: run.resultAssistantId, index, offset } }, 5000);
+              const chunk = Buffer.from(part.base64, 'base64');
+              if (part.offset !== offset || part.totalBytes !== asset.byteLength || !chunk.length || chunk.length > 512 * 1024 || offset + chunk.length > asset.byteLength) throw new Error('Image chunk integrity check failed');
+              chunks.push(chunk); offset += chunk.length;
+            }
+            files.push(await saveTransferredOriginal({ asset, bytes: Buffer.concat(chunks), runId: run.id, index }));
+          }
+          if (!files.length) throw new Error('No loaded original assets were found');
+          this.store.data.runs[run.id].verifiedDownloads = files; this.store.changed(); await this.store.save();
+          return { runId: run.id, complete: true, state: 'recovered_and_verified', files, expectedCount: files.length, sourceTransport: 'bridge_byte_transfer' };
+        });
+      }
       case 'download': {
         const run = this.store.runView(params.runId);
         if (run.phase !== 'completed' || !(run.images?.length)) throw new Error('The image run is not confirmed complete');
@@ -233,7 +269,29 @@ export class BridgeService {
           const tab = this.target(run.tabKey, { allowBusy: true });
           if (tab.conversationId !== run.conversationId) throw new Error('Tab no longer displays this run');
           const result = await this.command(tab.profileId, 'read', { tabId: tab.tabId, documentId: tab.documentId, assistantId: run.resultAssistantId }, 4000);
-          if (!result.assets?.length) throw new Error('Image hashes could not be read from the exact completed message');
+          requireCompleteImageAssets(run, result.assets);
+          const saved = await verifySavedOriginals(result.assets, run.verifiedDownloads);
+          if (saved) return { runId: run.id, state: 'saved_and_verified', complete: true, files: saved, expectedCount: saved.length, reused: true };
+          if (result.assets.length > 1) {
+            const current = this.store.data.runs[run.id];
+            const info = await this.command(tab.profileId, 'download_info', { tabId: tab.tabId, documentId: tab.documentId, assistantId: run.resultAssistantId }, 7000);
+            if (info.count !== result.assets.length || info.mode !== 'image_viewer_carousel') throw new Error('Multi-image save controls do not match the rendered assets');
+            current.assetSaveReceipts ||= {};
+            let verified = await matchDownloadedFiles({ assets: result.assets, runId: run.id, sinceMs: run.createdAt, downloadDirectory: this.config.downloadDirectory, waitMs: 0 });
+            for (let index = 0; index < result.assets.length; index++) {
+              if (verified.files.some(file => file.sha256 === result.assets[index].sha256) || current.assetSaveReceipts[index]) continue;
+              // Per-image receipts survive uncertain responses and prevent a
+              // second click for the same selected full-size original.
+              current.assetSaveReceipts[index] = { requestedAt: Date.now(), state: 'started' };
+              this.store.changed(); await this.store.save();
+              const clicked = await this.command(tab.profileId, 'click_download', { tabId: tab.tabId, documentId: tab.documentId, assistantId: run.resultAssistantId, index }, 7000);
+              current.assetSaveReceipts[index].result = clicked;
+              this.store.changed(); await this.store.save();
+              verified = await matchDownloadedFiles({ assets: result.assets, runId: run.id, sinceMs: run.createdAt, downloadDirectory: this.config.downloadDirectory, waitMs: 2000 });
+            }
+            current.verifiedDownloads = verified.files; this.store.changed(); await this.store.save();
+            return { runId: run.id, state: verified.complete ? 'downloaded_and_verified' : 'verification_pending', ...verified, assetSaveReceipts: current.assetSaveReceipts };
+          }
           const receipt = await this.command(tab.profileId, 'download', { tabId: tab.tabId, documentId: tab.documentId, runId: run.id, assistantId: run.resultAssistantId }, 20000);
           const verified = await matchDownloadedFiles({ assets: result.assets, runId: run.id, sinceMs: receipt.requestedAt || run.createdAt, downloadDirectory: this.config.downloadDirectory, waitMs: 4000 });
           const current = this.store.data.runs[run.id];

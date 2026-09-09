@@ -1,5 +1,5 @@
 (() => {
-  const adapterVersion = 18;
+  const adapterVersion = 29;
   if (globalThis.ChatGPTBridgeAdapter?.version === adapterVersion) return;
   const doc = document;
   const normalize = value => String(value || '').replace(/\r\n/g, '\n').trim();
@@ -12,8 +12,32 @@
   const controls = () => editor()?.closest('form') || doc.querySelector('[data-testid="composer"]');
   const messageId = node => node?.getAttribute('data-message-id') || node?.closest('[data-message-id]')?.getAttribute('data-message-id') || node?.closest('article')?.id || null;
   const messages = role => [...doc.querySelectorAll(`[data-message-author-role="${role}"]`)];
-  const draft = node => normalize(node?.value ?? text(node));
+  const draft = node => {
+    if (!node || node.value !== undefined) return normalize(node?.value);
+    const blocks = [...node.children];
+    // ProseMirror stores each entered line as a paragraph. innerText adds
+    // visual paragraph spacing that is not part of the editor's plain text.
+    if (blocks.length && blocks.every(n => /^(P|DIV)$/.test(n.tagName)) &&
+        [...node.childNodes].every(n => n.nodeType === 1 || !n.textContent)) {
+      const inline = n => n.nodeType === 3 ? n.textContent : n.nodeName === 'BR'
+        ? (n.classList.contains('ProseMirror-trailingBreak') ? '' : '\n')
+        : [...n.childNodes].map(inline).join('');
+      return normalize(blocks.map(n => n.childNodes.length === 1 && n.firstChild.nodeName === 'BR'
+        ? '' : inline(n)).join('\n'));
+    }
+    return text(node);
+  };
   const buttons = root => root ? all('button,[role="button"]', root) : [];
+  const userText = node => {
+    let output = text(node);
+    // Long user messages include a visible expand/collapse button. Its label
+    // belongs to the UI, not to the submitted prompt used for run identity.
+    for (const control of buttons(node).reverse()) {
+      const suffix = text(control);
+      if (suffix && output.endsWith('\n' + suffix)) output = normalize(output.slice(0, -suffix.length));
+    }
+    return output;
+  };
   const turnRoot = node => node?.closest('[data-turn="assistant"],article') || node;
   const stop = () => all('[data-testid="stop-button"]').find(n => !n.disabled) ||
     buttons(controls()).find(n => /^(stop( generating| response| streaming)?|停止(生成|回答|输出)?)$/i.test(label(n)) && !n.disabled);
@@ -83,7 +107,7 @@
       surface: imageViewer() ? 'image_viewer' : 'conversation',
       composerReady: !!input && !input.disabled && input.getAttribute('aria-disabled') !== 'true' && !imageViewer(),
       draftLength: draft(input).length, userCount: users.length, assistantCount: assistants.length,
-      lastUserId: messageId(lastUser), lastUserText: text(lastUser), lastAssistantId: lastId,
+      lastUserId: messageId(lastUser), lastUserText: userText(lastUser), lastAssistantId: lastId,
       lastAssistantPreview: output.slice(-400), lastAssistantLength: output.length,
       images, finalActions,
       contentSignature: fingerprint(JSON.stringify([output, images, activity, finalActions, users.length, lastId])),
@@ -110,7 +134,7 @@
     button.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true, pointerType: 'mouse', button: 0, buttons: 0, isPrimary: true }));
     if (!await until(() => button.getAttribute('aria-expanded') !== before, 250)) button.click();
   }
-  async function openModels() {
+  async function closeEmptyViewer() {
     const viewer = imageViewer();
     if (viewer) {
       const viewerInput = viewer.querySelector('#prompt-textarea');
@@ -118,6 +142,37 @@
       buttons(viewer).find(n => /^(关闭全屏显示|Close full screen|Close fullscreen)$/i.test(label(n)))?.click();
       if (!await until(() => !imageViewer(), 1200)) throw new Error('Close the image viewer before selecting a conversation model');
     }
+  }
+  async function newChat() {
+    await closeEmptyViewer();
+    const before = assertIdle();
+    if (before.draftLength) throw new Error('Existing draft was left intact');
+    const blank = () => {
+      const state = snapshot();
+      return new URL(state.url).pathname === '/' && state.activity === 'idle' && state.composerReady &&
+        state.draftLength === 0 && state.userCount === 0 && state.assistantCount === 0 && state;
+    };
+    let after = blank();
+    if (!after) {
+      const findControl = () => all('a,button,[role="button"]').find(n => /^(新聊天|New chat)(?:\s|$)/i.test(label(n)));
+      let control = findControl();
+      if (!control) {
+        const sidebar = all('button,[role="button"]').find(n => /^(打开侧边栏|Open sidebar)$/i.test(label(n)));
+        if (sidebar) { sidebar.click(); control = await until(findControl, 1800); }
+      }
+      if (!control) {
+        const candidates = all('a,button,[role="button"]').map(n => label(n))
+          .filter(value => /新|对话|chat|侧边栏/i.test(value)).map(value => value.slice(0, 80));
+        throw new Error('Visible New chat control was not recognized: ' + JSON.stringify(candidates));
+      }
+      control.click();
+      after = await until(blank, 5000);
+    }
+    if (!after) throw new Error('New chat was not confirmed; inspect this same tab before retrying');
+    return { confirmed: true, previousUrl: before.url, url: after.url, snapshot: after };
+  }
+  async function openModels() {
+    await closeEmptyViewer();
     assertIdle();
     const button = picker();
     if (!button) throw new Error('Visible model picker was not recognized');
@@ -162,9 +217,11 @@
   async function submit(prompt, expectedModel) {
     const before = assertIdle(), input = editor();
     if (expectedModel && before.model.label !== expectedModel) return { notSubmitted: true, error: 'Model changed before submission' };
-    if (before.draftLength) return { notSubmitted: true, error: 'Existing draft was left intact' };
+    if (before.draftLength && draft(input) !== normalize(prompt)) return { notSubmitted: true, error: 'Existing draft was left intact' };
     input.focus();
-    if (input.tagName === 'TEXTAREA') {
+    if (before.draftLength) {
+      // Recover an identical unsent draft without replacing or appending text.
+    } else if (input.tagName === 'TEXTAREA') {
       Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(input, prompt);
       input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: prompt }));
     } else {
@@ -191,6 +248,13 @@
     return { stopped: !!await until(() => !stop(), 1800) };
   }
   async function read(assistantId) {
+    // Older installed content scripts already route read payloads. The service
+    // validates and locks these fixed operations before using this envelope.
+    if (assistantId && typeof assistantId === 'object') {
+      if (assistantId.operation === 'new_chat') return newChat();
+      if (assistantId.operation !== 'image_chunk') throw new Error('Unknown image read operation');
+      return imageChunk(assistantId.assistantId, assistantId.index, assistantId.offset);
+    }
     const list = messages('assistant');
     const target = assistantId ? list.find(n => messageId(n) === assistantId) : list.at(-1);
     if (!target) throw new Error('Requested assistant message is not present in this page');
@@ -207,14 +271,44 @@
       const digest = await crypto.subtle.digest('SHA-256', bytes);
       assets.push({ sourceUrl, sha256: [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join(''), byteLength: bytes.byteLength, mimeType: response.headers.get('content-type'), width: img.naturalWidth, height: img.naturalHeight, alt: img.alt, browserDecoded: true });
     }
-    return { assistantId: messageId(target), text: text(target), assets, snapshot: snapshot() };
+    const viewer = imageViewer();
+    return { assistantId: messageId(target), text: text(target), assets, snapshot: snapshot(),
+      viewer: viewer ? { text: text(viewer).slice(-1200), controls: buttons(viewer).map(n => ({ label: label(n), disabled: !!n.disabled })) } : null };
   }
   let downloadTarget;
+  async function imageChunk(assistantId, index, offset) {
+    if (!Number.isInteger(index) || index < 0 || !Number.isInteger(offset) || offset < 0) throw new Error('Invalid image chunk parameters');
+    const assistant = messages('assistant').find(n => messageId(n) === assistantId);
+    if (!assistant) throw new Error('Requested assistant is not present');
+    const images = [...turnRoot(assistant).querySelectorAll('img')].filter(n => n.alt && n.complete && n.naturalWidth >= 256 && n.naturalHeight >= 256);
+    const img = images[index]; if (!img) throw new Error('Loaded image index is out of bounds');
+    const source = img.currentSrc || img.src, url = new URL(source, location.href);
+    if (url.origin !== location.origin) throw new Error('Only the exact displayed same-origin image can be transferred');
+    const response = await fetch(source, { credentials: 'same-origin', cache: 'force-cache' });
+    if (!response.ok || !response.headers.get('content-type')?.startsWith('image/')) throw new Error('Displayed image bytes unavailable');
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    if (offset >= bytes.length) throw new Error('Image chunk offset is out of bounds');
+    const chunk = bytes.subarray(offset, Math.min(offset + 512 * 1024, bytes.length));
+    let binary = ''; for (let start = 0; start < chunk.length; start += 8192) binary += String.fromCharCode(...chunk.subarray(start, start + 8192));
+    return { offset, totalBytes: bytes.length, base64: btoa(binary) };
+  }
   const matchingViewer = source => all('[role="dialog"]').find(root => [...root.querySelectorAll('img')].some(img => (img.currentSrc || img.src) === source));
   const viewerDownloads = root => root ? all('button,[role="button"],a[download]', root).filter(n => !n.disabled && /^(download( image| original| file)?|下载(此图片|图片|原图|文件)?|保存(图片)?)$/i.test(label(n))) : [];
   async function downloadInfo(assistantId) {
     const assistant = assistantId ? messages('assistant').find(n => messageId(n) === assistantId) : messages('assistant').at(-1);
     if (!assistant) throw new Error('Image message is no longer present');
+    const loaded = [...turnRoot(assistant).querySelectorAll('img')].filter(n => n.alt && n.complete && n.naturalWidth >= 256 && n.naturalHeight >= 256);
+    if (loaded.length > 1) {
+      const images = loaded.map(n => n.currentSrc || n.src);
+      downloadTarget = { assistantId: messageId(assistant), imageSrc: images[0], images };
+      if (!matchingViewer(images[0])) {
+        const opener = loaded[0].closest('[role="button"]');
+        if (!opener) throw new Error('No original image viewer opener is available');
+        opener.click();
+      }
+      if (!await until(() => viewerDownloads(matchingViewer(images[0])).length, 5000)) throw new Error('Original image save control was not recognized');
+      return { count: images.length, assistantId: messageId(assistant), mode: 'image_viewer_carousel' };
+    }
     let controls = downloadButtons(assistant);
     if (!controls.length) {
       const img = [...turnRoot(assistant).querySelectorAll('img')].find(n => n.alt && n.complete && n.naturalWidth >= 256);
@@ -230,7 +324,29 @@
     }
     return { count: controls.length, assistantId: messageId(assistant) };
   }
-  function clickDownload(assistantId, index) {
+  async function clickDownload(assistantId, index) {
+    if (downloadTarget?.assistantId === assistantId && downloadTarget.images) {
+      const source = downloadTarget.images[index];
+      if (!source) throw new Error('Image index is out of bounds');
+      const viewer = matchingViewer(source);
+      if (!viewer) throw new Error('Original image viewer is not open');
+      const thumbnails = buttons(viewer).filter(n => /^(图片 \d+（共 \d+ 张）：|Image \d+ of \d+:)/i.test(label(n)));
+      // Thumbnail images use the same source as the original. Identify their
+      // controls instead of assuming the full image has a minimum CSS height.
+      const selected = () => all('img', viewer).some(img =>
+        (img.currentSrc || img.src) === source && img.complete && img.naturalWidth >= 256 && img.naturalHeight >= 256 &&
+        !thumbnails.some(control => control.contains(img)));
+      if (!selected()) {
+        const thumb = thumbnails.find(n => label(n).startsWith(`图片 ${index + 1}（共 ${downloadTarget.images.length} 张）：`) ||
+          label(n).startsWith(`Image ${index + 1} of ${downloadTarget.images.length}:`));
+        if (!thumb) throw new Error('Requested image thumbnail was not recognized');
+        thumb.click();
+      }
+      if (!await until(selected, 5000)) throw new Error('Requested full-size image did not become active');
+      const control = viewerDownloads(viewer)[0];
+      if (!control) throw new Error('Original save control is not available');
+      control.click(); return { clicked: true, index, control: label(control), source: 'active_full_size_image_viewer' };
+    }
     const assistant = messages('assistant').find(n => messageId(n) === assistantId);
     let control = downloadButtons(assistant)[index];
     if (!control && downloadTarget?.assistantId === assistantId) {
@@ -239,5 +355,5 @@
     if (!control) throw new Error('Download control is not available');
     control.click(); return { clicked: true };
   }
-  Object.assign(globalThis.ChatGPTBridgeAdapter ||= {}, { version: adapterVersion, snapshot, models, selectModel, submit, stopGeneration, read, downloadInfo, clickDownload });
+  Object.assign(globalThis.ChatGPTBridgeAdapter ||= {}, { version: adapterVersion, snapshot, newChat, models, selectModel, submit, stopGeneration, read, imageChunk, downloadInfo, clickDownload });
 })();
