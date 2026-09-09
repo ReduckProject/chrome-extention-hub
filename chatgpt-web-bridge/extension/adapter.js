@@ -1,5 +1,5 @@
 (() => {
-  const adapterVersion = 33;
+  const adapterVersion = 41;
   if (globalThis.ChatGPTBridgeAdapter?.version === adapterVersion) return;
   globalThis.ChatGPTBridgeAdapter?.dispose?.();
   const doc = document;
@@ -11,8 +11,19 @@
   const all = (selector, root = doc) => [...root.querySelectorAll(selector)].filter(visible);
   const editor = () => all('#prompt-textarea[contenteditable="true"],textarea#prompt-textarea,textarea[data-testid="prompt-textarea"]')[0];
   const controls = () => editor()?.closest('form') || doc.querySelector('[data-testid="composer"]');
-  const messageId = node => node?.getAttribute('data-message-id') || node?.closest('[data-message-id]')?.getAttribute('data-message-id') || node?.closest('article')?.id || null;
-  const messages = role => [...doc.querySelectorAll(`[data-message-author-role="${role}"]`)];
+  const messageId = node => node?.getAttribute('data-message-id') || node?.closest('[data-message-id]')?.getAttribute('data-message-id') || node?.closest('article')?.id ||
+    (node?.closest('[data-turn][data-testid^="conversation-turn-"]')?.getAttribute('data-testid')
+      ? `turn:${node.closest('[data-turn]').getAttribute('data-testid')}` : null);
+  const messages = role => {
+    const selector = `[data-message-author-role="${role}"]`;
+    // Image-only answers can be sections with no inner message node. Use their
+    // stable turn identity, scoped by the service to this document and user.
+    const nodes = [...doc.querySelectorAll(selector)];
+    if (role === 'assistant') for (const turn of doc.querySelectorAll('main [data-turn="assistant"]')) {
+      if (!turn.matches(selector) && !turn.querySelector(selector) && messageId(turn)) nodes.push(turn);
+    }
+    return nodes.sort((a, b) => a === b ? 0 : a.compareDocumentPosition(b) & 2 ? 1 : -1);
+  };
   const draft = node => {
     if (!node || node.value !== undefined) return normalize(node?.value);
     const blocks = [...node.children];
@@ -44,9 +55,54 @@
     buttons(controls()).find(n => /^(stop( generating| response| streaming)?|停止(生成|回答|输出)?)$/i.test(label(n)) && !n.disabled);
   const send = () => all('[data-testid="send-button"]').find(n => !n.disabled) ||
     buttons(controls()).find(n => /^(send( prompt| message)?|发送(消息|提示)?)$/i.test(label(n)) && !n.disabled);
-  const picker = () => all('[data-testid="model-switcher-dropdown-button"]')[0] ||
-    all('header button[aria-haspopup="menu"]').find(n => /^(ChatGPT|GPT-|o[1-9])/i.test(label(n))) ||
-    all('button[aria-haspopup="menu"]').find(n => !n.closest('article,aside,nav') && (/^(Instant|Thinking|Pro|Auto|即时|思考|专业|自动)$/i.test(label(n)) || /^(?:GPT-)?5\.(5|6)\b/i.test(label(n))));
+  const effortLabels = /^(低|中|高|极高|轻度|标准|扩展|重度|Low|Medium|High|Extra high|Light|Standard|Extended|Heavy)$/i;
+  const modelLabel = /^(Instant|Thinking|Pro|Auto|即时|思考|专业|自动)$|^(?:GPT-)?\d+\.\d+\b|^o[1-9]\b/i;
+  function modelPickers() {
+    return [...doc.querySelectorAll('button,[role="button"]')].filter(n => {
+      if (n.closest('article,[data-turn],[data-message-author-role],aside,nav')) return false;
+      if (n.getAttribute('data-testid') === 'model-switcher-dropdown-button') return true;
+      if (n.getAttribute('aria-haspopup') !== 'menu') return false;
+      if (n.closest('header') && /^(ChatGPT|GPT-|o[1-9])/i.test(label(n))) return true;
+      return modelLabel.test(label(n)) || (n.closest('form,[data-testid="composer"]') &&
+        n.classList.contains('__composer-pill') && effortLabels.test(label(n)));
+    });
+  }
+  const picker = () => modelPickers().find(visible);
+  const modelName = value => value?.match(/\b(?:GPT-\d+(?:\.\d+)?(?:\s+(?:Pro|Sol|Terra|Luna|Astra))?|o[1-9](?:-mini)?)(?![\w-])/i)?.[0] ||
+    (value?.match(/^(\d+\.\d+)(?=\s|$)/)?.[1] ? `GPT-${value.match(/^(\d+\.\d+)/)[1]}` : null);
+  function reasoningEffort(value) {
+    const effort = normalize(value).replace(/^(?:(?:GPT-)?\d+\.\d+(?:[ \t]+(?:Pro|Sol|Terra|Luna|Astra))?|o[1-9](?:-mini)?)\s+/i, '');
+    return effortLabels.test(effort) ? effort : null;
+  }
+  let lastModelSelection;
+  const checked = n => n.getAttribute('aria-checked') === 'true' || n.getAttribute('aria-selected') === 'true';
+  function rememberModelSelection(options, selectorLabel) {
+    const selected = options.filter(checked).map(n => modelName(label(n))).filter(Boolean);
+    lastModelSelection = selected.length === 1 ? { name: selected[0], selectorLabel,
+      pathname: location.pathname, observedAt: Date.now() } : null;
+  }
+  function currentModel() {
+    const candidates = modelPickers();
+    let button = candidates.find(visible), source = 'visible_model_picker';
+    if (!button && all('[role="dialog"],[role="alertdialog"]').length) {
+      const obscured = candidates.filter(n => n.closest('[aria-hidden="true"],[inert]') &&
+        !n.closest('[hidden]') && n.getClientRects().length &&
+        getComputedStyle(n).display !== 'none' && getComputedStyle(n).visibility !== 'hidden');
+      if (obscured.length === 1) { button = obscured[0]; source = 'obscured_model_picker'; }
+    }
+    const header = all('[data-testid="composer-intelligence-picker-content"] [aria-label="选择模型"],[data-testid="composer-intelligence-picker-content"] [aria-label="Choose model"],[data-testid="composer-intelligence-picker-content"] [aria-label="Select model"]')[0];
+    const value = button ? text(button) || label(button) : text(header) || null;
+    const description = button?.getAttribute('aria-describedby')?.split(/\s+/).map(id => text(doc.getElementById(id))).join(' ') || '';
+    const named = modelName(value) || modelName(description);
+    if (lastModelSelection && (lastModelSelection.pathname !== location.pathname ||
+        (value && lastModelSelection.selectorLabel !== value))) lastModelSelection = null;
+    return { label: value, name: named || lastModelSelection?.name || null, reasoningEffort: reasoningEffort(value),
+      source: button ? source : header ? 'visible_model_menu_header' : 'unavailable',
+      nameSource: named ? 'model_control' : lastModelSelection ? 'last_observed_model_menu' : 'unavailable',
+      nameIsCached: !named && !!lastModelSelection, nameObservedAt: !named ? lastModelSelection?.observedAt || null : null,
+      selectorVisible: !!button && visible(button),
+      actualBackendModel: null };
+  }
   const fingerprint = value => {
     let h = 2166136261;
     for (let i = 0; i < value.length; i++) h = Math.imul(h ^ value.charCodeAt(i), 16777619);
@@ -109,9 +165,7 @@
   function snapshot() {
     const input = editor(), root = controls(), users = messages('user'), assistants = messages('assistant');
     const lastUser = users.at(-1), last = assistants.at(-1), output = text(last);
-    const modelButton = picker();
-    const openModelHeader = all('[data-testid="composer-intelligence-picker-content"] [aria-label="选择模型"]')[0];
-    const model = { label: modelButton ? text(modelButton) || label(modelButton) : text(openModelHeader) || null, source: modelButton ? 'visible_model_picker' : openModelHeader ? 'visible_model_menu_header' : 'unavailable', actualBackendModel: null };
+    const model = currentModel();
     const statusNodes = [...all('[role="status"],[role="progressbar"],[aria-busy="true"]', last || doc.createElement('div')),
       ...(root ? all('[role="status"],[role="progressbar"],[aria-busy="true"]', root) : [])];
     // Do not interpret the static model name "Thinking" or assistant prose as active work.
@@ -187,28 +241,44 @@
       return new URL(state.url).pathname === '/' && state.activity === 'idle' && state.composerReady &&
         state.draftLength === 0 && state.userCount === 0 && state.assistantCount === 0 && state;
     };
-    let after = blank();
-    if (!after) {
-      const findControl = () => all('a,button,[role="button"]').find(n => /^(新聊天|New chat)(?:\s|$)/i.test(label(n)));
-      let control = findControl();
-      if (!control) {
-        const sidebar = all('button,[role="button"]').find(n => /^(打开侧边栏|Open sidebar)$/i.test(label(n)));
-        if (sidebar) { sidebar.click(); control = await until(findControl, 1800); }
+    let after = blank(), openedSidebar = false, sidebarRestored = null;
+    try {
+      if (!after) {
+        const findControl = () => all('a,button,[role="button"]').find(n => /^(新聊天|New chat)(?:\s|$)/i.test(label(n)));
+        let control = findControl();
+        if (!control) {
+          const sidebar = all('button,[role="button"]').find(n => /^(打开侧边栏|Open sidebar)$/i.test(label(n)));
+          if (sidebar) { sidebar.click(); openedSidebar = true; control = await until(findControl, 1800); }
+        }
+        if (!control) {
+          const candidates = all('a,button,[role="button"]').map(n => label(n))
+            .filter(value => /新|对话|chat|侧边栏/i.test(value)).map(value => value.slice(0, 80));
+          throw new Error('Visible New chat control was not recognized: ' + JSON.stringify(candidates));
+        }
+        control.click();
+        after = await until(blank, 5000);
       }
-      if (!control) {
-        const candidates = all('a,button,[role="button"]').map(n => label(n))
-          .filter(value => /新|对话|chat|侧边栏/i.test(value)).map(value => value.slice(0, 80));
-        throw new Error('Visible New chat control was not recognized: ' + JSON.stringify(candidates));
+    } finally {
+      // Only restore a sidebar this operation opened. Preserve the user's
+      // original layout, and never click through a newly displayed restriction.
+      if (openedSidebar) {
+        const findClose = () => all('[data-testid="close-sidebar-button"],button,[role="button"]')
+          .find(n => /^(关闭侧边栏|Close sidebar)$/i.test(label(n)));
+        const findOpen = () => all('button,[role="button"]')
+          .find(n => /^(打开侧边栏|Open sidebar)$/i.test(label(n)));
+        if (!accessNotice()) {
+          findClose()?.click();
+          sidebarRestored = !!await until(findOpen, 800);
+        } else sidebarRestored = false;
       }
-      control.click();
-      after = await until(blank, 5000);
     }
     if (!after) throw new Error('New chat was not confirmed; inspect this same tab before retrying');
-    return { confirmed: true, previousUrl: before.url, url: after.url, snapshot: after };
+    return { confirmed: true, previousUrl: before.url, url: after.url, snapshot: snapshot(),
+      ...(openedSidebar ? { sidebarRestored } : {}) };
   }
   async function openModels() {
     await closeEmptyViewer();
-    assertIdle();
+    const current = assertIdle().model;
     const button = picker();
     if (!button) throw new Error('Visible model picker was not recognized');
     if (button.getAttribute('aria-expanded') !== 'true') await toggleMenu(button);
@@ -220,12 +290,15 @@
       options = await until(() => menuOptions().some(n => n.getAttribute('role') === 'menuitemradio') && menuOptions().filter(n => n.getAttribute('role') === 'menuitemradio'));
       if (!options) throw new Error('Advanced model choices did not become observable');
     }
-    return { button, options };
+    return { button, options, current };
   }
   async function models() {
-    const current = snapshot().model;
-    const { button, options } = await openModels();
-    const result = { current, options: options.map(n => ({ label: label(n), selected: n.getAttribute('aria-checked') === 'true' || n.getAttribute('aria-selected') === 'true' })) };
+    const { button, options, current } = await openModels();
+    rememberModelSelection(options, current.label);
+    const result = { current: { ...current,
+      ...(lastModelSelection ? { name: lastModelSelection.name, nameSource: 'checked_model_menu', nameIsCached: false,
+        nameObservedAt: lastModelSelection.observedAt } : {}) },
+      options: options.map(n => ({ label: label(n), selected: checked(n) })) };
     if (button.getAttribute('aria-expanded') === 'true') await toggleMenu(button);
     return result;
   }
@@ -247,7 +320,13 @@
         if (reopened.button.getAttribute('aria-expanded') === 'true') await toggleMenu(reopened.button);
       } catch {}
     }
-    return { requestedLabel: exactLabel, before, model: after, confirmed: !!after.label && (selectedByMenu || after.label === exactLabel), verification: selectedByMenu ? 'visible_menu_selection' : 'visible_picker_label' };
+    if (selectedByMenu && modelName(exactLabel)) lastModelSelection = { name: modelName(exactLabel),
+      selectorLabel: after.label, pathname: location.pathname, observedAt: Date.now() };
+    return { requestedLabel: exactLabel, before, model: { ...after,
+      ...(selectedByMenu && modelName(exactLabel) ? { name: modelName(exactLabel), nameSource: 'checked_model_menu', nameIsCached: false,
+        nameObservedAt: lastModelSelection.observedAt } : {}) },
+      confirmed: !!after.label && (selectedByMenu || after.label === exactLabel),
+      verification: selectedByMenu ? 'visible_menu_selection' : 'visible_picker_label' };
   }
   async function submit(prompt, expectedModel) {
     const before = assertIdle(), input = editor();
@@ -344,7 +423,36 @@
       coverage: 'browser_buffer_only_not_a_complete_network_log', totalResourceEntries: entries.length,
       sameOriginEntries: requests.length, earliestAt: requests[0]?.at || null,
       latestAt: requests.at(-1)?.at || null, requests: requests.slice(-200),
-      responseStreams: responseStreams(), visibility: doc.visibilityState, hasFocus: doc.hasFocus() };
+      responseStreams: responseStreams(), visibility: doc.visibilityState, hasFocus: doc.hasFocus(),
+      uiControls: [...doc.querySelectorAll('button,[role="button"]')]
+        .filter(n => !n.closest('article,[data-turn],[data-message-author-role],aside,nav') &&
+          n.getAttribute('data-testid') !== 'accounts-profile-button').slice(0, 40).map(n => ({
+          tag: n.tagName, id: n.id, testId: n.getAttribute('data-testid'),
+          label: label(n).slice(0, 160), text: text(n).slice(0, 160),
+          popup: n.getAttribute('aria-haspopup'), expanded: n.getAttribute('aria-expanded'),
+          visible: visible(n), hiddenBy: n.closest('[hidden],[aria-hidden="true"],[inert]')?.tagName || null,
+          inHeader: !!n.closest('header'), inComposer: !!n.closest('form,[data-testid="composer"]'),
+        })),
+      sidebarControls: [...doc.querySelectorAll('button')].filter(n =>
+        /^(打开侧边栏|关闭侧边栏|Open sidebar|Close sidebar)$/i.test(label(n))).map(n => ({
+          label: label(n), testId: n.getAttribute('data-testid'), expanded: n.getAttribute('aria-expanded'),
+          visible: visible(n), hasLayout: n.getClientRects().length > 0,
+        })),
+      modelCandidates: [...doc.querySelectorAll('form button[aria-haspopup="menu"],[data-testid="composer"] button[aria-haspopup="menu"]')]
+        .filter(n => n.id !== 'composer-plus-btn').slice(0, 4).map(n => {
+          const copy = n.cloneNode(true);
+          for (const shape of copy.querySelectorAll('path,use')) shape.remove();
+          return { html: copy.outerHTML.slice(0, 4000), description: n.getAttribute('aria-describedby')?.split(/\s+/).map(id => text(doc.getElementById(id))).join(' ').slice(0, 800) || null, parentTag: n.parentElement?.tagName,
+            parentTestId: n.parentElement?.getAttribute('data-testid') };
+        }),
+      responseStructure: [...doc.querySelectorAll('main article,main [data-turn]')].slice(-6).map(node => ({
+        tag: node.tagName, id: node.id, turn: node.getAttribute('data-turn'),
+        testId: node.getAttribute('data-testid'), role: node.getAttribute('data-message-author-role'),
+        messages: [...node.querySelectorAll('[data-message-author-role],[data-message-id]')].slice(-8).map(n => ({
+          tag: n.tagName, id: messageId(n), role: n.getAttribute('data-message-author-role') })),
+        images: imageElements(node).map(n => ({ loaded: n.complete, width: n.naturalWidth, height: n.naturalHeight })),
+        controls: buttons(node).map(label).slice(-12),
+      })) };
   }
   function readResponse(assistantId) {
     const list = messages('assistant');

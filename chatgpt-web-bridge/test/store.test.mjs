@@ -19,6 +19,70 @@ function fixture(options = {}) {
   return { store, snap, advance: ms => { time += ms; } };
 }
 
+test('missing placeholder is reported and the matching image turn completes the original run', async () => {
+  const { store, snap, advance } = fixture();
+  const tabKey = snap(1);
+  const { run } = await store.reserve({ tabKey, prompt: 'portrait', requestId: 'placeholder-image', kind: 'image' });
+  store.submissionResult(run.id, { accepted: true, userMessageId: 'u1' });
+  const user = { userCount: 1, lastUserId: 'u1', lastUserText: 'portrait' };
+  snap(1, { ...user, activity: 'generating', assistantCount: 1, lastAssistantId: 'request-placeholder-1', contentSignature: 'placeholder' });
+  snap(1, { ...user, contentSignature: 'missing' });
+  assert.equal(run.phase, 'finalizing');
+  assert.equal(run.observationIssue, 'response_not_found');
+  assert.equal(run.responseAssistantId, 'request-placeholder-1');
+  const imageTurn = { ...user, assistantCount: 1, lastAssistantId: 'turn:conversation-turn-2', finalActions: true,
+    images: [{ key: 'portrait-1', loaded: true }], contentSignature: 'image-answer' };
+  snap(1, imageTurn); advance(2600); snap(1, imageTurn);
+  assert.equal(run.phase, 'completed');
+  assert.equal(run.resultAssistantId, 'turn:conversation-turn-2');
+  assert.equal(run.observationIssue, undefined);
+  assert.equal(run.images.length, 1);
+});
+
+test('an image turn following another user message cannot complete a missing response', async () => {
+  const { store, snap, advance } = fixture();
+  const tabKey = snap(1);
+  const { run } = await store.reserve({ tabKey, prompt: 'original', requestId: 'placeholder-other-user' });
+  store.submissionResult(run.id, { accepted: true, userMessageId: 'u1' });
+  snap(1, { userCount: 1, lastUserId: 'u1', lastUserText: 'original', activity: 'generating', assistantCount: 1, lastAssistantId: 'request-placeholder-1' });
+  const other = { userCount: 2, lastUserId: 'u2', lastUserText: 'another prompt', assistantCount: 1,
+    lastAssistantId: 'turn:conversation-turn-4', finalActions: true, images: [{ key: 'other' }], contentSignature: 'other' };
+  snap(1, other); advance(2600); snap(1, other);
+  assert.notEqual(run.phase, 'completed');
+  assert.equal(run.responseAssistantId, 'request-placeholder-1');
+  assert.equal(run.observationIssue, 'latest_user_message_does_not_match');
+  assert.equal(run.images.length, 0);
+});
+
+test('wait ignores heartbeat and unrelated tab revisions but wakes for the tracked response', async () => {
+  const { store, snap } = fixture();
+  const tabKey = snap(1); snap(2);
+  const { run } = await store.reserve({ tabKey, prompt: 'one', requestId: 'wait-one' });
+  store.submissionResult(run.id, { accepted: true, userMessageId: 'u1' });
+  const active = { userCount: 1, lastUserId: 'u1', lastUserText: 'one', activity: 'generating' };
+  snap(1, active);
+  const cursor = store.data.revision;
+  // Even changes arriving before wait must not cause an immediate return.
+  snap(1, active); snap(2, { contentSignature: 'other-before' });
+  let resolved = false;
+  const waiting = store.wait({ runId: run.id, afterRevision: cursor, timeoutMs: 500 }).then(result => { resolved = true; return result; });
+  snap(1, active); snap(2, { contentSignature: 'other-during' });
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(resolved, false);
+  snap(1, { ...active, activity: 'idle', assistantCount: 1, lastAssistantId: 'a1', finalActions: true, contentSignature: 'response' });
+  assert.equal((await waiting).run.phase, 'finalizing');
+  assert.equal(store.listenerCount('change'), 0);
+});
+
+test('wait times out without a semantic change and removes its listener', async () => {
+  const { store, snap } = fixture();
+  const { run } = await store.reserve({ tabKey: snap(1), prompt: 'one', requestId: 'wait-timeout' });
+  const started = Date.now();
+  await store.wait({ runId: run.id, afterRevision: store.data.revision, timeoutMs: 25 });
+  assert.ok(Date.now() - started >= 20);
+  assert.equal(store.listenerCount('change'), 0);
+});
+
 test('a visible access limit pauses every tab in its profile and preserves idempotent retries', async () => {
   const { store, snap, advance } = fixture();
   const first = snap(1), second = snap(2);

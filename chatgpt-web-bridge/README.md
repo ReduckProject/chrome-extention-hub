@@ -49,7 +49,7 @@ node src/cli.mjs status
 | `chatgpt_tabs` | 列出 tabKey、profile、网址；`action:new,count:3` 开三个新聊天 |
 | `chatgpt_new_chat` | 在指定的同一个 tab 点击“新聊天”，确认空白输入框；串行生图先保存上一张原图再调用 |
 | `chatgpt_status` | 查询模型、活动、连接、新鲜度、任务；`refresh:true` 并行探测 |
-| `chatgpt_models` | 读取实际模型菜单；必要时关闭没有草稿的图片查看器 |
+| `chatgpt_models` | 读取菜单勾选的模型名称和当前推理强度；必要时关闭没有草稿的图片查看器 |
 | `chatgpt_select_model` | 按精确标签选择并读回，检查 `confirmed:true` |
 | `chatgpt_send` | 提交 prompt，返回持久化 run；必须提供稳定 requestId |
 | `chatgpt_access` | 查询／记录 profile 暂停；只有用户明确要求恢复时才调用 resume，不自动重试网站请求 |
@@ -63,7 +63,7 @@ MCP 返回 structuredContent JSON，并附带相同内容的文本。状态字�
 
 ```json
 {
-  "model": {"label": "5.5\n即时", "source": "visible_model_picker", "actualBackendModel": null},
+  "model": {"label": "5.5\n即时", "name": "GPT-5.5", "reasoningEffort": null, "nameSource": "model_control", "nameIsCached": false, "source": "visible_model_picker", "actualBackendModel": null},
   "activity": "idle",
   "connection": "connected",
   "freshness": {"ageMs": 18, "stale": false},
@@ -71,6 +71,8 @@ MCP 返回 structuredContent JSON，并附带相同内容的文本。状态字�
   "composerReady": true
 }
 ```
+
+`model.label` 保留选择器原文，`model.name` 返回有证据的模型名称，`reasoningEffort` 返回选择器显示的推理强度（如“中”“高”）。仅有强度不能推定模型名称：首次用 `models` 读取勾选项，或以 `select_model` 的已验证结果确认名称。随后 status 仅读缓存，不反复开菜单；`nameIsCached:true`、`nameSource:last_observed_model_menu` 和 `nameObservedAt` 标明名称来自此前观察，不能当作刚刚验证的选择。选择器标签或会话路径变化后清除该缓存；名称未知时返回 null。`obscured_model_picker` / `selectorVisible:false` 表示控件被弹窗遮住，只读取 DOM 值，不穿过弹窗点击。`send.expectedModel` 仍使用精确的 `model.label`，而不是 `model.name`。
 
 `generating` / `thinking` 表示页面活动。`run.phase:completed` 和 `completionReason:response_finished` 只表示本次网页回答已经结束：已关联本次用户消息及新回答，页面空闲，取得回答结束证据并稳定 2.5 秒。adapter v33 被动记录网页自身的响应流 Resource Timing；本次提交之后成功结束的响应流可作为证据，不要求复制／下载按钮出现，也不要求图片加载。`completionEvidence.source:response_stream_end` 附带流开始／结束时间；缺少可用时序时仍可使用 `response_actions` 控件证据，不仅凭长时间空闲推定完成。旧请求、不同文档／用户消息、仍在生成及未知／过期观察不能据此完成。纯文字、拒绝说明、无图回复及图片尚未加载的回复都可完成，`kind` 不参与完成判断。新请求默认 `kind:text`；已有 requestId 的默认类型保持原值，确保升级后仍可幂等重查。
 
@@ -110,12 +112,12 @@ MCP 返回 structuredContent JSON，并附带相同内容的文本。状态字�
 
 2026-09-10 的一次复发现场：三个 tab 在约 142 秒内共有 25 次会话列表读取，其中 7 次返回 429；已有图片资源读取返回 200。相邻 tab 的列表读取多次同步发生。现场支持继续排查自动流程触发的多 tab 列表更新，但没有此前的命令调用栈，尚不能归因到某一个代码改动，也不宣称根因已修复。此处的 profile 是本地保守范围，无法确定不同 profile 是否登录同一账号。不要靠刷新网页、新开 tab 或切换工具重试来诊断。
 
-串行生图默认只在第一张调用 `chatgpt_tabs({action:"new",count:1})` 打开专用 tab。每张完成并保存验证原图后，用 `chatgpt_new_chat({tabKey})` 在同一 tab 新建聊天，检查 `confirmed:true`，重新确认模型，再提交下一张。新工具尚未加载到客户端时，可用同一服务的 CLI `new_chat --input <UTF-8参数文件>`。当前已实测同 tab 连续新建聊天、重新选择模型、逐张生图和原图保存。
+串行任务优先复用当前任务已有、回答已结束且结果已保存的 tab；没有可复用的本任务 tab 时才开一个。用 `chatgpt_new_chat({tabKey})` 在同一 tab 新建聊天，检查 `confirmed:true`，重新确认模型再提交。不抢占其他任务，不自动关闭用户页面，也不设置总 tab 数硬上限。临时展开的侧栏会恢复折叠；用户原先展开的侧栏保持原状，`sidebarRestored:false` 表示未恢复。
 
 仅在用户明确要求并行时采用以下三 tab 流程：
 
 1. 获取 profile，创建三个新聊天，等待空输入框与新鲜 idle 状态，取得各自精确 tabKey。
-2. 每页读取 models，选择实际菜单标签并检查 confirmed；把读回的模型名称用于 send.expectedModel。
+2. 每页读取 models，选择实际菜单标签并检查 confirmed；把读回的精确 model.label 用于 send.expectedModel。
 3. 为三个任务分别固定 requestId，分别提交，不等待前一个生成完成。
 4. 用一次 status 查看全部任务；需要新观测时 refresh:true，各 tab 最多等 2 秒且并行执行；等待变化可用 wait。
 5. 每个 run 完成后调用 result，检查正文及图片状态，有实际可下载图片时再调用 download。同一 profile 的下载串行处理。
@@ -163,11 +165,17 @@ setup 生成 runtime/extension、固定扩展 ID、本机认证配置，不代�
 
 已有实例的源码可以独立纳入本仓库，当前安装不会自动迁移。迁移运行实例时需保留其 runtime 配置和状态；环境变量 CHATGPT_BRIDGE_RUNTIME 可指定现有 runtime 目录。Chrome 扩展仍从加载时的目录运行，重新加载前应保留该目录。每个实例的认证配置需与其本地服务一致。
 
-页面适配层更新后，npm run setup 和 node src/cli.mjs refresh_observers 可更新当前文档的观察器。content.js 新增命令通常需要重新加载对应页面；修改 manifest 或 background 时需要在 Chrome 中重新加载扩展。当前 adapter 版本 32 支持被动读取已有请求时序，兼容现有 content.js 的固定 read 消息格式；服务端须重启以加载需明确恢复的暂停策略和操作审计。
+页面适配层更新后，npm run setup 和 node src/cli.mjs refresh_observers 可更新当前文档的观察器。content.js 新增命令通常需要重新加载对应页面；修改 manifest 或 background 时需要在 Chrome 中重新加载扩展。当前 adapter 版本 41 兼容现有 content.js 的固定 read 消息格式。全 tab 观察器安装仅发生在扩展连接建立或显式 refresh_observers 时；新文档的普通状态上报不再触发所有 tab 重新注入。服务端改动须重启本机 daemon。
 
 ## 验证范围与限制
 
-- 既有本机 Chrome 152、已登录 ChatGPT 中文页面、GPT-5.5 菜单、三 tab 文生图和原图获取已验证；初次验收完成 60 次真实 MCP 状态查询，当前 71 个自动化测试通过。访问限流保护采用本地 DOM／WebSocket 测试；部署后通过真实观察器捕获弹窗、读取三个页面已有的请求时序并确认暂停保持。没有在限制提示仍存在时重新发送提示词或进行压力测试。
+- 2026-09-10 adapter v41：从实际 DOM 确认部分模型入口改为显示“中／高”的 composer pill，增加识别并分别返回模型名称与推理强度。模型菜单名称的缓存明确标注来源；新聊天临时展开的侧栏会恢复折叠，保留用户原先展开的侧栏。移除新文档观察引发的全 tab 重装，并在 MCP 中暴露 closed/frozen/discarded，便于区分旧记录与当前页面。
+- 当前完整测试 83 项通过；模型识别追加修改后重跑 32 项 adapter 测试通过。真实 MCP 读取验证 12 个工具、adapterVersion:41、推理强度字段及暂停保留。部署保留 54 个任务和现有文档；未解除访问暂停或用新的生成任务测试。实际模型名称仍待允许操作后首次读取模型菜单确认，不以 DOM 模拟测试冒充网页切换验收。
+- 本次限流窗口中，一次发送后约六个 tab 在约 26 毫秒内同时请求会话列表，随后部分返回 429；用户也报告手动操作触发相同提示。这支持多 tab 同步请求放大的判断，但现有 Resource Timing 不含调用栈，不能据此确定网页内部触发链。串行任务优先复用同一 tab，不设置总数硬上限、不自动关闭用户页面；不以持续新建 tab 验证限制是否恢复。
+- 2026-09-10 adapter v35：兼容没有内部 `data-message-author-role` 的纯图片 `section[data-turn="assistant"]`，使用会话内的 turn 标识关联回答；临时占位消失但未找到回答时标记 `finalizing` / `response_not_found`，不继续声称生成中。`wait` 仅在目标任务的有效状态变化时唤醒，无关 tab 和重复观测不再触发立即返回。新增占位替换、图片回答读取、跨用户消息保护、等待隔离与超时清理测试，当时 77 项测试通过。
+- v35 部署后实测：此前卡住的同一任务无需重发即识别为 completed，并经 Chrome 下载校验 941×1672 原图；后续任务无有效变化时，25 秒 wait 实测约 25029 ms 返回。该结果验证本次图片回答识别与等待修复，不代表模型选择器等其他网页适配已修复。
+
+- 既有本机 Chrome 152、已登录 ChatGPT 中文页面、GPT-5.5 菜单、三 tab 文生图和原图获取已验证；初次验收完成 60 次真实 MCP 状态查询，当时 71 个自动化测试通过。访问限流保护采用本地 DOM／WebSocket 测试；部署后通过真实观察器捕获弹窗、读取三个页面已有的请求时序并确认暂停保持。没有在限制提示仍存在时重新发送提示词或进行压力测试。
 - 2026-09-10 adapter v33 实测：一个后台 tab 的回答流结束后约 3.8 秒返回 completed，完成时 visibility:hidden、hasFocus:false、finalActions:false，图片仍 lazy/pending。证明此次完成不依赖前台激活、图片加载或完成按钮；该窗口未观察到 HTTP 429。只是一轮样本，不证明此前多 tab 会话列表限流的根因已消除。
 - `noticeVisible:null` / `observationPending:true` 表示原限流页面的观察已过期，不能据此认定提示消失；恢复前须取得一次新的页面观察，默认状态查询不会为此刷新网页。
 - 重新加载扩展后，另行验证了 GPT-5.6 Sol → GPT-5.5 切换、新聊天、图片生成、阶段查询和原图下载。进度按 generating、finalizing、completed 等阶段返回，当前不提供生成百分比。

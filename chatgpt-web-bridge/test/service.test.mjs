@@ -55,6 +55,19 @@ test('a profile rate limit blocks browser requests across tabs but permits passi
   assert.equal(commands.length, 3, 'Neither hashing nor lazy loading may reach the extension during backoff');
 });
 
+test('new document observations never broadcast reinjection to all tabs', async t => {
+  const { service, ws, rpc, snapshot, until } = await fixture(t);
+  const received = [];
+  ws.on('message', data => received.push(JSON.parse(data)));
+  snapshot(snap(1)); snapshot(snap(2));
+  await until(() => service.store.list().length === 2);
+  await new Promise(resolve => setTimeout(resolve, 220));
+  assert.equal(received.length, 0, 'Passive observations must not send a welcome or commands to old tabs');
+  await rpc('refresh_observers');
+  await until(() => received.length === 1);
+  assert.equal(received[0].type, 'welcome', 'Explicit observer updates remain available');
+});
+
 test('lazy loading is an explicit completed-result operation, never a default query side effect', async t => {
   const { service, ws, rpc, snapshot, until } = await fixture(t);
   snapshot(snap(1)); await until(() => service.store.list().length === 1);

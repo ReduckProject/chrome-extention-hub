@@ -26,6 +26,7 @@ export class StateStore extends EventEmitter {
     this.data = { schema: 1, revision: 0, tabs: {}, runs: {}, requests: {}, accessPauses: {}, operations: [] };
     this.connections = new Set();
     this.saves = Promise.resolve();
+    this.runChanges = new Map();
   }
 
   async load() {
@@ -56,6 +57,15 @@ export class StateStore extends EventEmitter {
 
   changed() {
     this.data.revision++;
+    for (const run of Object.values(this.data.runs)) {
+      const { updatedAt, responseCache, ...state } = run;
+      const tab = this.data.tabs[run.tabKey];
+      const signature = JSON.stringify([state, tab?.activity, tab?.observationError,
+        this.connections.has(run.profileId), !!this.data.accessPauses[run.profileId]]);
+      if (this.runChanges.get(run.id)?.signature !== signature) {
+        this.runChanges.set(run.id, { signature, revision: this.data.revision });
+      }
+    }
     this.emit('change', this.data.revision);
   }
 
@@ -288,6 +298,12 @@ export class StateStore extends EventEmitter {
         run.completionEvidence = completionEvidence;
         run.resultAssistantId = tab.lastAssistantId;
       } else if (newAssistant && tab.activity === 'idle') run.phase = 'finalizing';
+      else if (tab.activity === 'idle' && run.responseAssistantId) {
+        // A disappearing placeholder is not proof of completion or continued
+        // generation. Keep ownership and expose the missing response explicitly.
+        run.phase = 'finalizing';
+        run.observationIssue = 'response_not_found';
+      }
       if (JSON.stringify(run) !== before) { run.updatedAt = this.now(); changed = true; }
     }
     if (changed) this.changed();
@@ -308,12 +324,15 @@ export class StateStore extends EventEmitter {
     if (terminal.has(run.phase) || run.phase === 'awaiting_user' || run.observation?.accessPause) {
       return { revision: this.data.revision, run };
     }
-    if (this.data.revision <= afterRevision) {
+    if ((this.runChanges.get(runId)?.revision || 0) <= afterRevision) {
       await new Promise(resolve => {
-        const done = () => { clearTimeout(timer); this.off('change', done); resolve(); };
+        const done = () => { clearTimeout(timer); this.off('change', onChange); resolve(); };
+        const onChange = () => {
+          if ((this.runChanges.get(runId)?.revision || 0) > afterRevision) done();
+        };
         const timer = setTimeout(done, Math.min(Math.max(timeoutMs, 0), 25000));
-        this.on('change', done);
-        if (this.data.revision > afterRevision) done();
+        this.on('change', onChange);
+        onChange();
       });
     }
     return { revision: this.data.revision, run: this.runView(runId) };

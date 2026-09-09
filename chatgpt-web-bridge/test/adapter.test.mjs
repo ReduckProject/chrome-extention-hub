@@ -11,6 +11,119 @@ function page(extra = '', setup = () => {}) {
   dom.window.eval(source);
   return { dom, document: dom.window.document, adapter: dom.window.ChatGPTBridgeAdapter };
 }
+
+test('composer effort selectors expose effort without inventing a model or matching unrelated controls', () => {
+  const { dom, adapter, document } = page();
+  document.querySelector('header button').remove();
+  document.body.insertAdjacentHTML('beforeend', '<aside><button aria-haspopup="menu">GPT-9.0</button></aside><button aria-haspopup="menu">高</button>');
+  document.querySelector('form').insertAdjacentHTML('beforeend', '<button aria-haspopup="menu" class="__composer-pill" id="effort">高</button>');
+  const model = adapter.snapshot().model;
+  assert.equal(model.label, '高'); assert.equal(model.reasoningEffort, '高'); assert.equal(model.name, null);
+  assert.equal(model.selectorVisible, true); assert.equal(adapter.snapshot().activity, 'idle');
+  document.querySelector('#effort').textContent = '中';
+  assert.equal(adapter.snapshot().model.reasoningEffort, '中');
+  document.querySelector('#effort').textContent = '5.5\n高';
+  assert.equal(adapter.snapshot().model.name, 'GPT-5.5');
+  assert.equal(adapter.snapshot().model.reasoningEffort, '高');
+  document.querySelector('#effort').textContent = 'GPT-5.6 Sol\nMedium';
+  assert.equal(adapter.snapshot().model.name, 'GPT-5.6 Sol');
+  assert.equal(adapter.snapshot().model.reasoningEffort, 'Medium');
+  document.querySelector('#effort').remove();
+  assert.equal(adapter.snapshot().model.label, null);
+  dom.window.close();
+});
+
+test('a restriction obscures the model control without erasing its DOM value or permitting clicks', async () => {
+  const { dom, adapter, document } = page();
+  document.querySelector('header button').remove();
+  document.querySelector('form').insertAdjacentHTML('beforeend', '<button aria-haspopup="menu" class="__composer-pill">高</button>');
+  document.querySelector('form').setAttribute('aria-hidden', 'true');
+  document.body.insertAdjacentHTML('beforeend', '<div role="dialog">请求过于频繁，暂时限制访问对话记录。</div>');
+  const state = adapter.snapshot();
+  assert.equal(state.model.reasoningEffort, '高'); assert.equal(state.model.source, 'obscured_model_picker');
+  assert.equal(state.model.selectorVisible, false); assert.equal(state.activity, 'needs_attention');
+  await assert.rejects(adapter.models(), /rate limited/);
+  document.querySelector('[role="dialog"]').remove();
+  assert.equal(adapter.snapshot().model.label, null, 'Unrelated hidden controls are not a fallback');
+  dom.window.close();
+});
+
+test('model menus can be opened from an effort pill, read by checked name and selected exactly', async () => {
+  const { dom, adapter, document } = page();
+  try {
+    document.querySelector('header button').remove();
+    document.querySelector('form').insertAdjacentHTML('beforeend', '<button type="button" aria-haspopup="menu" aria-expanded="false" class="__composer-pill" id="model">高</button>');
+    const button = document.querySelector('#model');
+    let selected = 'GPT-5.6 Sol', opens = 0;
+    const close = () => { document.querySelectorAll('[role="menu"]').forEach(n => n.remove()); button.setAttribute('aria-expanded', 'false'); };
+    button.addEventListener('pointerdown', () => {
+      if (button.getAttribute('aria-expanded') === 'true') { close(); return; }
+      opens++; button.setAttribute('aria-expanded', 'true');
+      document.body.insertAdjacentHTML('beforeend', '<div role="menu"><button role="menuitem" id="choose">选择模型</button></div>');
+      document.querySelector('#choose').onclick = () => {
+        const menu = document.querySelector('[role="menu"]'); menu.replaceChildren();
+        for (const name of ['GPT-5.5', 'GPT-5.6 Sol']) {
+          const option = document.createElement('button'); option.textContent = name;
+          option.setAttribute('role', 'menuitemradio'); option.setAttribute('aria-checked', String(name === selected));
+          option.onclick = () => { selected = name; close(); };
+          menu.append(option);
+        }
+      };
+    });
+    const listed = await adapter.models();
+    assert.equal(listed.current.name, 'GPT-5.6 Sol'); assert.equal(listed.current.reasoningEffort, '高');
+    assert.equal(listed.current.nameSource, 'checked_model_menu');
+    assert.equal(listed.options.filter(n => n.selected)[0].label, 'GPT-5.6 Sol');
+    assert.equal(button.getAttribute('aria-expanded'), 'false');
+    assert.equal(adapter.snapshot().model.name, 'GPT-5.6 Sol');
+    assert.equal(adapter.snapshot().model.nameIsCached, true);
+    const changed = await adapter.selectModel('GPT-5.5');
+    assert.equal(changed.confirmed, true); assert.equal(changed.model.name, 'GPT-5.5');
+    assert.equal(changed.model.reasoningEffort, '高'); assert.equal(changed.model.nameIsCached, false);
+    const beforeReads = opens;
+    adapter.snapshot(); adapter.snapshot();
+    assert.equal(opens, beforeReads, 'Passive status must never open the menu');
+    dom.window.history.pushState({}, '', '/c/other');
+    assert.equal(adapter.snapshot().model.name, null, 'A previous conversation model must not leak into the next chat');
+  } finally { dom.window.close(); }
+});
+
+test('explicit version labels are recognized beyond a hard-coded model release list', () => {
+  const { dom, adapter, document } = page();
+  document.querySelector('header button').remove();
+  document.querySelector('form').insertAdjacentHTML('beforeend', '<button aria-haspopup="menu">6.1\n即时</button>');
+  assert.equal(adapter.snapshot().model.name, 'GPT-6.1');
+  assert.equal(adapter.snapshot().model.nameIsCached, false);
+  dom.window.close();
+});
+
+test('image-only assistant sections replace placeholders and remain readable by turn identity', async () => {
+  const { dom, document, adapter } = page('<section data-turn="assistant" data-testid="conversation-turn-2"><div data-message-author-role="assistant" data-message-id="request-placeholder-1">Thinking</div></section>');
+  assert.equal(adapter.snapshot().assistantCount, 1);
+  assert.equal(adapter.snapshot().lastAssistantId, 'request-placeholder-1');
+  document.querySelector('section').innerHTML = '<img src="/original.png" alt="Generated portrait"><button aria-label="复制回复">Copy</button>';
+  const state = adapter.snapshot();
+  assert.equal(state.assistantCount, 1);
+  assert.equal(state.lastAssistantId, 'turn:conversation-turn-2');
+  assert.equal(state.finalActions, true);
+  assert.equal(state.images.length, 1);
+  const result = await adapter.read({ operation: 'response', assistantId: state.lastAssistantId });
+  assert.equal(result.assistantId, state.lastAssistantId);
+  assert.equal(result.images[0].sourceUrl, 'https://chatgpt.com/original.png');
+  await assert.rejects(adapter.read({ operation: 'response', assistantId: 'request-placeholder-1' }), /not present/);
+  dom.window.close();
+});
+
+test('mixed text and image-only turns preserve order without counting user or sidebar images', async () => {
+  const { dom, adapter, document } = page('<section data-turn="assistant" data-testid="conversation-turn-2"><img src="/first.png"></section><section data-turn="user" data-testid="conversation-turn-3"><div data-message-author-role="user" data-message-id="u2"><img src="/upload.png"></div></section><section data-turn="assistant" data-testid="conversation-turn-4"><div data-message-author-role="assistant" data-message-id="a2">Text answer</div></section>');
+  document.body.insertAdjacentHTML('beforeend', '<aside><section data-turn="assistant" data-testid="conversation-turn-99"><img src="/unrelated.png"></section></aside>');
+  assert.equal(adapter.snapshot().assistantCount, 2);
+  assert.equal(adapter.snapshot().lastAssistantId, 'a2');
+  assert.equal(adapter.snapshot().images.length, 0);
+  const first = await adapter.read({ operation: 'response', assistantId: 'turn:conversation-turn-2' });
+  assert.equal(first.images.length, 1);
+  dom.window.close();
+});
 test('static Thinking label and prose mentioning Stop do not count as active generation', () => {
   const { dom, adapter } = page('<article><div data-message-author-role="assistant" data-message-id="a"><p>Thinking about a stop button does not mean it exists.</p></div><button aria-label="Copy response">Copy</button></article>');
   const status = adapter.snapshot();
@@ -83,13 +196,28 @@ test('new chat uses the visible control in the same page and confirms an empty c
   dom.window.close();
 });
 
-test('new chat opens the collapsed sidebar to reveal the navigation control', async () => {
+test('new chat temporarily opens the sidebar and restores its collapsed state', async () => {
   const { dom, adapter, document } = page('<div data-message-author-role="user">prior prompt</div>');
-  document.body.insertAdjacentHTML('afterbegin', '<button aria-label="打开侧边栏" id="sidebar-open">Open</button><a href="/" id="new-chat" hidden>新聊天</a>');
+  document.body.insertAdjacentHTML('afterbegin', '<button aria-label="打开侧边栏" id="sidebar-open">Open</button><button aria-label="关闭侧边栏" id="sidebar-close" hidden>Close</button><a href="/" id="new-chat" hidden>新聊天</a>');
   const link = document.querySelector('#new-chat');
-  document.querySelector('#sidebar-open').onclick = () => { link.hidden = false; };
+  const open = document.querySelector('#sidebar-open'), close = document.querySelector('#sidebar-close');
+  open.onclick = () => { link.hidden = false; open.hidden = true; close.hidden = false; };
+  close.onclick = () => { link.hidden = true; open.hidden = false; close.hidden = true; };
   link.onclick = event => { event.preventDefault(); document.querySelector('main').replaceChildren(); dom.window.history.pushState({}, '', '/'); };
-  assert.equal((await adapter.newChat()).confirmed, true); assert.equal(link.hidden, false);
+  const result = await adapter.newChat();
+  assert.equal(result.confirmed, true); assert.equal(result.sidebarRestored, true); assert.equal(link.hidden, true);
+  dom.window.close();
+});
+
+test('new chat preserves a sidebar that was already open', async () => {
+  const { dom, adapter, document } = page('<div data-message-author-role="user">prior prompt</div>');
+  document.body.insertAdjacentHTML('afterbegin', '<button aria-label="关闭侧边栏">Close</button><a href="/" id="new-chat">新聊天</a>');
+  let closes = 0;
+  document.querySelector('[aria-label="关闭侧边栏"]').onclick = () => { closes++; };
+  document.querySelector('#new-chat').onclick = event => {
+    event.preventDefault(); document.querySelector('main').replaceChildren(); dom.window.history.pushState({}, '', '/');
+  };
+  assert.equal((await adapter.newChat()).confirmed, true); assert.equal(closes, 0);
   dom.window.close();
 });
 

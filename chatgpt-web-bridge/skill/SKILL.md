@@ -8,8 +8,8 @@ description: 通过本机 ChatGPT Web Bridge MCP 控制 Chrome 中已登录的 C
 优先调用 `chatgpt_*` MCP 工具。工具未在本任务加载时，可在实际子项目目录调用 `node src/cli.mjs <method> --input <UTF-8参数文件>`；短的无参数查询可以省略 `--input`。若 MCP 配置指定 CHATGPT_BRIDGE_RUNTIME，CLI 也使用相同环境变量。CLI 与 MCP 共用服务、认证和状态，不依赖 Codex 的浏览器连接。先查 health/tabs；没有连接的 profile 时说明扩展连接缺失，不要用重发提示词测试连通性。
 
 - 只按实际返回的 `tabKey` 和 `runId` 操作，不使用“当前 tab”或位置编号。同一 profile 下同一聊天可能开在两个 tab，不能并发向同一聊天发送。
-- `chatgpt_tabs({action:"new"})` 打开新 tab；`chatgpt_new_chat({tabKey})` 在同一个 tab 点击“新聊天”，必须检查 `confirmed:true` 和空白输入框。串行生图第一张用 new，后续先保存验证原图，再在原 tab 内新建聊天。当前会话未加载新工具时可调用同一服务的 CLI `new_chat --input <UTF-8参数文件>`；参数为实际 `tabKey`。旧会话的 URL、runId 和原图路径需在离开前保存。
-- 模型用 `models` 读取的精确标签选择；检查 `select_model.confirmed`，再将当前选择器名称作为 `send.expectedModel`。例如实测模型选项 GPT-5.5 对应选择器 `5.5\n即时`，两种标签不要混用。模型名称只证明网页选择，不能断言具体响应的实际后端模型。
+- 串行任务优先复用当前任务已有的 tab：确认上个回答已结束、需要的正文和原图已保存且无草稿，再用 `chatgpt_new_chat({tabKey})` 在同一 tab 新建聊天，检查 `confirmed:true` 和空白输入框。没有可复用的本任务 tab 时才用 `chatgpt_tabs({action:"new",count:1})`；不抢占别的任务或关闭用户页面，不设置总 tab 数硬上限。MCP 返回 closed/frozen/discarded，结合连接和 freshness 排除旧记录。旧聊天 URL、runId 和原图路径须在离开前保存。新聊天若临时展开侧栏会尝试恢复折叠，`sidebarRestored:false` 表示未恢复。
+- 模型用 `models` 读取的精确标签选择；检查 `select_model.confirmed`，再将实际 `model.label` 作为 `send.expectedModel`。返回的 `model.name` 是模型名称，`reasoningEffort` 是推理强度（如“中”“高”），不能把强度或“即时”当模型名。名称只有在选择器明确显示或模型菜单勾选得到验证时才确定；`models.current.nameSource:checked_model_menu` 是这次菜单观测，status 的 `nameIsCached:true` / `nameObservedAt` 明示此前缓存，不能当作刚验证的选择。名称未知返回 null；需确认名称时在页面可操作且未限流时调用 models，日常状态不重复打开菜单。名称只证明网页选择，actualBackendModel 仍为 null。
 - 每个逻辑提交创建一次 `requestId` 并记录。超时重查或重试同一个 requestId；`submission_unknown` 不能换 ID 重发。不要覆盖未完成草稿。
 - 用户明确要求并行时，多 tab 生图可一次建立 3 个新聊天，等其空闲且状态新鲜后分别提交。不要等待第一张生成完成才提交下一张。每个任务单独保存提示词、模型、tabKey、runId、聊天链接。
 - 用一次 `status` 查询全部任务；仅需新观测时用 `refresh:true`。连接状态、回答状态和缓存时间分别理解，`unknown` 不代表失败或完成。`completed` 只表示网页回答已结束，包含普通文字、拒绝回复及图片尚未加载的回答，不代表已满足用户要求。`kind` 仅记录任务意图，默认 text。长等待用 `wait` 的有界请求，已结束的任务会立即返回。

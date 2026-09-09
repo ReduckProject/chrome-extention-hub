@@ -23,8 +23,6 @@ export class BridgeService {
     this.pending = new Map();
     this.locks = new Map();
     this.operationContext = new AsyncLocalStorage();
-    this.observerDocuments = new Set();
-    this.observerRefreshTimers = new Map();
     this.runProbes = new Map();
     this.wss = new WebSocketServer({ noServer: true, maxPayload: 2 * 1024 * 1024 });
     this.server = http.createServer((req, res) => this.http(req, res));
@@ -53,7 +51,6 @@ export class BridgeService {
   async close() {
     this.stopping = true;
     clearInterval(this.tick);
-    for (const timer of this.observerRefreshTimers.values()) clearTimeout(timer);
     for (const socket of this.wss.clients) socket.terminate();
     for (const pending of this.pending.values()) { clearTimeout(pending.timer); pending.reject(new Error('Service closing')); }
     this.pending.clear();
@@ -112,14 +109,8 @@ export class BridgeService {
         if (message.type === 'snapshot') {
           this.store.snapshot(profileId, message.snapshot);
           this.store.save().catch(error => this.logError(error));
-          const documentKey = `${profileId}:${message.snapshot.tabId}:${message.snapshot.documentId}`;
-          if (!this.observerDocuments.has(documentKey)) {
-            this.observerDocuments.add(documentKey);
-            if (!this.observerRefreshTimers.has(profileId)) this.observerRefreshTimers.set(profileId, setTimeout(() => {
-              this.observerRefreshTimers.delete(profileId);
-              if (this.clients.get(profileId)?.readyState === 1) this.clients.get(profileId).send(JSON.stringify({ type: 'welcome', protocol: 1 }));
-            }, 150));
-          }
+          // A newly observed document must not reinject observers into every
+          // other tab. Connection setup and explicit refresh_observers own that.
         } else if (message.type === 'invalidate' || message.type === 'inventory') {
           for (const tab of Object.values(this.store.data.tabs)) {
             if (tab.profileId !== profileId) continue;
