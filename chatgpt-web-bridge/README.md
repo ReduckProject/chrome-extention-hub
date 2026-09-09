@@ -72,7 +72,7 @@ MCP 返回 structuredContent JSON，并附带相同内容的文本。状态字�
 }
 ```
 
-`model.label` 保留选择器原文，`model.name` 返回有证据的模型名称，`reasoningEffort` 返回选择器显示的推理强度（如“中”“高”）。仅有强度不能推定模型名称：首次用 `models` 读取勾选项，或以 `select_model` 的已验证结果确认名称。随后 status 仅读缓存，不反复开菜单；`nameIsCached:true`、`nameSource:last_observed_model_menu` 和 `nameObservedAt` 标明名称来自此前观察，不能当作刚刚验证的选择。选择器标签或会话路径变化后清除该缓存；名称未知时返回 null。`obscured_model_picker` / `selectorVisible:false` 表示控件被弹窗遮住，只读取 DOM 值，不穿过弹窗点击。`send.expectedModel` 仍使用精确的 `model.label`，而不是 `model.name`。
+`model.label` 保留选择器原文，`model.name` 返回模型选项名称，`reasoningEffort` 返回推理强度。新版 composer 的滚动“最新”选项只显示“中／高／即时”等标签，v42 按这项已实测布局返回 `name:最新`（英文为 Latest）、`nameSource:latest_selector`，不会猜测具体模型版本。菜单里的“最新”同样是可选择并验证的有效名称。带版本前缀的旧模型返回对应型号。`models` 的 checked_model_menu 来源表示这次已勾选项，status 的 nameIsCached/nameObservedAt 标明此前缓存；切换选择器标签或会话路径清除缓存。无法识别时仍返回 null。弹窗下可读控件标记 obscured_model_picker/selectorVisible:false，不能穿过弹窗点击。send.expectedModel 使用精确 label；actualBackendModel 仍为 null。
 
 `generating` / `thinking` 表示页面活动。`run.phase:completed` 和 `completionReason:response_finished` 只表示本次网页回答已经结束：已关联本次用户消息及新回答，页面空闲，取得回答结束证据并稳定 2.5 秒。adapter v33 被动记录网页自身的响应流 Resource Timing；本次提交之后成功结束的响应流可作为证据，不要求复制／下载按钮出现，也不要求图片加载。`completionEvidence.source:response_stream_end` 附带流开始／结束时间；缺少可用时序时仍可使用 `response_actions` 控件证据，不仅凭长时间空闲推定完成。旧请求、不同文档／用户消息、仍在生成及未知／过期观察不能据此完成。纯文字、拒绝说明、无图回复及图片尚未加载的回复都可完成，`kind` 不参与完成判断。新请求默认 `kind:text`；已有 requestId 的默认类型保持原值，确保升级后仍可幂等重查。
 
@@ -165,12 +165,14 @@ setup 生成 runtime/extension、固定扩展 ID、本机认证配置，不代�
 
 已有实例的源码可以独立纳入本仓库，当前安装不会自动迁移。迁移运行实例时需保留其 runtime 配置和状态；环境变量 CHATGPT_BRIDGE_RUNTIME 可指定现有 runtime 目录。Chrome 扩展仍从加载时的目录运行，重新加载前应保留该目录。每个实例的认证配置需与其本地服务一致。
 
-页面适配层更新后，npm run setup 和 node src/cli.mjs refresh_observers 可更新当前文档的观察器。content.js 新增命令通常需要重新加载对应页面；修改 manifest 或 background 时需要在 Chrome 中重新加载扩展。当前 adapter 版本 41 兼容现有 content.js 的固定 read 消息格式。全 tab 观察器安装仅发生在扩展连接建立或显式 refresh_observers 时；新文档的普通状态上报不再触发所有 tab 重新注入。服务端改动须重启本机 daemon。
+扩展 0.1.1 的 manifest 只注册 content.js 启动脚本，contentVersion:4 在首次上报前，请求后台用 scripting API 为当前 tab 加载 adapter.js（当前 v42）。Chrome 会缓存 manifest 静态脚本，覆盖磁盘文件并热更新现有页面不会更新这份缓存；从旧版首次升级到 0.1.1 需要在 Chrome 重新加载扩展。后续 adapter 修改可运行 npm run setup 与 CLI refresh_observers，新的页面也会动态加载当前版本。固定加载消息只接受本扩展在 ChatGPT 顶层页面的请求，忽略调用方提供的 tabId/脚本，只加载自带 adapter.js，不重装其他 tab。content/manifest/background 变更仍需要相应页面或扩展重新加载。
 
 ## 验证范围与限制
 
+- 2026-09-10 adapter v42 / 扩展 0.1.1：真实模型菜单包含“最新”、GPT-5.6 Sol 和 GPT-5.5。修复“最新”名称被过滤的问题，并在独立空白页验证“最新 → GPT-5.5 → GPT-5.6 Sol → 最新”，每次切换均 confirmed:true，分别读回模型名称、推理强度“高”和名称来源。完整测试 86 项通过，覆盖首次上报等待新 adapter、重复启动去重、失败重试及加载消息的 tab／来源限制。
+- 本次新建诊断 tab 首次实际加载 adapter v15，而已有页面已热更新到 v41；旧启动脚本会再次返回无法识别模型。新启动方式只为请求的 tab 动态加载 adapter，contentVersion:4 便于区分启动脚本。安装目录已生成 0.1.1；从旧版升级须重新加载扩展，首次加载验证须在显式 refresh_observers 之前进行。现有页热更新后的模型实测不能代替这项新文档验证。
 - 2026-09-10 adapter v41：从实际 DOM 确认部分模型入口改为显示“中／高”的 composer pill，增加识别并分别返回模型名称与推理强度。模型菜单名称的缓存明确标注来源；新聊天临时展开的侧栏会恢复折叠，保留用户原先展开的侧栏。移除新文档观察引发的全 tab 重装，并在 MCP 中暴露 closed/frozen/discarded，便于区分旧记录与当前页面。
-- 当前完整测试 83 项通过；模型识别追加修改后重跑 32 项 adapter 测试通过。真实 MCP 读取验证 12 个工具、adapterVersion:41、推理强度字段及暂停保留。部署保留 54 个任务和现有文档；未解除访问暂停或用新的生成任务测试。实际模型名称仍待允许操作后首次读取模型菜单确认，不以 DOM 模拟测试冒充网页切换验收。
+- v41 当时完整测试 83 项通过；模型识别追加修改后重跑 32 项 adapter 测试通过。真实 MCP 读取验证 12 个工具、adapterVersion:41、推理强度字段及暂停保留。部署保留 54 个任务和现有文档；未解除访问暂停或用新的生成任务测试。当时实际模型名称尚未读取菜单确认，后续切换验证见 v42 记录。
 - 本次限流窗口中，一次发送后约六个 tab 在约 26 毫秒内同时请求会话列表，随后部分返回 429；用户也报告手动操作触发相同提示。这支持多 tab 同步请求放大的判断，但现有 Resource Timing 不含调用栈，不能据此确定网页内部触发链。串行任务优先复用同一 tab，不设置总数硬上限、不自动关闭用户页面；不以持续新建 tab 验证限制是否恢复。
 - 2026-09-10 adapter v35：兼容没有内部 `data-message-author-role` 的纯图片 `section[data-turn="assistant"]`，使用会话内的 turn 标识关联回答；临时占位消失但未找到回答时标记 `finalizing` / `response_not_found`，不继续声称生成中。`wait` 仅在目标任务的有效状态变化时唤醒，无关 tab 和重复观测不再触发立即返回。新增占位替换、图片回答读取、跨用户消息保护、等待隔离与超时清理测试，当时 77 项测试通过。
 - v35 部署后实测：此前卡住的同一任务无需重发即识别为 completed，并经 Chrome 下载校验 941×1672 原图；后续任务无有效变化时，25 秒 wait 实测约 25029 ms 返回。该结果验证本次图片回答识别与等待修复，不代表模型选择器等其他网页适配已修复。

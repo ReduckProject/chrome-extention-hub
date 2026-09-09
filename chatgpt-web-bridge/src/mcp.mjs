@@ -36,7 +36,7 @@ function compact(method, result) {
     tabKey: tab.key, tabId: tab.tabId, profileId: tab.profileId, browserSessionId: tab.browserSessionId,
     title: tab.title, url: tab.url, conversationId: tab.conversationId, model: tab.model,
     activity: tab.activity, connection: tab.connection, freshness: tab.freshness, attention: tab.attention,
-    attentionType: tab.attentionType, accessPause: tab.accessPause, adapterVersion: tab.adapterVersion,
+    attentionType: tab.attentionType, accessPause: tab.accessPause, adapterVersion: tab.adapterVersion, contentVersion: tab.contentVersion,
     closed: !!tab.closed, frozen: !!tab.frozen, discarded: !!tab.discarded,
     surface: tab.surface, composerReady: tab.composerReady, draftLength: tab.draftLength, observationError: tab.observationError,
   }));

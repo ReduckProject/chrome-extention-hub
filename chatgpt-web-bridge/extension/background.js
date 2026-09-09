@@ -179,6 +179,14 @@ async function restoreDownloads() {
 }
 chrome.runtime.onMessage.addListener((message, sender, respond) => {
   if (sender.id !== chrome.runtime.id) return false;
+  if (message.type === 'load_adapter' && sender.tab && sender.frameId === 0 && allowed(sender.url || sender.tab.url)) {
+    // The requesting content script can load only our fixed adapter file into
+    // its own top-level ChatGPT document, never caller-supplied code or tab IDs.
+    page(sender.tab.id).then(() => chrome.scripting.executeScript({
+      target: { tabId: sender.tab.id, frameIds: [0] }, files: ['adapter.js'],
+    })).then(() => respond({ ok: true }), error => respond({ ok: false, error: error.message }));
+    return true;
+  }
   if (message.type === 'snapshot' && sender.tab && allowed(sender.tab.url)) {
     relay(sender.tab, message.snapshot).then(() => respond({ ok: true }), () => respond({ ok: false })); return true;
   }

@@ -9,7 +9,7 @@ description: 通过本机 ChatGPT Web Bridge MCP 控制 Chrome 中已登录的 C
 
 - 只按实际返回的 `tabKey` 和 `runId` 操作，不使用“当前 tab”或位置编号。同一 profile 下同一聊天可能开在两个 tab，不能并发向同一聊天发送。
 - 串行任务优先复用当前任务已有的 tab：确认上个回答已结束、需要的正文和原图已保存且无草稿，再用 `chatgpt_new_chat({tabKey})` 在同一 tab 新建聊天，检查 `confirmed:true` 和空白输入框。没有可复用的本任务 tab 时才用 `chatgpt_tabs({action:"new",count:1})`；不抢占别的任务或关闭用户页面，不设置总 tab 数硬上限。MCP 返回 closed/frozen/discarded，结合连接和 freshness 排除旧记录。旧聊天 URL、runId 和原图路径须在离开前保存。新聊天若临时展开侧栏会尝试恢复折叠，`sidebarRestored:false` 表示未恢复。
-- 模型用 `models` 读取的精确标签选择；检查 `select_model.confirmed`，再将实际 `model.label` 作为 `send.expectedModel`。返回的 `model.name` 是模型名称，`reasoningEffort` 是推理强度（如“中”“高”），不能把强度或“即时”当模型名。名称只有在选择器明确显示或模型菜单勾选得到验证时才确定；`models.current.nameSource:checked_model_menu` 是这次菜单观测，status 的 `nameIsCached:true` / `nameObservedAt` 明示此前缓存，不能当作刚验证的选择。名称未知返回 null；需确认名称时在页面可操作且未限流时调用 models，日常状态不重复打开菜单。名称只证明网页选择，actualBackendModel 仍为 null。
+- 模型用 models 读取的精确标签选择，检查 select_model.confirmed；send.expectedModel 仍用实际 model.label。model.name 返回模型选项名称，reasoningEffort 返回推理强度。新版 composer 只显示“高／中／即时”等模式或强度时，表示滚动的“最新”选项：返回 name:最新（英文为 Latest）、nameSource:latest_selector，不推测具体版本号。带版本前缀时返回对应模型；models.current.nameSource:checked_model_menu 表示本次验证的勾选项。nameIsCached:true/nameObservedAt 明示此前缓存，不能当作刚验证的选择；日常 status 不重复开菜单。确实缺少识别依据时 name:null，actualBackendModel 始终为 null。
 - 每个逻辑提交创建一次 `requestId` 并记录。超时重查或重试同一个 requestId；`submission_unknown` 不能换 ID 重发。不要覆盖未完成草稿。
 - 用户明确要求并行时，多 tab 生图可一次建立 3 个新聊天，等其空闲且状态新鲜后分别提交。不要等待第一张生成完成才提交下一张。每个任务单独保存提示词、模型、tabKey、runId、聊天链接。
 - 用一次 `status` 查询全部任务；仅需新观测时用 `refresh:true`。连接状态、回答状态和缓存时间分别理解，`unknown` 不代表失败或完成。`completed` 只表示网页回答已结束，包含普通文字、拒绝回复及图片尚未加载的回答，不代表已满足用户要求。`kind` 仅记录任务意图，默认 text。长等待用 `wait` 的有界请求，已结束的任务会立即返回。
@@ -29,3 +29,5 @@ description: 通过本机 ChatGPT Web Bridge MCP 控制 Chrome 中已登录的 C
 扩展安装目录是项目下 `runtime\extension`，由 `npm run setup` 生成。该目录包含本机密钥，不作为公共源码分享。扩展仅使用 ChatGPT 主机权限，不需要远程调试设置。遇到浏览器策略明确拒绝时，不要切换通道绕过；记录阻碍及尚未验证的环节。
 
 先检查本机 MCP 和扩展连接状态，已有安装时不要重复安装。日常状态查询无需读取完整 DOM 或截图；首选一次 status 查全部 tab，观察变化用 wait。模型菜单和页面控件无法识别时再检查 adapter，不用重复提交来诊断连接。页面适配更新用 npm run setup 后调用 CLI refresh_observers；content.js 新增命令需要重新加载对应页面，manifest/background 修改则需在 Chrome 重新加载扩展。
+
+扩展 0.1.1 / contentVersion:4 在每个新文档第一次上报前，通过后台仅为该 tab 加载当前 adapter。v42 支持“最新”名称；首次从旧扩展升级须在 Chrome 重新加载扩展，setup 加 refresh_observers 只热更新现有文档，不能更新 Chrome 缓存的启动脚本。后续只改 adapter 时，动态加载避免新 tab 回退到旧版本。诊断新页时先记录首次 adapterVersion/contentVersion，再决定是否显式热更新，不掩盖新页首次版本问题。

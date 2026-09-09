@@ -80,3 +80,13 @@
 - 合并保留另一会话未提交的 v35 图片 section 识别、占位替换和目标任务 wait 隔离修复。完整测试 83 项通过，最后的强度组合标签修改重跑 32 项 adapter 测试通过；三份 Skill 通过验证。
 - 备份状态后仅重启本项目 daemon，保留 54 个任务和访问暂停；四个现有 tab 热更新至 v41，安装文件与源码一致。真实 stdio MCP 返回 12 个工具，并读回新字段。当前页面只显示强度，模型名称仍为 null，实际菜单读取／切换尚未在访问恢复后验收。
 - 现场日志、部署前后快照和 MCP 验证位于被忽略的 artifacts/recurrence-2026-09-09T18-27-39-023Z。
+
+## “最新”模型识别与新页面启动版本修复 — 2026-09-10
+
+- 用户反馈滚动“最新”只显示推理强度，而固定 5.5／5.6 显示型号前缀。实机模型菜单确认三个有效选项为“最新”、GPT-5.6 Sol、GPT-5.5；此前名称提取只接受具体型号，错误过滤了“最新”。
+- adapter v42 接受“最新”／Latest 作为模型选项名称。已确认的 composer pill 布局仅显示强度或模式时返回 name:最新／Latest、nameSource:latest_selector；不推测其具体后端型号。name、reasoningEffort、nameSource、nameIsCached 和 nameObservedAt 分别保留，菜单读取及切换可以验证“最新”。
+- 只新建一个空白诊断 tab，首次记录到 adapterVersion:15、模型未识别；此时已有页面为热更新的 v41。说明 Chrome 缓存的 manifest 静态启动脚本仍在新文档加载旧 adapter，显式热更新现有页面不能覆盖新页首次启动问题。
+- 扩展版本升至 0.1.1，manifest 只注册 content.js；contentVersion:4 首次上报前请求后台给当前 tab 加载固定 adapter.js。加载消息校验本扩展、ChatGPT 顶层页面并锁定发送者 tab，不接受自定义脚本或目标，不触发其他 tab 重装。加载失败不发布旧快照，允许显式重试；重复启动不新增观察器。MCP 同时返回 contentVersion。
+- 完整测试 86 项通过；源码及用户级 bridge Skill、用户级 gen-image Skill 通过验证。npm run setup 已更新原安装目录；现有诊断页热更新到 v42 后，真实执行“最新 → GPT-5.5 → GPT-5.6 Sol → 最新”，全部 confirmed:true，模型及推理强度均读回成功，没有发送提示词或生成图片。
+- 新启动脚本首次启用需要重新加载 Chrome 扩展。自动化访问扩展管理页被浏览器 URL 安全策略拒绝，已请用户手动重载；后续须在不先热更新的条件下记录新文档首次 adapterVersion:42 / contentVersion:4。重载前不宣称新文档启动已通过实机验证。
+- 现场证据保留在被忽略的 artifacts/latest-model-2026-09-09T19-10-32-913Z。

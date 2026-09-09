@@ -1,13 +1,23 @@
-(() => {
+(async () => {
   if (globalThis.chatGPTBridgeContentInstalled) return;
   globalThis.chatGPTBridgeContentInstalled = true;
-  globalThis.chatGPTBridgeContentVersion = 3;
+  // Chrome can retain the manifest's old content-script source after an unpacked
+  // extension's files are updated. Load the current adapter in this document
+  // before reporting any state; never reinject other tabs to repair this one.
+  try {
+    const loaded = await chrome.runtime.sendMessage({ type: 'load_adapter' });
+    if (!loaded?.ok || !globalThis.ChatGPTBridgeAdapter?.snapshot) throw new Error('Current adapter is unavailable');
+  } catch {
+    globalThis.chatGPTBridgeContentInstalled = false;
+    return;
+  }
+  globalThis.chatGPTBridgeContentVersion = 4;
   const documentId = crypto.randomUUID();
   const adapter = globalThis.ChatGPTBridgeAdapter;
   let timer, lastSignature;
   function emit(force = false) {
     try {
-      const state = { ...adapter.snapshot(), documentId };
+      const state = { ...adapter.snapshot(), documentId, contentVersion: 4 };
       const signature = JSON.stringify(state);
       if (force || signature !== lastSignature) {
         lastSignature = signature;
@@ -29,7 +39,7 @@
       if (message.documentId && message.documentId !== documentId) throw new Error('Page document changed; refresh status before acting');
       let result;
       switch (message.command) {
-        case 'probe': result = { ...adapter.snapshot(), documentId }; break;
+        case 'probe': result = { ...adapter.snapshot(), documentId, contentVersion: 4 }; break;
         case 'models': result = await adapter.models(); break;
         case 'new_chat': result = await adapter.newChat(); break;
         case 'select_model': result = await adapter.selectModel(message.label); break;

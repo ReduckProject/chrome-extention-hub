@@ -1,5 +1,5 @@
 (() => {
-  const adapterVersion = 41;
+  const adapterVersion = 42;
   if (globalThis.ChatGPTBridgeAdapter?.version === adapterVersion) return;
   globalThis.ChatGPTBridgeAdapter?.dispose?.();
   const doc = document;
@@ -56,7 +56,7 @@
   const send = () => all('[data-testid="send-button"]').find(n => !n.disabled) ||
     buttons(controls()).find(n => /^(send( prompt| message)?|发送(消息|提示)?)$/i.test(label(n)) && !n.disabled);
   const effortLabels = /^(低|中|高|极高|轻度|标准|扩展|重度|Low|Medium|High|Extra high|Light|Standard|Extended|Heavy)$/i;
-  const modelLabel = /^(Instant|Thinking|Pro|Auto|即时|思考|专业|自动)$|^(?:GPT-)?\d+\.\d+\b|^o[1-9]\b/i;
+  const modelLabel = /^(Latest|最新|Instant|Thinking|Pro|Auto|即时|思考|专业|自动)$|^(?:GPT-)?\d+\.\d+\b|^o[1-9]\b/i;
   function modelPickers() {
     return [...doc.querySelectorAll('button,[role="button"]')].filter(n => {
       if (n.closest('article,[data-turn],[data-message-author-role],aside,nav')) return false;
@@ -68,7 +68,8 @@
     });
   }
   const picker = () => modelPickers().find(visible);
-  const modelName = value => value?.match(/\b(?:GPT-\d+(?:\.\d+)?(?:\s+(?:Pro|Sol|Terra|Luna|Astra))?|o[1-9](?:-mini)?)(?![\w-])/i)?.[0] ||
+  const modelName = value => (/^(最新|Latest)$/i.test(normalize(value)) ? normalize(value) : null) ||
+    value?.match(/\b(?:GPT-\d+(?:\.\d+)?(?:\s+(?:Pro|Sol|Terra|Luna|Astra))?|o[1-9](?:-mini)?)(?![\w-])/i)?.[0] ||
     (value?.match(/^(\d+\.\d+)(?=\s|$)/)?.[1] ? `GPT-${value.match(/^(\d+\.\d+)/)[1]}` : null);
   function reasoningEffort(value) {
     const effort = normalize(value).replace(/^(?:(?:GPT-)?\d+\.\d+(?:[ \t]+(?:Pro|Sol|Terra|Luna|Astra))?|o[1-9](?:-mini)?)\s+/i, '');
@@ -94,11 +95,18 @@
     const value = button ? text(button) || label(button) : text(header) || null;
     const description = button?.getAttribute('aria-describedby')?.split(/\s+/).map(id => text(doc.getElementById(id))).join(' ') || '';
     const named = modelName(value) || modelName(description);
+    // In the observed composer layout, pinned versions have a version prefix;
+    // the rolling Latest selection displays only its mode/effort. Report the UI
+    // selection "Latest", never infer a numbered backend model from that layout.
+    const latest = !named && button?.classList.contains('__composer-pill') &&
+      button.closest('form,[data-testid="composer"]') &&
+      (effortLabels.test(value || '') || /^(Instant|Thinking|Pro|Auto|即时|思考|专业|自动)$/i.test(value || ''))
+      ? (/[\u3400-\u9fff]/.test(value) ? '最新' : 'Latest') : null;
     if (lastModelSelection && (lastModelSelection.pathname !== location.pathname ||
         (value && lastModelSelection.selectorLabel !== value))) lastModelSelection = null;
-    return { label: value, name: named || lastModelSelection?.name || null, reasoningEffort: reasoningEffort(value),
+    return { label: value, name: named || lastModelSelection?.name || latest, reasoningEffort: reasoningEffort(value),
       source: button ? source : header ? 'visible_model_menu_header' : 'unavailable',
-      nameSource: named ? 'model_control' : lastModelSelection ? 'last_observed_model_menu' : 'unavailable',
+      nameSource: named ? 'model_control' : lastModelSelection ? 'last_observed_model_menu' : latest ? 'latest_selector' : 'unavailable',
       nameIsCached: !named && !!lastModelSelection, nameObservedAt: !named ? lastModelSelection?.observedAt || null : null,
       selectorVisible: !!button && visible(button),
       actualBackendModel: null };

@@ -12,16 +12,21 @@ function page(extra = '', setup = () => {}) {
   return { dom, document: dom.window.document, adapter: dom.window.ChatGPTBridgeAdapter };
 }
 
-test('composer effort selectors expose effort without inventing a model or matching unrelated controls', () => {
+test('unversioned composer selectors identify Latest without inventing a backend version', () => {
   const { dom, adapter, document } = page();
   document.querySelector('header button').remove();
   document.body.insertAdjacentHTML('beforeend', '<aside><button aria-haspopup="menu">GPT-9.0</button></aside><button aria-haspopup="menu">高</button>');
   document.querySelector('form').insertAdjacentHTML('beforeend', '<button aria-haspopup="menu" class="__composer-pill" id="effort">高</button>');
   const model = adapter.snapshot().model;
-  assert.equal(model.label, '高'); assert.equal(model.reasoningEffort, '高'); assert.equal(model.name, null);
+  assert.equal(model.label, '高'); assert.equal(model.reasoningEffort, '高'); assert.equal(model.name, '最新');
+  assert.equal(model.nameSource, 'latest_selector'); assert.equal(model.actualBackendModel, null);
   assert.equal(model.selectorVisible, true); assert.equal(adapter.snapshot().activity, 'idle');
   document.querySelector('#effort').textContent = '中';
   assert.equal(adapter.snapshot().model.reasoningEffort, '中');
+  document.querySelector('#effort').textContent = 'High';
+  assert.equal(adapter.snapshot().model.name, 'Latest');
+  document.querySelector('#effort').textContent = '即时';
+  assert.equal(adapter.snapshot().model.name, '最新');
   document.querySelector('#effort').textContent = '5.5\n高';
   assert.equal(adapter.snapshot().model.name, 'GPT-5.5');
   assert.equal(adapter.snapshot().model.reasoningEffort, '高');
@@ -54,7 +59,7 @@ test('model menus can be opened from an effort pill, read by checked name and se
     document.querySelector('header button').remove();
     document.querySelector('form').insertAdjacentHTML('beforeend', '<button type="button" aria-haspopup="menu" aria-expanded="false" class="__composer-pill" id="model">高</button>');
     const button = document.querySelector('#model');
-    let selected = 'GPT-5.6 Sol', opens = 0;
+    let selected = '最新', opens = 0;
     const close = () => { document.querySelectorAll('[role="menu"]').forEach(n => n.remove()); button.setAttribute('aria-expanded', 'false'); };
     button.addEventListener('pointerdown', () => {
       if (button.getAttribute('aria-expanded') === 'true') { close(); return; }
@@ -62,29 +67,33 @@ test('model menus can be opened from an effort pill, read by checked name and se
       document.body.insertAdjacentHTML('beforeend', '<div role="menu"><button role="menuitem" id="choose">选择模型</button></div>');
       document.querySelector('#choose').onclick = () => {
         const menu = document.querySelector('[role="menu"]'); menu.replaceChildren();
-        for (const name of ['GPT-5.5', 'GPT-5.6 Sol']) {
+        for (const name of ['最新', 'GPT-5.5', 'GPT-5.6 Sol']) {
           const option = document.createElement('button'); option.textContent = name;
           option.setAttribute('role', 'menuitemradio'); option.setAttribute('aria-checked', String(name === selected));
-          option.onclick = () => { selected = name; close(); };
+          option.onclick = () => { selected = name; button.textContent = name === '最新' ? '高' : name === 'GPT-5.5' ? '5.5\n高' : '5.6\n高'; close(); };
           menu.append(option);
         }
       };
     });
     const listed = await adapter.models();
-    assert.equal(listed.current.name, 'GPT-5.6 Sol'); assert.equal(listed.current.reasoningEffort, '高');
+    assert.equal(listed.current.name, '最新'); assert.equal(listed.current.reasoningEffort, '高');
     assert.equal(listed.current.nameSource, 'checked_model_menu');
-    assert.equal(listed.options.filter(n => n.selected)[0].label, 'GPT-5.6 Sol');
+    assert.equal(listed.options.filter(n => n.selected)[0].label, '最新');
     assert.equal(button.getAttribute('aria-expanded'), 'false');
-    assert.equal(adapter.snapshot().model.name, 'GPT-5.6 Sol');
+    assert.equal(adapter.snapshot().model.name, '最新');
     assert.equal(adapter.snapshot().model.nameIsCached, true);
     const changed = await adapter.selectModel('GPT-5.5');
     assert.equal(changed.confirmed, true); assert.equal(changed.model.name, 'GPT-5.5');
     assert.equal(changed.model.reasoningEffort, '高'); assert.equal(changed.model.nameIsCached, false);
+    const latest = await adapter.selectModel('最新');
+    assert.equal(latest.confirmed, true); assert.equal(latest.model.name, '最新');
+    assert.equal(latest.model.label, '高'); assert.equal(latest.model.reasoningEffort, '高');
     const beforeReads = opens;
     adapter.snapshot(); adapter.snapshot();
     assert.equal(opens, beforeReads, 'Passive status must never open the menu');
     dom.window.history.pushState({}, '', '/c/other');
-    assert.equal(adapter.snapshot().model.name, null, 'A previous conversation model must not leak into the next chat');
+    assert.equal(adapter.snapshot().model.name, '最新');
+    assert.equal(adapter.snapshot().model.nameSource, 'latest_selector', 'The previous conversation menu cache must not leak');
   } finally { dom.window.close(); }
 });
 

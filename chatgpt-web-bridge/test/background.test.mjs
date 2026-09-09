@@ -5,7 +5,7 @@ import vm from 'node:vm';
 import { randomUUID } from 'node:crypto';
 const source = await fs.readFile(new URL('../extension/background.js', import.meta.url), 'utf8');
 function fixture() {
-  const storage = { local: {}, session: {} }, clicks = [], created = [], sockets = [], timers = [];
+  const storage = { local: {}, session: {} }, clicks = [], created = [], sockets = [], timers = [], scripts = [];
   const event = () => ({ listeners: [], addListener(callback) { this.listeners.push(callback); } });
   const area = name => ({
     get: async key => key === null ? { ...storage[name] } : { [key]: storage[name][key] },
@@ -25,7 +25,7 @@ function fixture() {
     clearTimeout() {}, setInterval() { return 1; }, clearInterval() {},
     chrome: {
       storage: { local: area('local'), session: area('session') },
-      scripting: { executeScript: async () => {} },
+      scripting: { executeScript: async value => { scripts.push(value); } },
       tabs: {
         get: async id => ({ id, url: id === 999 ? 'https://example.org/' : `https://chatgpt.com/c/${id}` }),
         query: async () => [], create: async options => { const tab = { id: created.length + 1, url: options.url }; created.push(tab); return tab; },
@@ -40,8 +40,22 @@ function fixture() {
     },
   });
   vm.runInContext(source, context);
-  return { context, clicks, created, sockets, timers, storage, exec: code => vm.runInContext(code, context) };
+  return { context, clicks, created, sockets, timers, storage, scripts, exec: code => vm.runInContext(code, context) };
 }
+
+test('content bootstrap loads only the fixed adapter into its own ChatGPT tab', async () => {
+  const { context, scripts } = fixture();
+  const listener = context.chrome.runtime.onMessage.listeners[0];
+  const sender = { id: 'fixture-extension', frameId: 0, url: 'https://chatgpt.com/', tab: { id: 7, url: 'https://chatgpt.com/' } };
+  const reply = await new Promise(resolve => assert.equal(listener({ type: 'load_adapter', tabId: 8, files: ['untrusted.js'] }, sender, resolve), true));
+  assert.equal(reply.ok, true);
+  assert.deepEqual(JSON.parse(JSON.stringify(scripts)), [{ target: { tabId: 7, frameIds: [0] }, files: ['adapter.js'] }]);
+  for (const invalid of [{ ...sender, id: 'another-extension' }, { ...sender, frameId: 1 },
+    { ...sender, url: 'https://unrelated.example/' }, { id: 'fixture-extension' }]) {
+    assert.equal(listener({ type: 'load_adapter' }, invalid, () => assert.fail('Unexpected response')), false);
+  }
+  assert.equal(scripts.length, 1);
+});
 test('concurrent identity requests yield one stable profile and one session', async () => {
   const { exec } = fixture();
   const identities = await exec('Promise.all(Array.from({length: 20}, () => getIdentity()))');
