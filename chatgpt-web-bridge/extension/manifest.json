@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "ChatGPT Web Bridge (local)",
+  "version": "0.1.0",
+  "description": "Explicit-tab ChatGPT status and actions through an authenticated local MCP bridge.",
+  "minimum_chrome_version": "120",
+  "permissions": ["storage", "scripting", "downloads", "alarms"],
+  "host_permissions": ["https://chatgpt.com/*"],
+  "background": { "service_worker": "background.js" },
+  "action": { "default_popup": "popup.html", "default_title": "ChatGPT Web Bridge" },
+  "content_scripts": [{
+    "matches": ["https://chatgpt.com/*"],
+    "js": ["adapter.js", "content.js"],
+    "run_at": "document_idle"
+  }],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; connect-src ws://127.0.0.1:*"
+  }
+}

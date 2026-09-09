@@ -1,0 +1,7 @@
+:root { color-scheme: light dark; font: 13px system-ui, sans-serif; }
+body { width: 360px; padding: 14px; margin: 0; }
+h1 { font-size: 17px; margin: 0 0 12px; }
+.tab { border: 1px solid #8886; border-radius: 8px; padding: 10px; margin: 8px 0; }
+.name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.details, .note { margin-top: 5px; color: #888; font-size: 12px; }
+.connected { color: #1aaf76; }

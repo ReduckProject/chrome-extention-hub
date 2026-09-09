@@ -1,0 +1,23 @@
+{
+  "name": "chatgpt-web-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local bridge for explicit-tab ChatGPT web control and status",
+  "engines": { "node": ">=24.0.0" },
+  "scripts": {
+    "setup": "node src/setup.mjs",
+    "start": "node src/daemon.mjs",
+    "mcp": "node src/mcp.mjs",
+    "status": "node src/cli.mjs status",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "chrome-devtools-mcp": "1.9.0",
+    "ws": "8.21.3"
+  },
+  "devDependencies": {
+    "jsdom": "29.0.2"
+  }
+}
