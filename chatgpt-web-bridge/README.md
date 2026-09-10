@@ -111,7 +111,7 @@ MCP 返回 structuredContent JSON，并附带相同内容的文本。状态字�
 
 同一 profile 两次发送至少相隔 10 秒，不等待其它 tab 的回答结束。某 tab 回答完成后，该页再留 10 秒才能新聊天、操作模型或再次发送；其它 tab 的新聊天和模型操作可继续。两个截止时间取较晚者，不叠加为 20 秒。PROFILE_COOLDOWN 返回 retryAfterMs，未下发页面命令或创建下一条 run；原 requestId 重查仍幂等。scheduling.minSubmissionIntervalMs / scheduling.postCompletionCooldownMs 是这两个本地配置项，不表示网站公布的限额。
 
-completed 仅表示回答结束，任务占用仍保留；整批必要结果保存、归档与 tab 清理完成后，以 `task({action:"release",profileId,leaseId,resultsSaved:true})` 释放。占用、队列和发送时间持久化，进程重启不会绕过限制；过期只清理无人继续等待的队列项，不自动抢占 active 任务。新任务不会在后台自动发送，普通 status/result/wait 不需要 leaseId。用户明确取消时可以 abandon 自己的占用，保留网页和未确认 run 的原状态。
+completed 仅表示回答结束，任务占用仍保留；整批必要结果保存、归档完成后，以 `task({action:"release",profileId,leaseId,resultsSaved:true})` 释放。占用、队列和发送时间持久化，进程重启不会绕过限制；过期只清理无人继续等待的队列项，不自动抢占 active 任务。新任务不会在后台自动发送，普通 status/result/wait 不需要 leaseId。用户明确取消时可以 abandon 自己的占用，保留网页和未确认 run 的原状态。
 
 旧 MCP schema 缺少新工具或 leaseId 参数时，在子项目目录用同一服务的 `node src/cli.mjs task --input <UTF-8 JSON 文件>` 及相应动作方法操作，不需重新加载 Chrome 扩展。扩展仍为 0.1.2 / adapter 43 / content 5，服务及 MCP 为 0.2.2（schedulerVersion:2 / accessRecoveryVersion:1）。
 
@@ -129,7 +129,7 @@ Skill 按目标 Chrome profile 内全部当前 ChatGPT tab 计数，跨浏览器
 
 可复用页面须连接和状态新鲜、idle、无草稿及未确认生成、必要结果已保存，且未被其它任务占用。用 `chatgpt_new_chat({tabKey,leaseId})` 在同一 tab 新建聊天，检查 `confirmed:true`，重新确认模型再提交。临时展开的侧栏会恢复折叠；用户原先展开的侧栏保持原状，`sidebarRestored:false` 表示未恢复。
 
-记录每个 tab 的 openedByThisTask 和完整身份；新建聊天不会改变 tab 的来源。整个任务及所需保存／归档完成后，关闭本任务新建的 tab，复用的 tab 保留；多图任务中间仍复用同一页。关闭前核对身份、草稿和活动状态，按实际工具能力关闭并验证；当前 MCP 没有关闭接口，Skill 使用可用的浏览器 tab 关闭能力。工具不可用或关闭失败时汇报遗留页面。服务端也强制执行新建前的四个 tab 阈值与每任务单页占用；关闭仍使用实际可用的浏览器工具，本次没有新增关闭 API。
+记录每个 tab 的 openedByThisTask 和完整身份；新建聊天不会改变 tab 的来源。多图任务中间继续复用同一页。服务端强制执行新建前的四个 tab 阈值与每任务单页占用；整个任务及所需保存／归档完成后，显式 release 释放占用。
 
 不同任务在不同 tab 并行，每项批量任务内部复用一页。connections.scheduling 的 lockScope:tab 和 activeTasks 明示占用范围与页面归属，queue 只记录等待空闲页的任务。整批任务顺序如下：
 
@@ -137,7 +137,7 @@ Skill 按目标 Chrome profile 内全部当前 ChatGPT tab 计数，跨浏览器
 2. 持有 leaseId，在同一 tab 新建聊天、确认模型、以固定 requestId 提交。
 3. 用 status/wait 被动等待回答结束，再用默认 result 检查正文和图片。
 4. 有需要的已加载图片时，持有 leaseId 下载并验证原图；在本地冷却结束后才新建下一聊天。
-5. 整批结果保存和归档完成后关闭本任务新建的 tab，复用的保留；最后显式 release。
+5. 整批结果保存和归档完成后，显式 release 释放占用。
 
 `submission_unknown` 表示网页是否接受尚未确认。先查询或用**相同 ID、相同参数**重试，不能换 ID 重发。重复请求返回 existing:true 和原 runId。已有草稿不会被覆盖。
 
@@ -194,7 +194,7 @@ setup 生成 runtime/extension、固定扩展 ID、本机认证配置，不代�
 - 本次新建诊断 tab 首次实际加载 adapter v15，而已有页面已热更新到 v41；旧启动脚本会再次返回无法识别模型。新启动方式只为请求的 tab 动态加载 adapter，contentVersion:4 便于区分启动脚本。安装目录已生成 0.1.1；从旧版升级须重新加载扩展，首次加载验证须在显式 refresh_observers 之前进行。现有页热更新后的模型实测不能代替这项新文档验证。
 - 2026-09-10 adapter v41：从实际 DOM 确认部分模型入口改为显示“中／高”的 composer pill，增加识别并分别返回模型名称与推理强度。模型菜单名称的缓存明确标注来源；新聊天临时展开的侧栏会恢复折叠，保留用户原先展开的侧栏。移除新文档观察引发的全 tab 重装，并在 MCP 中暴露 closed/frozen/discarded，便于区分旧记录与当前页面。
 - v41 当时完整测试 83 项通过；模型识别追加修改后重跑 32 项 adapter 测试通过。真实 MCP 读取验证 12 个工具、adapterVersion:41、推理强度字段及暂停保留。部署保留 54 个任务和现有文档；未解除访问暂停或用新的生成任务测试。当时实际模型名称尚未读取菜单确认，后续切换验证见 v42 记录。
-- 本次限流窗口中，一次发送后约六个 tab 在约 26 毫秒内同时请求会话列表，随后部分返回 429；用户也报告手动操作触发相同提示。这支持多 tab 同步请求放大的判断，但现有 Resource Timing 不含调用栈，不能据此确定网页内部触发链。不以持续新建 tab 验证限制是否恢复；当前窗口分配和清理按上方 4 个 tab 阈值及来源规则执行。
+- 本次限流窗口中，一次发送后约六个 tab 在约 26 毫秒内同时请求会话列表，随后部分返回 429；用户也报告手动操作触发相同提示。这支持多 tab 同步请求放大的判断，但现有 Resource Timing 不含调用栈，不能据此确定网页内部触发链。不以持续新建 tab 验证限制是否恢复；当前 tab 分配和复用按上方规则执行。
 - 2026-09-10 adapter v35：兼容没有内部 `data-message-author-role` 的纯图片 `section[data-turn="assistant"]`，使用会话内的 turn 标识关联回答；临时占位消失但未找到回答时标记 `finalizing` / `response_not_found`，不继续声称生成中。`wait` 仅在目标任务的有效状态变化时唤醒，无关 tab 和重复观测不再触发立即返回。新增占位替换、图片回答读取、跨用户消息保护、等待隔离与超时清理测试，当时 77 项测试通过。
 - v35 部署后实测：此前卡住的同一任务无需重发即识别为 completed，并经 Chrome 下载校验 941×1672 原图；后续任务无有效变化时，25 秒 wait 实测约 25029 ms 返回。该结果验证本次图片回答识别与等待修复，不代表模型选择器等其他网页适配已修复。
 

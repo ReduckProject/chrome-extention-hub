@@ -10,7 +10,7 @@
 4. 创建前服务再次核对完整清单与其它预留名额，返回 task.tabKey 和 openedByThisTask 后等待首次观测就绪。若其它页面变化使数量达到 4，TAB_REUSE_REQUIRED 时保留本任务 leaseId，每 20 秒读一次当前清单，发现空闲页就 bind，名额恢复则重试原创建操作；包含已经等待的次数，初次之后总共最多 5 次，仍不可用则在无未确认操作的情况下 release 并中断汇报，不更换 taskId 重置次数。创建超时／结果不确定时不能再开一页；读取现有清单，只有新增候选唯一时用 bind 确认归属，否则保留占用并报告。待确认的新页不会被其它任务自动认领。
 5. 用默认 status/result/wait 被动观察；完成后读取文字与图片，再检查结果。需要加载或保存时传 leaseId，例如 `result({runId,loadImages:true,leaseId})`、`download({runId,leaseId})`。拒绝回复也按原 run 处理，不把 completed 当作已保存。
 6. 下一张／下一步继续复用同一 tab 和 leaseId。同 profile 的 send 共用 10 秒最短间隔；某 tab 回答结束后，该 tab 的新聊天、模型操作和下一次发送再等 10 秒。取两个截止时间较晚者，不叠加；不会等待其它 tab 完成回答。PROFILE_COOLDOWN 的 retryAfterMs 是本地等待时长，返回时未下发页面命令。等待后原参数重试；已有 requestId 重查仍幂等，不因冷却换 ID。
-7. 必要结果保存和要求的归档完成后，按 openedByThisTask 清理 tab：本任务新建的关闭，复用的保留。再 `task({action:"release",profileId,leaseId,resultsSaved:true})`。未确认的生成、草稿、创建结果或过期页面观察会阻止正常释放，不替用户停止生成。关闭工具失败时记录遗留 tab，在确认结果已保存、页面无新草稿或活动后仍可释放，并如实汇报。
+7. 必要结果保存和要求的归档完成后，调用 `task({action:"release",profileId,leaseId,resultsSaved:true})` 释放占用。未确认的生成、草稿、创建结果或过期页面观察会阻止正常释放，不替用户停止生成。
 
 MCP 未加载新工具或旧 schema 没有 leaseId 时，把相同 JSON 写入 UTF-8 文件，在实际子项目目录运行 `node src/cli.mjs task --input <参数文件>`；其它动作替换方法名即可。使用与 MCP 相同的 CHATGPT_BRIDGE_RUNTIME。CLI 和 MCP 均返回 code、retryAfterMs 等错误信息。更新服务不需要重载 Chrome 扩展。
 
