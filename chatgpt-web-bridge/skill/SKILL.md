@@ -30,4 +30,6 @@ description: 通过本机 ChatGPT Web Bridge MCP 控制 Chrome 中已登录的 C
 
 先检查本机 MCP 和扩展连接状态，已有安装时不要重复安装。日常状态查询无需读取完整 DOM 或截图；首选一次 status 查全部 tab，观察变化用 wait。模型菜单和页面控件无法识别时再检查 adapter，不用重复提交来诊断连接。页面适配更新用 npm run setup 后调用 CLI refresh_observers；content.js 新增命令需要重新加载对应页面，manifest/background 修改则需在 Chrome 重新加载扩展。
 
-扩展 0.1.1 / contentVersion:4 在每个新文档第一次上报前，通过后台仅为该 tab 加载当前 adapter。v42 支持“最新”名称；首次从旧扩展升级须在 Chrome 重新加载扩展，setup 加 refresh_observers 只热更新现有文档，不能更新 Chrome 缓存的启动脚本。后续只改 adapter 时，动态加载避免新 tab 回退到旧版本。诊断新页时先记录首次 adapterVersion/contentVersion，再决定是否显式热更新，不掩盖新页首次版本问题。
+扩展 0.1.2 / contentVersion:5 在新文档首次上报前加载 adapter v42；显式 refresh_observers 已先注入当前 adapter 时直接使用它，兼容尚未识别新加载协议的旧后台。初始化失败返回 bootstrapError、composerReady:false 和过期状态，不发布旧模型为可用状态。更新 content/manifest/background 后仍需重新加载扩展；setup 与热更新现有页面不能替代这一步。新页首次版本应在显式热更新之前验证，本机已在重载后实测首次 v42 / content v5。
+
+连接判断先看 status/tabs 的 connections（旧服务可用 tabs.profiles 或 CLI health.connectedProfiles），不能仅凭历史 tab 的 disconnected/stale 要求用户重新登录。currentTabIds 是当前页面，unobservedTabIds 是尚未收到首份快照的页面；freshTabCount:0 但连接存在时属于页面观察问题。可执行一次不带 tabKey 的 status({refresh:true}) 探测当前清单，查看 observationErrors 和 bootstrapError；不会刷新网页或查询已关闭历史 tab。仅在明确缺少当前扩展连接时报告断连；只有页面证据表明登录失效才要求登录。bootstrapError 提示后台未确认加载时，已有页面可用一次 CLI refresh_observers 修复，重新加载扩展后再验证新文档，失败时保留实际错误而非循环重试。

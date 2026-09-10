@@ -20,6 +20,7 @@ export class BridgeService {
     this.config = config;
     this.store = new StateStore({ file: stateFile });
     this.clients = new Map();
+    this.browserStates = new Map();
     this.pending = new Map();
     this.locks = new Map();
     this.operationContext = new AsyncLocalStorage();
@@ -102,16 +103,40 @@ export class BridgeService {
           const old = this.clients.get(profileId);
           if (old && old !== ws) old.close(1000, 'Replaced by current extension connection');
           this.clients.set(profileId, ws);
+          this.browserStates.set(profileId, { browserSessionId: message.browserSessionId,
+            connectedAt: Date.now(), inventoryAt: null, tabIds: null, errors: new Map() });
           this.store.connect(profileId);
           ws.send(JSON.stringify({ type: 'welcome', protocol: 1 }));
           return;
         }
         if (message.type === 'snapshot') {
           this.store.snapshot(profileId, message.snapshot);
+          const browser = this.browserStates.get(profileId);
+          if (browser && message.snapshot.browserSessionId === browser.browserSessionId) {
+            if (browser.tabIds && !browser.tabIds.includes(message.snapshot.tabId)) browser.tabIds.push(message.snapshot.tabId);
+            if (message.snapshot.observationError) browser.errors.set(message.snapshot.tabId, message.snapshot.observationError);
+            else browser.errors.delete(message.snapshot.tabId);
+          }
           this.store.save().catch(error => this.logError(error));
           // A newly observed document must not reinject observers into every
           // other tab. Connection setup and explicit refresh_observers own that.
         } else if (message.type === 'invalidate' || message.type === 'inventory') {
+          const browser = this.browserStates.get(profileId);
+          if (browser && message.type === 'inventory' && typeof message.browserSessionId === 'string') {
+            browser.browserSessionId = message.browserSessionId;
+          }
+          if (browser && message.browserSessionId === browser.browserSessionId) {
+            if (message.type === 'inventory') {
+              browser.tabIds = [...new Set((message.tabIds || []).filter(Number.isInteger))];
+              browser.inventoryAt = Date.now();
+              for (const id of browser.errors.keys()) if (!browser.tabIds.includes(id)) browser.errors.delete(id);
+            } else if (message.closed) {
+              browser.tabIds = browser.tabIds?.filter(id => id !== message.tabId) ?? null;
+              browser.errors.delete(message.tabId);
+            } else if (Number.isInteger(message.tabId)) {
+              browser.errors.set(message.tabId, String(message.reason || 'Page observation failed').slice(0, 1000));
+            }
+          }
           for (const tab of Object.values(this.store.data.tabs)) {
             if (tab.profileId !== profileId) continue;
             const invalid = message.type === 'inventory'
@@ -147,6 +172,7 @@ export class BridgeService {
       clearTimeout(helloTimer);
       if (profileId && this.clients.get(profileId) === ws) {
         this.clients.delete(profileId); this.store.disconnect(profileId);
+        this.browserStates.delete(profileId);
         for (const [id, pending] of this.pending) if (pending.profileId === profileId) {
           clearTimeout(pending.timer); this.pending.delete(id);
           pending.reject(new Error('Extension disconnected; command outcome may be unknown'));
@@ -157,6 +183,20 @@ export class BridgeService {
   }
 
   logError(error) { console.error(`[bridge] ${error.message}`); }
+
+  connectionViews() {
+    return [...this.clients.keys()].map(profileId => {
+      const browser = this.browserStates.get(profileId);
+      const current = this.store.list().filter(tab => tab.profileId === profileId && !tab.closed &&
+        (!browser?.browserSessionId || tab.browserSessionId === browser.browserSessionId));
+      return { profileId, connection: 'connected', browserSessionId: browser?.browserSessionId,
+        connectedAt: browser?.connectedAt, inventoryAt: browser?.inventoryAt,
+        currentTabIds: browser?.tabIds, observedTabCount: current.length,
+        freshTabCount: current.filter(tab => !tab.freshness.stale).length,
+        unobservedTabIds: browser?.tabIds?.filter(id => !current.some(tab => tab.tabId === id)) ?? null,
+        observationErrors: [...(browser?.errors || [])].map(([tabId, error]) => ({ tabId, error })) };
+    });
+  }
 
   command(profileId, command, params = {}, timeoutMs = 5000, id = randomUUID()) {
     const passive = command === 'probe' || (command === 'read' &&
@@ -229,7 +269,7 @@ export class BridgeService {
 
   async perform(method, params = {}) {
     switch (method) {
-      case 'health': return { ok: true, service: 'chatgpt-web-bridge', protocol: 1, version: '0.1.0', connectedProfiles: [...this.clients.keys()], revision: this.store.data.revision };
+      case 'health': return { ok: true, service: 'chatgpt-web-bridge', protocol: 1, version: '0.1.0', connectedProfiles: [...this.clients.keys()], connections: this.connectionViews(), revision: this.store.data.revision };
       case 'refresh_observers': {
         if (this.pending.size) throw new Error('Wait for outstanding page commands before updating observers');
         const profiles = params.profileId ? [params.profileId] : [...this.clients.keys()];
@@ -248,18 +288,39 @@ export class BridgeService {
           if (!profileId) throw new Error('Choose a connected profileId explicitly');
           return this.command(profileId, 'new_chats', { count }, 8000);
         }
-        return { profiles: [...this.clients.keys()], tabs: this.store.list(), revision: this.store.data.revision };
+        return { profiles: [...this.clients.keys()], connections: this.connectionViews(), tabs: this.store.list(), revision: this.store.data.revision };
       }
       case 'status': {
         if (params.diagnostics && !params.tabKey) throw new Error('Diagnostics require one exact tabKey');
         const keys = params.tabKey ? [params.tabKey] : Object.keys(this.store.data.tabs);
         const errors = [];
         if (params.refresh) {
-          await Promise.all(keys.map(async key => {
-            const tab = this.store.data.tabs[key];
-            if (!tab) { errors.push({ tabKey: key, error: 'Unknown tab' }); return; }
-            try { await this.command(tab.profileId, 'probe', { tabId: tab.tabId }, 2000); }
-            catch (error) { errors.push({ tabKey: key, error: error.message }); }
+          // Current browser inventory also includes pages whose first snapshot
+          // failed. Never refresh closed history or disconnected old profiles.
+          const targets = params.tabKey ? [this.store.data.tabs[params.tabKey] || { key: params.tabKey }] :
+            [...this.clients.keys()].flatMap(profileId => {
+              const browser = this.browserStates.get(profileId);
+              return browser?.tabIds ? browser.tabIds.map(tabId => ({ profileId, tabId,
+                key: `${profileId}:${browser.browserSessionId}:${tabId}` })) :
+                this.store.list().filter(tab => tab.profileId === profileId && !tab.closed &&
+                  (!browser?.browserSessionId || tab.browserSessionId === browser.browserSessionId));
+            });
+          let next = 0;
+          await Promise.all(Array.from({ length: Math.min(4, targets.length) }, async () => {
+            while (next < targets.length) {
+              const tab = targets[next++];
+              if (!tab.profileId) { errors.push({ tabKey: tab.key, error: 'Unknown tab' }); continue; }
+              const browser = this.browserStates.get(tab.profileId);
+              const currentTarget = browser && (!browser.tabIds || browser.tabIds.includes(tab.tabId)) &&
+                (!tab.browserSessionId || tab.browserSessionId === browser.browserSessionId);
+              try {
+                await this.command(tab.profileId, 'probe', { tabId: tab.tabId }, 2000);
+                if (currentTarget) browser.errors.delete(tab.tabId);
+              } catch (error) {
+                errors.push({ tabKey: tab.key, error: error.message });
+                if (currentTarget) browser.errors.set(tab.tabId, error.message);
+              }
+            }
           }));
         }
         this.store.reconcile();
@@ -270,7 +331,7 @@ export class BridgeService {
           diagnostics = await this.command(tab.profileId, 'read', { tabId: tab.tabId, documentId: tab.documentId,
             assistantId: { operation: 'diagnostics' } }, 5000);
         }
-        return { revision: this.store.data.revision, tabs: keys.filter(k => this.store.data.tabs[k]).map(key => this.store.tabView(key)), runs: Object.values(this.store.data.runs).filter(r => !params.tabKey || r.tabKey === params.tabKey).map(r => this.store.runView(r.id)), errors,
+        return { revision: this.store.data.revision, connections: this.connectionViews(), tabs: (params.tabKey ? keys : Object.keys(this.store.data.tabs)).filter(k => this.store.data.tabs[k]).map(key => this.store.tabView(key)), runs: Object.values(this.store.data.runs).filter(r => !params.tabKey || r.tabKey === params.tabKey).map(r => this.store.runView(r.id)), errors,
           ...(diagnostics ? { diagnostics, recentOperations: this.store.data.operations.filter(op => op.tabKey === params.tabKey ||
             op.profileId === this.store.data.tabs[params.tabKey]?.profileId).slice(-30) } : {}) };
       }

@@ -90,3 +90,13 @@
 - 完整测试 86 项通过；源码及用户级 bridge Skill、用户级 gen-image Skill 通过验证。npm run setup 已更新原安装目录；现有诊断页热更新到 v42 后，真实执行“最新 → GPT-5.5 → GPT-5.6 Sol → 最新”，全部 confirmed:true，模型及推理强度均读回成功，没有发送提示词或生成图片。
 - 新启动脚本首次启用需要重新加载 Chrome 扩展。自动化访问扩展管理页被浏览器 URL 安全策略拒绝，已请用户手动重载；后续须在不先热更新的条件下记录新文档首次 adapterVersion:42 / contentVersion:4。重载前不宣称新文档启动已通过实机验证。
 - 现场证据保留在被忽略的 artifacts/latest-model-2026-09-09T19-10-32-913Z。
+
+## 扩展已连接但新页面未上报的修复 — 2026-09-11
+
+- 用户反馈另一任务把网页生图阻塞归因为“连接断开且缓存过期”。实查服务和扩展 WebSocket 正常，但状态接口只有旧浏览器会话记录；Chrome 已有新的 ChatGPT tab，却未成功启动观察器。配置仍指向当前仓库，扩展仍启用且保有 ChatGPT 主机权限。
+- 原服务丢弃未曾上报页面的 invalidate 信息；status refresh 只遍历历史状态，向已关闭 tab 发 probe，无法诊断新 tab。新增 connections，保留当前浏览器会话、当前 tab、尚未上报的 tab、观察错误和新鲜页面数。默认刷新根据当前清单最多并发四个被动 probe，跳过已关闭历史和断连旧 profile；新页面后续的首份快照会加入清单，显式 tabKey 保持原有定向查询。
+- 先部署诊断，收到新页面的 Receiving end does not exist。为 content 初始化失败补充 bootstrapError 后，确认后台没有确认 load_adapter 请求；原 content v4 静默退出，没有注册接收器，导致查询方将初始化失败误认为桥接断开。没有把浏览器 UI 工具的独立超时或 Promise 等待假设当作根因。
+- content v5 在显式注入已预载当前 adapter 时直接启动，不再依赖旧后台确认新协议；加载失败发布不可提交的诊断快照，不读旧 adapter 冒充有效页面。更新安装包为 0.1.2，现有两个 ChatGPT 页面经热更新恢复 v42 / content v5、idle、composerReady:true、stale:false，模型名称“最新”、推理强度“高”。
+- 更新源 Skill 和用户级 bridge/gen-image Skill：按连接元数据与当前页面判断，页面观察错误不自动归因为断连或要求重新登录。保留串行复用、明确限流恢复、原图验证与 @创建图片 前缀约定。
+- 用户手动重载扩展后，仅新建一个空白诊断 tab，在没有先热更新的条件下首次收到 v42 / content v5，随后读回新鲜 idle 和实际勾选模型“最新 / 高”。没有提交提示词或生成图片；UI 工具 getTab 仍超时，保留这一空白测试页供用户关闭，未操作其他用户页面。
+- 最终 90 项完整测试通过，包括新快照加入当前清单、定向旧记录错误不污染当前连接等回归。备份状态后仅重启本项目 daemon；实机记录在被忽略的 artifacts/connection-20260911-1789058335709。

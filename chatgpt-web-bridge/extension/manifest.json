@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "ChatGPT Web Bridge (local)",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Explicit-tab ChatGPT status and actions through an authenticated local MCP bridge.",
   "minimum_chrome_version": "120",
   "permissions": ["storage", "scripting", "downloads", "alarms"],

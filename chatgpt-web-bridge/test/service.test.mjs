@@ -68,6 +68,67 @@ test('new document observations never broadcast reinjection to all tabs', async 
   assert.equal(received[0].type, 'welcome', 'Explicit observer updates remain available');
 });
 
+test('connected extension inventory reports a page even when its first observer never starts', async t => {
+  const { service, ws, rpc, until } = await fixture(t);
+  ws.send(JSON.stringify({ type: 'inventory', browserSessionId: sessionId, tabIds: [7] }));
+  await until(() => service.connectionViews()[0].currentTabIds?.includes(7));
+  const initial = await rpc('status');
+  assert.equal(initial.tabs.length, 0);
+  assert.equal(initial.connections[0].connection, 'connected');
+  assert.deepEqual(initial.connections[0].unobservedTabIds, [7]);
+  const commands = [];
+  ws.on('message', data => {
+    const message = JSON.parse(data); if (message.type !== 'command') return;
+    commands.push(message);
+    ws.send(JSON.stringify({ type: 'result', id: message.id, error: 'Receiving end does not exist.' }));
+  });
+  const refreshed = await rpc('status', { refresh: true });
+  assert.deepEqual(commands.map(command => [command.command, command.params.tabId]), [['probe', 7]]);
+  assert.equal(refreshed.errors[0].tabKey, `${profileId}:${sessionId}:7`);
+  assert.deepEqual(refreshed.connections[0].observationErrors, [{ tabId: 7, error: 'Receiving end does not exist.' }]);
+  assert.deepEqual((await rpc('health')).connections, (await rpc('tabs')).connections);
+});
+
+test('refresh skips closed and disconnected history and includes a recovered first snapshot immediately', async t => {
+  const { service, ws, rpc, snapshot, until } = await fixture(t);
+  service.store.snapshot('old-disconnected-profile', snap(99));
+  snapshot(snap(1)); await until(() => service.store.list().length === 2);
+  ws.send(JSON.stringify({ type: 'inventory', browserSessionId: sessionId, tabIds: [2] }));
+  ws.send(JSON.stringify({ type: 'invalidate', browserSessionId: sessionId, tabId: 2, reason: 'Observer failed to load' }));
+  await until(() => service.connectionViews()[0].observationErrors.length === 1);
+  const commands = [];
+  ws.on('message', data => {
+    const message = JSON.parse(data); if (message.type !== 'command') return;
+    commands.push(message.params.tabId);
+    snapshot(snap(message.params.tabId));
+    ws.send(JSON.stringify({ type: 'result', id: message.id, result: { tabId: message.params.tabId } }));
+  });
+  const refreshed = await rpc('status', { refresh: true });
+  assert.deepEqual(commands, [2]); assert.deepEqual(refreshed.errors, []);
+  assert.ok(refreshed.tabs.some(tab => tab.tabId === 2 && !tab.freshness.stale));
+  assert.equal(refreshed.connections[0].freshTabCount, 1);
+  assert.deepEqual(refreshed.connections[0].observationErrors, []);
+  assert.deepEqual(refreshed.connections[0].unobservedTabIds, []);
+  snapshot(snap(3));
+  await until(() => service.connectionViews()[0].currentTabIds.includes(3));
+  assert.deepEqual((await rpc('status')).connections[0].currentTabIds, [2, 3], 'A newly observed tab joins the next passive refresh');
+});
+
+test('explicit history errors do not contaminate current browser connection diagnostics', async t => {
+  const { service, ws, rpc, snapshot, until } = await fixture(t);
+  snapshot(snap(1)); await until(() => service.store.list().length === 1);
+  const oldKey = service.store.list()[0].key;
+  ws.send(JSON.stringify({ type: 'inventory', browserSessionId: sessionId, tabIds: [] }));
+  await until(() => service.store.tabView(oldKey).closed);
+  ws.on('message', data => {
+    const message = JSON.parse(data); if (message.type !== 'command') return;
+    ws.send(JSON.stringify({ type: 'result', id: message.id, error: 'No tab with id: 1.' }));
+  });
+  const result = await rpc('status', { tabKey: oldKey, refresh: true });
+  assert.equal(result.errors[0].error, 'No tab with id: 1.');
+  assert.deepEqual(result.connections[0].observationErrors, []);
+});
+
 test('lazy loading is an explicit completed-result operation, never a default query side effect', async t => {
   const { service, ws, rpc, snapshot, until } = await fixture(t);
   snapshot(snap(1)); await until(() => service.store.list().length === 1);
@@ -121,7 +182,7 @@ async function fixture(t) {
   t.after(() => service.close());
   const ws = new WebSocket(`ws://127.0.0.1:${config.port}/extension`, { origin: `chrome-extension://${config.extensionId}` });
   await once(ws, 'open');
-  const welcome = once(ws, 'message'); ws.send(JSON.stringify({ type: 'hello', token, profileId })); await welcome;
+  const welcome = once(ws, 'message'); ws.send(JSON.stringify({ type: 'hello', token, profileId, browserSessionId: sessionId })); await welcome;
   const rpc = (method, params = {}) => call(method, params, { config });
   const snapshot = data => ws.send(JSON.stringify({ type: 'snapshot', snapshot: data }));
   const until = async condition => { for (let i = 0; i < 100; i++) { if (condition()) return; await new Promise(r => setTimeout(r, 10)); } throw new Error('Fixture did not settle'); };

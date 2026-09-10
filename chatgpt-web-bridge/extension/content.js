@@ -1,23 +1,33 @@
 (async () => {
   if (globalThis.chatGPTBridgeContentInstalled) return;
   globalThis.chatGPTBridgeContentInstalled = true;
+  const documentId = crypto.randomUUID();
   // Chrome can retain the manifest's old content-script source after an unpacked
   // extension's files are updated. Load the current adapter in this document
   // before reporting any state; never reinject other tabs to repair this one.
   try {
-    const loaded = await chrome.runtime.sendMessage({ type: 'load_adapter' });
-    if (!loaded?.ok || !globalThis.ChatGPTBridgeAdapter?.snapshot) throw new Error('Current adapter is unavailable');
-  } catch {
+    // Explicit inventory injection already loads the current adapter first.
+    // It must also repair pages while an older worker lacks load_adapter.
+    if (!(globalThis.ChatGPTBridgeAdapter?.version >= 42 && globalThis.ChatGPTBridgeAdapter?.snapshot)) {
+      const loaded = await chrome.runtime.sendMessage({ type: 'load_adapter' });
+      if (!loaded?.ok) throw new Error(loaded?.error || 'Background did not acknowledge adapter loading; reload the extension');
+    }
+    if (!globalThis.ChatGPTBridgeAdapter?.snapshot) throw new Error('Current adapter is unavailable');
+  } catch (error) {
     globalThis.chatGPTBridgeContentInstalled = false;
+    chrome.runtime.sendMessage({ type: 'snapshot', snapshot: { url: location.href, documentId,
+      contentVersion: 5, adapterVersion: null, activity: 'unknown', composerReady: false,
+      bootstrapError: error.message,
+      observationError: `Adapter bootstrap failed: ${error.message}`,
+      contentSignature: 'adapter_bootstrap_failed' } }).catch(() => {});
     return;
   }
-  globalThis.chatGPTBridgeContentVersion = 4;
-  const documentId = crypto.randomUUID();
+  globalThis.chatGPTBridgeContentVersion = 5;
   const adapter = globalThis.ChatGPTBridgeAdapter;
   let timer, lastSignature;
   function emit(force = false) {
     try {
-      const state = { ...adapter.snapshot(), documentId, contentVersion: 4 };
+      const state = { ...adapter.snapshot(), documentId, contentVersion: 5 };
       const signature = JSON.stringify(state);
       if (force || signature !== lastSignature) {
         lastSignature = signature;
@@ -39,7 +49,7 @@
       if (message.documentId && message.documentId !== documentId) throw new Error('Page document changed; refresh status before acting');
       let result;
       switch (message.command) {
-        case 'probe': result = { ...adapter.snapshot(), documentId, contentVersion: 4 }; break;
+        case 'probe': result = { ...adapter.snapshot(), documentId, contentVersion: 5 }; break;
         case 'models': result = await adapter.models(); break;
         case 'new_chat': result = await adapter.newChat(); break;
         case 'select_model': result = await adapter.selectModel(message.label); break;

@@ -165,10 +165,14 @@ setup 生成 runtime/extension、固定扩展 ID、本机认证配置，不代�
 
 已有实例的源码可以独立纳入本仓库，当前安装不会自动迁移。迁移运行实例时需保留其 runtime 配置和状态；环境变量 CHATGPT_BRIDGE_RUNTIME 可指定现有 runtime 目录。Chrome 扩展仍从加载时的目录运行，重新加载前应保留该目录。每个实例的认证配置需与其本地服务一致。
 
-扩展 0.1.1 的 manifest 只注册 content.js 启动脚本，contentVersion:4 在首次上报前，请求后台用 scripting API 为当前 tab 加载 adapter.js（当前 v42）。Chrome 会缓存 manifest 静态脚本，覆盖磁盘文件并热更新现有页面不会更新这份缓存；从旧版首次升级到 0.1.1 需要在 Chrome 重新加载扩展。后续 adapter 修改可运行 npm run setup 与 CLI refresh_observers，新的页面也会动态加载当前版本。固定加载消息只接受本扩展在 ChatGPT 顶层页面的请求，忽略调用方提供的 tabId/脚本，只加载自带 adapter.js，不重装其他 tab。content/manifest/background 变更仍需要相应页面或扩展重新加载。
+扩展 0.1.2 的 manifest 只注册 content.js 启动脚本，contentVersion:5 在首次上报前，请求后台用 scripting API 为当前 tab 加载 adapter.js（当前 v42）。显式 refresh_observers 已先加载新 adapter 时直接使用它，避免旧后台未识别 load_adapter 协议导致整个观察器退出。初始化失败返回 bootstrapError，页面保持不可提交。Chrome 会缓存 manifest 静态脚本，覆盖磁盘文件并热更新现有页面不会更新这份缓存；更新 content/manifest/background 后需要在 Chrome 重新加载扩展。后续仅修改 adapter 可运行 npm run setup 与 CLI refresh_observers，新的页面也会动态加载当前版本。固定加载消息只接受本扩展在 ChatGPT 顶层页面的请求，忽略调用方提供的 tabId/脚本，只加载自带 adapter.js，不重装其他 tab。
+
+连接诊断读取 status/tabs/CLI health 的 connections：connection 表示扩展到本地服务的连接，currentTabIds 是当前 Chrome 清单及后续观察发现的页面，unobservedTabIds 表示尚未上报首份快照，freshTabCount 表示状态可用的页面数。旧 tab 的 disconnected/stale 不代表整个桥接断开。默认 status({refresh:true}) 按当前浏览器清单最多并发探测四页，包含从未成功上报的新 tab，并跳过已关闭页面及断连旧 profile；显式 tabKey 仍只探测目标。observationErrors 保留页面通道错误，bootstrapError 保留初始化的具体原因。连接存在但页面观察失败时，不应笼统要求重新登录 ChatGPT。
 
 ## 验证范围与限制
 
+- 2026-09-11 扩展 0.1.2 / content v5：现场扩展 WebSocket 正常连接，但新 tab 没有消息接收器；增加初始化错误上报后确认后台没有确认 load_adapter 请求。显式热更新已预载 adapter 时直接安装观察器，恢复两个现有页面。90 项完整测试通过，包括新页面加入当前清单、首次上报失败、定向查询旧记录时不污染当前连接错误等回归。
+- 用户重新加载 0.1.2 后，新建一个独立空白诊断页，在未先热更新的条件下首次收到 adapterVersion:42 / contentVersion:5；随后状态为 idle、composerReady:true、stale:false，模型菜单实测勾选“最新”、推理强度“高”。此次只验证连接、启动和模型读取，没有提交图片提示词。浏览器 UI 工具读取该页超时，因此未自动关闭这一个诊断页；不影响桥接器已验证的页面读取。
 - 2026-09-10 adapter v42 / 扩展 0.1.1：真实模型菜单包含“最新”、GPT-5.6 Sol 和 GPT-5.5。修复“最新”名称被过滤的问题，并在独立空白页验证“最新 → GPT-5.5 → GPT-5.6 Sol → 最新”，每次切换均 confirmed:true，分别读回模型名称、推理强度“高”和名称来源。完整测试 86 项通过，覆盖首次上报等待新 adapter、重复启动去重、失败重试及加载消息的 tab／来源限制。
 - 本次新建诊断 tab 首次实际加载 adapter v15，而已有页面已热更新到 v41；旧启动脚本会再次返回无法识别模型。新启动方式只为请求的 tab 动态加载 adapter，contentVersion:4 便于区分启动脚本。安装目录已生成 0.1.1；从旧版升级须重新加载扩展，首次加载验证须在显式 refresh_observers 之前进行。现有页热更新后的模型实测不能代替这项新文档验证。
 - 2026-09-10 adapter v41：从实际 DOM 确认部分模型入口改为显示“中／高”的 composer pill，增加识别并分别返回模型名称与推理强度。模型菜单名称的缓存明确标注来源；新聊天临时展开的侧栏会恢复折叠，保留用户原先展开的侧栏。移除新文档观察引发的全 tab 重装，并在 MCP 中暴露 closed/frozen/discarded，便于区分旧记录与当前页面。
