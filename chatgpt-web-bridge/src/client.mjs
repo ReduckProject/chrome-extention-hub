@@ -10,7 +10,8 @@ export async function call(method, params = {}, { timeoutMs = 30000, config = nu
     body: JSON.stringify({ method, params, client: { pid: process.pid, entry: path.basename(process.argv[1] || 'node') } }), signal: AbortSignal.timeout(timeoutMs),
   });
   const body = await response.json();
-  if (!response.ok) { const error = new Error(body.error || `HTTP ${response.status}`); error.status = response.status; throw error; }
+  if (!response.ok) throw Object.assign(new Error(body.error || `HTTP ${response.status}`),
+    { status: response.status, code: body.code, details: body.details });
   return body.result;
 }
 

@@ -183,11 +183,115 @@ async function fixture(t) {
   const ws = new WebSocket(`ws://127.0.0.1:${config.port}/extension`, { origin: `chrome-extension://${config.extensionId}` });
   await once(ws, 'open');
   const welcome = once(ws, 'message'); ws.send(JSON.stringify({ type: 'hello', token, profileId, browserSessionId: sessionId })); await welcome;
-  const rpc = (method, params = {}) => call(method, params, { config });
+  const rawRpc = (method, params = {}) => call(method, params, { config });
+  const lease = await rawRpc('task', { action: 'acquire', profileId, taskId: 'fixture-task-owner' });
+  const rpc = (method, params = {}) => rawRpc(method, { leaseId: lease.leaseId, ...params });
   const snapshot = data => ws.send(JSON.stringify({ type: 'snapshot', snapshot: data }));
   const until = async condition => { for (let i = 0; i < 100; i++) { if (condition()) return; await new Promise(r => setTimeout(r, 10)); } throw new Error('Fixture did not settle'); };
-  return { config, service, ws, rpc, snapshot, until };
+  return { config, service, ws, rpc, rawRpc, lease, snapshot, until };
 }
+
+test('two RPC clients cannot interleave a task or take its tab after generation ends', async t => {
+  const { service, ws, rpc, rawRpc, lease, snapshot, until } = await fixture(t);
+  snapshot(snap(1)); snapshot(snap(2)); await until(() => service.store.list().length === 2);
+  const [tabKey, secondKey] = service.store.list().map(tab => tab.key), commands = [];
+  ws.on('message', data => {
+    const m = JSON.parse(data); if (m.type !== 'command') return;
+    commands.push(m.command);
+    ws.send(JSON.stringify({ type: 'result', id: m.id, result: { confirmed: true, accepted: true } }));
+  });
+  const queued = await rawRpc('task', { action: 'acquire', profileId, taskId: 'other-client-task' });
+  assert.equal(queued.state, 'queued'); assert.equal(queued.position, 1); assert.equal(queued.leaseId, undefined);
+  for (const method of ['models', 'new_chat', 'send']) {
+    await assert.rejects(rawRpc(method, { tabKey, prompt: 'must not send', requestId: 'legacy-request' }), { code: 'TASK_LEASE_REQUIRED' });
+  }
+  assert.equal(commands.length, 0);
+  await rpc('new_chat', { tabKey }); await rpc('models', { tabKey });
+  await assert.rejects(rpc('models', { tabKey: secondKey }), { code: 'TASK_TAB_MISMATCH' });
+  const { run } = await rpc('send', { tabKey, prompt: 'one answer', requestId: 'owned-send' });
+  assert.equal(run.taskId, lease.taskId);
+  await assert.rejects(rpc('task', { action: 'release', profileId, resultsSaved: true }), { code: 'TASK_UNRESOLVED' });
+  Object.assign(service.store.data.runs[run.id], { phase: 'completed', completedAt: Date.now() });
+  assert.equal((await rawRpc('task', { action: 'acquire', profileId, taskId: 'other-client-task' })).state, 'queued', 'Saving and archiving still own the profile');
+  assert.equal((await rpc('task', { action: 'release', profileId, resultsSaved: true })).released, true);
+  service.store.data.scheduling.tasks['other-client-task'].nextPollAt = 0;
+  const next = await rawRpc('task', { action: 'acquire', profileId, taskId: 'other-client-task' });
+  assert.equal(next.state, 'active'); assert.notEqual(next.leaseId, lease.leaseId);
+  await assert.rejects(rpc('models', { tabKey }), { code: 'TASK_LEASE_REQUIRED' });
+  await assert.rejects(rawRpc('new_chat', { tabKey, leaseId: next.leaseId }), { code: 'PROFILE_COOLDOWN' });
+  assert.deepEqual(commands, ['read', 'models', 'submit']);
+  assert.ok(!JSON.stringify((await rpc('status')).connections).includes(next.leaseId), 'Public status must not expose lease credentials');
+});
+
+test('profile pacing blocks rapid new chats and preserves simultaneous idempotent send retries', async t => {
+  const { service, ws, rpc, snapshot, until } = await fixture(t);
+  let now = 1000000; service.store.now = () => now;
+  snapshot(snap(1)); await until(() => service.store.list().length === 1);
+  const tabKey = service.store.list()[0].key, commands = [];
+  ws.on('message', data => {
+    const m = JSON.parse(data); if (m.type !== 'command') return;
+    commands.push(m.command);
+    ws.send(JSON.stringify({ type: 'result', id: m.id, result: { accepted: true, confirmed: true } }));
+  });
+  const args = { tabKey, prompt: 'one', requestId: 'two-racing-retries' };
+  const replies = await Promise.all([rpc('send', args), rpc('send', args)]);
+  assert.equal(replies[0].run.id, replies[1].run.id); assert.equal(commands.length, 1);
+  const run = service.store.data.runs[replies[0].run.id];
+  await assert.rejects(rpc('new_chat', { tabKey }), { code: 'PROFILE_BUSY' });
+  now += 50000; Object.assign(run, { phase: 'completed', completedAt: now });
+  await assert.rejects(rpc('new_chat', { tabKey }), error => error.code === 'PROFILE_COOLDOWN' && error.details.retryAfterMs === 70000);
+  assert.equal((await rpc('send', args)).existing, true);
+  assert.equal(service.store.data.requests['blocked-next'], undefined);
+  await assert.rejects(rpc('send', { tabKey, prompt: 'two', requestId: 'blocked-next' }), { code: 'PROFILE_COOLDOWN' });
+  assert.equal(service.store.data.requests['blocked-next'], undefined);
+  now += 70000;
+  snapshot(snap(1)); await until(() => service.store.data.tabs[tabKey].receivedAt === now);
+  await rpc('new_chat', { tabKey });
+  await rpc('send', { tabKey, prompt: 'two', requestId: 'blocked-next' });
+  assert.deepEqual(commands, ['submit', 'read', 'submit']);
+});
+
+test('new-tab creation enforces four-tab reuse and uncertain outcomes cannot be retried', async t => {
+  const { service, ws, rpc, snapshot, until } = await fixture(t);
+  for (let i = 1; i <= 4; i++) snapshot(snap(i));
+  ws.send(JSON.stringify({ type: 'inventory', browserSessionId: sessionId, tabIds: [1, 2, 3, 4, 5] }));
+  await until(() => service.connectionViews()[0].currentTabIds?.length === 5);
+  const commands = [];
+  ws.on('message', data => {
+    const m = JSON.parse(data); if (m.type !== 'command') return;
+    commands.push(m.command);
+    ws.send(JSON.stringify({ type: 'result', id: m.id, error: 'Tab creation response lost' }));
+  });
+  await assert.rejects(rpc('tabs', { action: 'new', count: 1 }), { code: 'TAB_REUSE_REQUIRED' });
+  assert.equal(commands.length, 0);
+  ws.send(JSON.stringify({ type: 'inventory', browserSessionId: sessionId, tabIds: [1, 2, 3] }));
+  await until(() => service.connectionViews()[0].currentTabIds.length === 3);
+  await assert.rejects(rpc('tabs', { action: 'new', count: 2 }), /count must be 1/);
+  await assert.rejects(rpc('tabs', { action: 'new', count: 1 }), /response lost/);
+  await assert.rejects(rpc('tabs', { action: 'new', count: 1 }), { code: 'TAB_CREATION_UNCERTAIN' });
+  snapshot(snap(6)); await until(() => service.store.data.tabs[`${profileId}:${sessionId}:6`]);
+  const bound = await rpc('task', { action: 'bind', profileId, tabKey: `${profileId}:${sessionId}:6` });
+  assert.equal(bound.openedByThisTask, true); assert.equal(bound.creationPending, false);
+  assert.deepEqual(commands, ['new_chats']);
+});
+
+test('a created tab is bound and counted before its first observation, so the task cannot open another', async t => {
+  const { service, ws, rpc, until } = await fixture(t);
+  ws.send(JSON.stringify({ type: 'inventory', browserSessionId: sessionId, tabIds: [] }));
+  await until(() => service.connectionViews()[0].currentTabIds?.length === 0);
+  const commands = [];
+  ws.on('message', data => {
+    const m = JSON.parse(data); if (m.type !== 'command') return;
+    commands.push(m.command);
+    ws.send(JSON.stringify({ type: 'result', id: m.id, result: { tabs: [{ tabId: 10, profileId, browserSessionId: sessionId }] } }));
+  });
+  const made = await rpc('tabs', { action: 'new', count: 1 });
+  assert.equal(made.task.tabKey, `${profileId}:${sessionId}:10`);
+  assert.equal(made.task.openedByThisTask, true);
+  assert.deepEqual(service.connectionViews()[0].currentTabIds, [10]);
+  await assert.rejects(rpc('tabs', { action: 'new', count: 1 }), { code: 'TASK_TAB_MISMATCH' });
+  assert.deepEqual(commands, ['new_chats']);
+});
 
 test('a background page with no push heartbeat completes through passive probes before lazy media loads', { timeout: 10000 }, async t => {
   const { service, ws, snapshot, until } = await fixture(t);

@@ -4,6 +4,8 @@
 
 五个 ChatGPT tab、三个已完成任务的实测：MCP 全部状态缓存查询中位 **2.78 ms**，主动刷新中位 **18.95 ms**。这是本机短时样本。详见 [验收记录](ACCEPTANCE.md) 和 [安装与开发记录](WORKLOG.md)。
 
+0.2.0 起，当前自动任务改为同一 Chrome profile 串行执行：先申请任务占用，整批复用一个 tab，保存和归档后显式释放。上面的并发数据是历史验收，不代表当前调度策略。
+
 ## 工作方式
 
 提示词提交后返回持久化 `runId`，网页继续生成。后续查询使用短请求，不必让一个 MCP 调用一直等待生图完成。每个 tab 使用 Chrome profile、浏览器会话、tab ID 组合标识。
@@ -25,7 +27,7 @@ flowchart LR
 ## 组件与依赖
 
 - Chrome 扩展 **ChatGPT Web Bridge (local)**，由本机 setup 生成。
-- Codex stdio MCP **chatgpt-web-bridge**，提供 12 个工具。
+- Codex stdio MCP **chatgpt-web-bridge**，提供 13 个工具。
 - Skill **chatgpt-chrome-bridge**，源码见 [skill/SKILL.md](skill/SKILL.md)，可复制到个人 Codex skills 目录下的同名文件夹。
 - 项目依赖：`@modelcontextprotocol/sdk@1.30.0`、`ws@8.21.3`、调研用 `chrome-devtools-mcp@1.9.0`；测试依赖 `jsdom@29.0.2`。使用现有 Node 24.13.0。
 
@@ -33,7 +35,7 @@ flowchart LR
 
 ## 使用
 
-可直接对 AI 说：“使用 chatgpt-chrome-bridge，查看 Chrome 中所有 ChatGPT 标签页的模型与生成状态”，或“使用 Chrome 网页版 ChatGPT，开三个独立聊天并发生图，逐个确认模型后提交，最后给我对应原图”。
+可直接对 AI 说：“使用 chatgpt-chrome-bridge，查看 Chrome 中所有 ChatGPT 标签页的模型与生成状态”，或“使用 Chrome 网页版 ChatGPT，串行生成两张图，复用一个 tab 并保存原图”。
 
 当前任务未加载新 MCP 工具时，Skill 可调用同一服务的 CLI：
 
@@ -46,7 +48,8 @@ node src/cli.mjs status
 
 | MCP 工具 | 作用 |
 |---|---|
-| `chatgpt_tabs` | 列出 tabKey、profile、网址；`action:new,count:3` 开三个新聊天 |
+| `chatgpt_task` | 同 profile 的任务占用与 FIFO 队列；acquire 返回 leaseId，保存／归档后 release |
+| `chatgpt_tabs` | 列出当前清单；持有 leaseId 且少于四个 tab 时以 `action:new,count:1` 新建一页 |
 | `chatgpt_new_chat` | 在指定的同一个 tab 点击“新聊天”，确认空白输入框；串行生图先保存上一张原图再调用 |
 | `chatgpt_status` | 查询模型、活动、连接、新鲜度、任务；`refresh:true` 并行探测 |
 | `chatgpt_models` | 读取菜单勾选的模型名称和当前推理强度；必要时关闭没有草稿的图片查看器 |
@@ -102,9 +105,19 @@ MCP 返回 structuredContent JSON，并附带相同内容的文本。状态字�
 
 已查询过的正文和图片信息会缓存。原页面离开或断线后，可返回 `resultSource:cache` 及该份内容的 `observedAt`、`complete`，并用 `resultError` 说明为何不能实时读取；未产生或从未缓存过的回答可能返回 `result:null`，不会拿其他回答代替。缓存不是已下载原图，原图保存仍以 `verifiedDownloads` 为准。
 
-## 逐张生图与并行流程
+## 任务占用与提交节奏
 
-状态观察、`status`（含 `refresh:true`）及默认 `result` 只读取已有页面，不刷新会话、不主动加载图片。需要获取后台 lazy 图片时，在回答 completed 后明确调用一次 `result({runId,loadImages:true})`，再间隔 10–20 秒读取默认 result，最多检查 3 次；`eager/pending` 不重复启动加载。哈希读取及原图分块传输共用页面内字节缓存，最多 4 个资源、64 MiB、5 分钟，避免每个 512 KiB 分块重新请求完整图片。
+服务端 0.2.0 将同一 Chrome profile 的任务统一排队，每项任务绑定一个 tab，锁覆盖新聊天、模型选择、提交、结果保存和归档。先用唯一 taskId 调用 `chatgpt_task({action:"acquire",profileId,taskId})`，state:active 时保存 leaseId 并传给每次页面动作。state:queued 时默认每 20 秒重新申请，初次检查后最多 5 次；第 5 次仍不可用返回 timed_out，提前取消使用 cancel。无凭据的旧客户端被拒绝；CLI 同样强制检查。详见 [任务协议](skill/references/task-leases.md)。
+
+默认两次提交至少相隔 120 秒，回答完成后至少再留 30 秒。服务端在新聊天、打开模型菜单和发送之前检查；PROFILE_COOLDOWN 返回 retryAfterMs，尚未下发页面命令，也未为下一次消息创建 run。不同 tab 和不同客户端共享此节奏，重复原 requestId 的查询仍保持幂等。参数 scheduling.minSubmissionIntervalMs / scheduling.postCompletionCooldownMs 可在本机配置中调整并重启服务；这些是本地保护间隔，不是网站公布的限额。
+
+completed 仅表示回答结束，任务占用仍保留；整批必要结果保存、归档与 tab 清理完成后，以 `task({action:"release",profileId,leaseId,resultsSaved:true})` 释放。占用、队列和发送时间持久化，进程重启不会绕过限制；过期只清理无人继续等待的队列项，不自动抢占 active 任务。新任务不会在后台自动发送，普通 status/result/wait 不需要 leaseId。用户明确取消时可以 abandon 自己的占用，保留网页和未确认 run 的原状态。
+
+旧 MCP schema 缺少新工具或 leaseId 参数时，在子项目目录用同一服务的 `node src/cli.mjs task --input <UTF-8 JSON 文件>` 及相应动作方法操作，不需重新加载 Chrome 扩展。扩展仍为 0.1.2 / adapter 42 / content 5，服务及 MCP 为 0.2.0。
+
+## 逐张生成与结果保存
+
+状态观察、`status`（含 `refresh:true`）及默认 `result` 只读取已有页面，不刷新会话、不主动加载图片。需要获取后台 lazy 图片时，在回答 completed 后明确调用一次 `result({runId,loadImages:true,leaseId})`，再间隔 10–20 秒读取默认 result，最多检查 3 次；`eager/pending` 不重复启动加载。哈希读取及原图分块传输共用页面内字节缓存，最多 4 个资源、64 MiB、5 分钟，避免每个 512 KiB 分块重新请求完整图片。
 
 网页显示“请求过于频繁／暂时限制访问对话记录”时，状态返回 `attentionType:rate_limit`。同一 Chrome profile 的所有 tab 共享 `accessPause`。暂停不会因 5 分钟到期或弹窗消失自动解除，始终返回 `resumeRequired:true`。只有用户明确要求恢复／再试一次时，才在本地退避已结束、页面观测新鲜且没有限制提示后调用 `chatgpt_access({action:"resume",profileId})`（CLI 方法为 access）。`resumed:true` 只解除本地暂停，`websiteRecoveryVerified:false` 表明网站恢复仍未经验证，不自动重试原请求。新聊天、发送、模型操作、图片加载、哈希、下载和恢复均暂停；默认正文及状态仍可查询，wait 立即返回。已完成回答保留 completed，原 runId/requestId 和草稿保留。用户报告而页面尚未识别的限制可用 access 的 pause 操作记录。
 
@@ -114,18 +127,17 @@ MCP 返回 structuredContent JSON，并附带相同内容的文本。状态字�
 
 Skill 按目标 Chrome profile 内全部当前 ChatGPT tab 计数，跨浏览器窗口合计，包含未上报和休眠 tab，排除已关闭历史及其他网站。数量大于等于 4 个时只复用空闲页；没有空闲页就每等待 20 秒检查一次，初次检查后最多轮询 5 次（约 100 秒）。第 5 次检查后仍达到 4 个且无空闲页则中断任务并汇报，不继续开 tab。小于 4 个时优先复用本任务已有空闲页，没有才逐个新建，每次新建前重新检查数量；并行任务也不能批量越过阈值。
 
-可复用页面须连接和状态新鲜、idle、无草稿及未确认生成、必要结果已保存，且未被其它任务占用。用 `chatgpt_new_chat({tabKey})` 在同一 tab 新建聊天，检查 `confirmed:true`，重新确认模型再提交。临时展开的侧栏会恢复折叠；用户原先展开的侧栏保持原状，`sidebarRestored:false` 表示未恢复。
+可复用页面须连接和状态新鲜、idle、无草稿及未确认生成、必要结果已保存，且未被其它任务占用。用 `chatgpt_new_chat({tabKey,leaseId})` 在同一 tab 新建聊天，检查 `confirmed:true`，重新确认模型再提交。临时展开的侧栏会恢复折叠；用户原先展开的侧栏保持原状，`sidebarRestored:false` 表示未恢复。
 
-记录每个 tab 的 openedByThisTask 和完整身份；新建聊天不会改变 tab 的来源。整个任务及所需保存／归档完成后，关闭本任务新建的 tab，复用的 tab 保留；多图任务中间仍复用同一页。关闭前核对身份、草稿和活动状态，按实际工具能力关闭并验证；当前 MCP 没有关闭接口，Skill 使用可用的浏览器 tab 关闭能力。工具不可用或关闭失败时汇报遗留页面。这些是 Skill 编排规则，不是对 MCP 接口新增强制配额或关闭 API。
+记录每个 tab 的 openedByThisTask 和完整身份；新建聊天不会改变 tab 的来源。整个任务及所需保存／归档完成后，关闭本任务新建的 tab，复用的 tab 保留；多图任务中间仍复用同一页。关闭前核对身份、草稿和活动状态，按实际工具能力关闭并验证；当前 MCP 没有关闭接口，Skill 使用可用的浏览器 tab 关闭能力。工具不可用或关闭失败时汇报遗留页面。服务端也强制执行新建前的四个 tab 阈值与每任务单页占用；关闭仍使用实际可用的浏览器工具，本次没有新增关闭 API。
 
-仅在用户明确要求并行时采用以下三 tab 流程：
+同一 profile 的并行需求进入服务端队列，实际串行执行。整批任务顺序如下：
 
-1. 获取 profile，按上述 4 个 tab 阈值及等待规则逐个分配所需页面，复用或新建聊天，等待空输入框与新鲜 idle 状态，记录各自 tabKey 及 openedByThisTask。
-2. 每页读取 models，选择实际菜单标签并检查 confirmed；把读回的精确 model.label 用于 send.expectedModel。
-3. 为三个任务分别固定 requestId，分别提交，不等待前一个生成完成。
-4. 用一次 status 查看全部任务；需要新观测时 refresh:true，各 tab 最多等 2 秒且并行执行；等待变化可用 wait。
-5. 每个 run 完成后调用 result，检查正文及图片状态，有实际可下载图片时再调用 download。同一 profile 的下载串行处理。
-6. 全部任务及归档完成后关闭本任务新建的 tab，保留复用的 tab，核验关闭结果。
+1. 申请任务占用，取得 leaseId 后按四个 tab 阈值分配一页，记录 openedByThisTask。
+2. 持有 leaseId，在同一 tab 新建聊天、确认模型、以固定 requestId 提交。
+3. 用 status/wait 被动等待回答结束，再用默认 result 检查正文和图片。
+4. 有需要的已加载图片时，持有 leaseId 下载并验证原图；在本地冷却结束后才新建下一聊天。
+5. 整批结果保存和归档完成后关闭本任务新建的 tab，复用的保留；最后显式 release。
 
 `submission_unknown` 表示网页是否接受尚未确认。先查询或用**相同 ID、相同参数**重试，不能换 ID 重发。重复请求返回 existing:true 和原 runId。已有草稿不会被覆盖。
 
@@ -139,7 +151,7 @@ Skill 按目标 Chrome profile 内全部当前 ChatGPT tab 计数，跨浏览器
 
 默认在当前 Windows 用户的 Downloads 文件夹检查近期、大小匹配的候选图片。Chrome 使用其他目录时，可在本机 runtime/connection.json 增加 downloadDirectory，保留其他字段并重启本项目服务。开启“每次询问保存位置”时需完成保存对话框。未匹配返回 verification_pending；重查相同 run 不重复点击。
 
-确认没有待处理的保存对话框，且网页保存仍未产生文件时，可调用 `chatgpt_recover_images({runId})`；工具未加载时用同一服务 CLI 的 `recover_images --input <UTF-8参数文件>`。它只传输对应回答中已加载、同源图片的确切字节，每块不超过 512 KiB，写盘前核对浏览器 SHA-256；记录 `sourceTransport:bridge_byte_transfer`，不冒充 Chrome 下载事件。当前已实测双图结果的原图恢复。明确的浏览器策略拒绝不适用此恢复方式。已验证原图会先重新核对本地字节，重复调用 download 可复用结果。
+确认没有待处理的保存对话框，且网页保存仍未产生文件时，可调用 `chatgpt_recover_images({runId,leaseId})`；工具未加载时用同一服务 CLI 的 `recover_images --input <UTF-8参数文件>`。它只传输对应回答中已加载、同源图片的确切字节，每块不超过 512 KiB，写盘前核对浏览器 SHA-256；记录 `sourceTransport:bridge_byte_transfer`，不冒充 Chrome 下载事件。当前已实测双图结果的原图恢复。明确的浏览器策略拒绝不适用此恢复方式。已验证原图会先重新核对本地字节，重复调用 download 可复用结果。
 
 ## 安装与更新
 

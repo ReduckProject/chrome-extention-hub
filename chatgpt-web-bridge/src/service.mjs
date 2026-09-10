@@ -5,6 +5,7 @@ import { WebSocketServer } from 'ws';
 import { StateStore } from './store.mjs';
 import { tokenEquals } from './config.mjs';
 import { matchDownloadedFiles, saveTransferredOriginal, verifySavedOriginals } from './downloads.mjs';
+import { TaskScheduler, managedAction, policyError } from './scheduler.mjs';
 
 function requireCompleteImageAssets(run, result) {
   const images = result.images ?? run.images ?? [];
@@ -19,6 +20,7 @@ export class BridgeService {
   constructor({ config, stateFile = null }) {
     this.config = config;
     this.store = new StateStore({ file: stateFile });
+    this.scheduler = new TaskScheduler(this.store, config.scheduling);
     this.clients = new Map();
     this.browserStates = new Map();
     this.pending = new Map();
@@ -194,7 +196,8 @@ export class BridgeService {
         currentTabIds: browser?.tabIds, observedTabCount: current.length,
         freshTabCount: current.filter(tab => !tab.freshness.stale).length,
         unobservedTabIds: browser?.tabIds?.filter(id => !current.some(tab => tab.tabId === id)) ?? null,
-        observationErrors: [...(browser?.errors || [])].map(([tabId, error]) => ({ tabId, error })) };
+        observationErrors: [...(browser?.errors || [])].map(([tabId, error]) => ({ tabId, error })),
+        scheduling: this.scheduler.view(profileId) };
     });
   }
 
@@ -240,7 +243,7 @@ export class BridgeService {
   async dispatch(method, params = {}, caller = null) {
     const tracked = ['send', 'new_chat', 'models', 'select_model', 'download', 'recover_images', 'stop'].includes(method) ||
       (method === 'tabs' && params.action === 'new') || (method === 'result' && (params.includeAssets || params.loadImages)) ||
-      (method === 'access' && ['pause', 'resume'].includes(params.action));
+      (method === 'access' && ['pause', 'resume'].includes(params.action)) || (method === 'task' && params.action !== 'status');
     if (!tracked) return this.perform(method, params);
     const run = this.store.data.runs[params.runId];
     const tab = this.store.data.tabs[params.tabKey || run?.tabKey];
@@ -260,7 +263,7 @@ export class BridgeService {
         operation.error = result.resultError?.slice(0, 500);
         return result;
       } catch (error) {
-        operation.outcome = 'error'; operation.error = error.message.slice(0, 500); throw error;
+        operation.outcome = 'error'; operation.error = error.message.slice(0, 500); operation.code = error.code; throw error;
       } finally {
         operation.finishedAt = Date.now(); this.store.changed(); await this.store.save();
       }
@@ -268,8 +271,65 @@ export class BridgeService {
   }
 
   async perform(method, params = {}) {
+    const run = this.store.data.runs[params.runId];
+    const tabKey = params.tabKey || run?.tabKey;
+    const tab = this.store.data.tabs[tabKey];
+    const profileId = tab?.profileId || params.profileId || (this.clients.size === 1 ? [...this.clients.keys()][0] : null);
+    if (method === 'task') {
+      if (!profileId) throw new Error('Choose a profileId explicitly');
+      return this.withLock(`workflow:${profileId}`, async () => {
+        const result = this.scheduler.task(profileId, params);
+        if (params.action && params.action !== 'status') { this.store.changed(); await this.store.save(); }
+        return result;
+      });
+    }
+    // Re-reading an existing request never clicks again, even without a lease
+    // or during a pause. reserve still verifies the complete request digest.
+    const existingSend = method === 'send' && this.store.data.requests[params.requestId];
+    if (!managedAction(method, params) || existingSend) return this.execute(method, params);
+    return this.withLock(`workflow:${profileId}`, async () => {
+      if (method === 'send' && this.store.data.requests[params.requestId]) return this.execute(method, params);
+      let task;
+      try {
+        if (!profileId) throw new Error('Choose a connected profileId or a known tab/run');
+        if (method !== 'stop') this.store.assertAccessAllowed(profileId);
+        task = this.scheduler.authorize(profileId, method, params, tabKey);
+        if (method === 'tabs') {
+          const browser = this.browserStates.get(profileId);
+          if (!browser?.tabIds) throw policyError('INVENTORY_UNKNOWN', 'Current Chrome inventory is unknown; do not create a tab');
+          if ((params.count ?? 1) !== 1) throw new Error('A task may create one tab and then reuse it; count must be 1');
+          if (browser.tabIds.length >= 4) throw policyError('TAB_REUSE_REQUIRED',
+            'At least four ChatGPT tabs are open; reuse an idle tab. Poll every 20 seconds at most five times, then cancel/report.', { currentTabCount: browser.tabIds.length });
+          task.creationPending = true; task.newTabBaseline = [...browser.tabIds];
+        }
+        const operation = this.operationContext.getStore();
+        if (operation) operation.taskId = task.taskId;
+        this.store.changed(); await this.store.save();
+      } catch (error) {
+        if (method !== 'result') throw error;
+        const cached = run?.responseCache;
+        return { run: this.store.runView(params.runId), result: cached || null,
+          resultSource: cached ? 'cache' : null, resultError: error.message, code: error.code, ...error.details };
+      }
+      const result = await this.execute(method, params, task);
+      if (method === 'tabs') {
+        const created = result.tabs?.[0];
+        if (!Number.isInteger(created?.tabId)) throw policyError('TAB_CREATION_UNCERTAIN', 'Tab creation returned no confirmed tab; inspect inventory before retrying');
+        const browser = this.browserStates.get(profileId);
+        // Update the local inventory immediately, before the first snapshot.
+        if (!browser.tabIds.includes(created.tabId)) browser.tabIds.push(created.tabId);
+        this.scheduler.bind(task, `${profileId}:${browser.browserSessionId}:${created.tabId}`);
+        task.creationPending = false; task.openedByThisTask = true;
+        result.task = this.scheduler.viewTask(task);
+        this.store.changed(); await this.store.save();
+      }
+      return result;
+    });
+  }
+
+  async execute(method, params = {}, task = null) {
     switch (method) {
-      case 'health': return { ok: true, service: 'chatgpt-web-bridge', protocol: 1, version: '0.1.0', connectedProfiles: [...this.clients.keys()], connections: this.connectionViews(), revision: this.store.data.revision };
+      case 'health': return { ok: true, service: 'chatgpt-web-bridge', protocol: 1, version: '0.2.0', schedulerVersion: 1, connectedProfiles: [...this.clients.keys()], connections: this.connectionViews(), revision: this.store.data.revision };
       case 'refresh_observers': {
         if (this.pending.size) throw new Error('Wait for outstanding page commands before updating observers');
         const profiles = params.profileId ? [params.profileId] : [...this.clients.keys()];
@@ -373,6 +433,8 @@ export class BridgeService {
       case 'send': return this.withLock(params.tabKey, async () => {
         const { run, existing } = await this.store.reserve(params);
         if (existing) return { existing: true, run: this.store.runView(run.id) };
+        this.scheduler.submitted(task, run);
+        this.store.changed(); await this.store.save();
         const tab = this.store.data.tabs[run.tabKey];
         try {
           const result = await this.command(tab.profileId, 'submit', { tabId: tab.tabId, documentId: tab.documentId, prompt: run.prompt, runId: run.id, expectedModel: params.expectedModel || run.selectedAtSend?.label }, 7000, run.id);
@@ -510,6 +572,6 @@ export class BridgeService {
         ? { reportedPid: client.pid, entry: typeof client.entry === 'string' ? client.entry.slice(0, 80) : null } : null;
       const result = await this.dispatch(method, params, caller);
       respond(200, { result });
-    } catch (error) { respond(400, { error: error.message }); }
+    } catch (error) { respond(400, { error: error.message, code: error.code, details: error.details }); }
   }
 }

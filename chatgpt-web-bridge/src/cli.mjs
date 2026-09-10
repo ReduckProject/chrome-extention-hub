@@ -11,4 +11,4 @@ catch { console.error('Arguments must be one JSON object'); process.exit(2); }
 try {
   await ensureDaemon();
   console.log(JSON.stringify(await call(method, params), null, 2));
-} catch (error) { console.error(error.message); process.exitCode = 1; }
+} catch (error) { console.error(JSON.stringify({ error: error.message, code: error.code, ...error.details })); process.exitCode = 1; }
