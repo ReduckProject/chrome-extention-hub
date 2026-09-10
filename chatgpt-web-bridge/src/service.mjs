@@ -20,7 +20,7 @@ export class BridgeService {
   constructor({ config, stateFile = null }) {
     this.config = config;
     this.store = new StateStore({ file: stateFile });
-    this.scheduler = new TaskScheduler(this.store, config.scheduling);
+    this.scheduler = new TaskScheduler(this.store, config.scheduling, id => this.browserStates.get(id)?.tabIds ?? null);
     this.clients = new Map();
     this.browserStates = new Map();
     this.pending = new Map();
@@ -277,34 +277,39 @@ export class BridgeService {
     const profileId = tab?.profileId || params.profileId || (this.clients.size === 1 ? [...this.clients.keys()][0] : null);
     if (method === 'task') {
       if (!profileId) throw new Error('Choose a profileId explicitly');
-      return this.withLock(`workflow:${profileId}`, async () => {
+      const update = () => this.withLock(`allocation:${profileId}`, async () => {
         const result = this.scheduler.task(profileId, params);
         if (params.action && params.action !== 'status') { this.store.changed(); await this.store.save(); }
         return result;
       });
+      // Finishing a lease waits only for that task's in-flight page action.
+      return params.leaseId ? this.withLock(`task:${params.leaseId}`, update) : update();
     }
     // Re-reading an existing request never clicks again, even without a lease
     // or during a pause. reserve still verifies the complete request digest.
     const existingSend = method === 'send' && this.store.data.requests[params.requestId];
     if (!managedAction(method, params) || existingSend) return this.execute(method, params);
-    return this.withLock(`workflow:${profileId}`, async () => {
+    return this.withLock(`task:${params.leaseId}`, async () => {
       if (method === 'send' && this.store.data.requests[params.requestId]) return this.execute(method, params);
       let task;
       try {
         if (!profileId) throw new Error('Choose a connected profileId or a known tab/run');
         if (method !== 'stop') this.store.assertAccessAllowed(profileId);
-        task = this.scheduler.authorize(profileId, method, params, tabKey);
-        if (method === 'tabs') {
-          const browser = this.browserStates.get(profileId);
-          if (!browser?.tabIds) throw policyError('INVENTORY_UNKNOWN', 'Current Chrome inventory is unknown; do not create a tab');
-          if ((params.count ?? 1) !== 1) throw new Error('A task may create one tab and then reuse it; count must be 1');
-          if (browser.tabIds.length >= 4) throw policyError('TAB_REUSE_REQUIRED',
-            'At least four ChatGPT tabs are open; reuse an idle tab. Poll every 20 seconds at most five times, then cancel/report.', { currentTabCount: browser.tabIds.length });
-          task.creationPending = true; task.newTabBaseline = [...browser.tabIds];
-        }
-        const operation = this.operationContext.getStore();
-        if (operation) operation.taskId = task.taskId;
-        this.store.changed(); await this.store.save();
+        await this.withLock(`allocation:${profileId}`, async () => {
+          task = this.scheduler.authorize(profileId, method, params, tabKey);
+          if (method === 'tabs') {
+            const browser = this.browserStates.get(profileId);
+            if (!browser?.tabIds) throw policyError('INVENTORY_UNKNOWN', 'Current Chrome inventory is unknown; do not create a tab');
+            if ((params.count ?? 1) !== 1) throw new Error('A task may create one tab and then reuse it; count must be 1');
+            const capacity = this.scheduler.capacity(profileId, task.taskId);
+            if (capacity.allocatedTabCount >= 4) throw policyError('TAB_REUSE_REQUIRED',
+              'Four ChatGPT tabs are open or reserved; bind an idle tab instead of opening another.', capacity);
+            task.creationPending = true; task.newTabBaseline = [...browser.tabIds];
+          }
+          const operation = this.operationContext.getStore();
+          if (operation) operation.taskId = task.taskId;
+          this.store.changed(); await this.store.save();
+        });
       } catch (error) {
         if (method !== 'result') throw error;
         const cached = run?.responseCache;
@@ -313,15 +318,18 @@ export class BridgeService {
       }
       const result = await this.execute(method, params, task);
       if (method === 'tabs') {
-        const created = result.tabs?.[0];
-        if (!Number.isInteger(created?.tabId)) throw policyError('TAB_CREATION_UNCERTAIN', 'Tab creation returned no confirmed tab; inspect inventory before retrying');
-        const browser = this.browserStates.get(profileId);
-        // Update the local inventory immediately, before the first snapshot.
-        if (!browser.tabIds.includes(created.tabId)) browser.tabIds.push(created.tabId);
-        this.scheduler.bind(task, `${profileId}:${browser.browserSessionId}:${created.tabId}`);
-        task.creationPending = false; task.openedByThisTask = true;
-        result.task = this.scheduler.viewTask(task);
-        this.store.changed(); await this.store.save();
+        await this.withLock(`allocation:${profileId}`, async () => {
+          const created = result.tabs?.[0];
+          if (!Number.isInteger(created?.tabId)) throw policyError('TAB_CREATION_UNCERTAIN', 'Tab creation returned no confirmed tab; inspect inventory before retrying');
+          const browser = this.browserStates.get(profileId);
+          // Update the local inventory immediately, before the first snapshot.
+          if (!browser?.tabIds || created.browserSessionId !== browser.browserSessionId) throw policyError('TAB_CREATION_UNCERTAIN', 'Browser session changed during tab creation; inspect inventory');
+          if (!browser.tabIds.includes(created.tabId)) browser.tabIds.push(created.tabId);
+          this.scheduler.bind(task, `${profileId}:${browser.browserSessionId}:${created.tabId}`);
+          task.creationPending = false; task.openedByThisTask = true;
+          result.task = this.scheduler.viewTask(task);
+          this.store.changed(); await this.store.save();
+        });
       }
       return result;
     });
@@ -329,7 +337,7 @@ export class BridgeService {
 
   async execute(method, params = {}, task = null) {
     switch (method) {
-      case 'health': return { ok: true, service: 'chatgpt-web-bridge', protocol: 1, version: '0.2.0', schedulerVersion: 1, connectedProfiles: [...this.clients.keys()], connections: this.connectionViews(), revision: this.store.data.revision };
+      case 'health': return { ok: true, service: 'chatgpt-web-bridge', protocol: 1, version: '0.2.1', schedulerVersion: 2, connectedProfiles: [...this.clients.keys()], connections: this.connectionViews(), revision: this.store.data.revision };
       case 'refresh_observers': {
         if (this.pending.size) throw new Error('Wait for outstanding page commands before updating observers');
         const profiles = params.profileId ? [params.profileId] : [...this.clients.keys()];
@@ -431,10 +439,17 @@ export class BridgeService {
         });
       }
       case 'send': return this.withLock(params.tabKey, async () => {
-        const { run, existing } = await this.store.reserve(params);
+        const profileId = this.store.data.tabs[params.tabKey]?.profileId;
+        const { run, existing } = await this.withLock(`allocation:${profileId}`, async () => {
+          if (!this.store.data.requests[params.requestId]) this.scheduler.authorize(profileId, 'send', params, params.tabKey);
+          const reserved = await this.store.reserve(params);
+          if (!reserved.existing) {
+            this.scheduler.submitted(task, reserved.run);
+            this.store.changed(); await this.store.save();
+          }
+          return reserved;
+        });
         if (existing) return { existing: true, run: this.store.runView(run.id) };
-        this.scheduler.submitted(task, run);
-        this.store.changed(); await this.store.save();
         const tab = this.store.data.tabs[run.tabKey];
         try {
           const result = await this.command(tab.profileId, 'submit', { tabId: tab.tabId, documentId: tab.documentId, prompt: run.prompt, runId: run.id, expectedModel: params.expectedModel || run.selectedAtSend?.label }, 7000, run.id);

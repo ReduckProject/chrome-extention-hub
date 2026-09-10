@@ -4,7 +4,7 @@
 
 五个 ChatGPT tab、三个已完成任务的实测：MCP 全部状态缓存查询中位 **2.78 ms**，主动刷新中位 **18.95 ms**。这是本机短时样本。详见 [验收记录](ACCEPTANCE.md) 和 [安装与开发记录](WORKLOG.md)。
 
-0.2.0 起，当前自动任务改为同一 Chrome profile 串行执行：先申请任务占用，整批复用一个 tab，保存和归档后显式释放。上面的并发数据是历史验收，不代表当前调度策略。
+0.2.1 起，每项任务独占并串行复用一个 tab，不同任务可以在同一 Chrome profile 的不同 tab 并行。保存和归档后显式释放；达到 4 个已打开或已预留 tab 且无空闲页才等待。
 
 ## 工作方式
 
@@ -48,7 +48,7 @@ node src/cli.mjs status
 
 | MCP 工具 | 作用 |
 |---|---|
-| `chatgpt_task` | 同 profile 的任务占用与 FIFO 队列；acquire 返回 leaseId，保存／归档后 release |
+| `chatgpt_task` | 单 tab 任务占用；有容量即可并行，满额无空闲才等待；保存／归档后 release |
 | `chatgpt_tabs` | 列出当前清单；持有 leaseId 且少于四个 tab 时以 `action:new,count:1` 新建一页 |
 | `chatgpt_new_chat` | 在指定的同一个 tab 点击“新聊天”，确认空白输入框；串行生图先保存上一张原图再调用 |
 | `chatgpt_status` | 查询模型、活动、连接、新鲜度、任务；`refresh:true` 并行探测 |
@@ -107,13 +107,13 @@ MCP 返回 structuredContent JSON，并附带相同内容的文本。状态字�
 
 ## 任务占用与提交节奏
 
-服务端 0.2.0 将同一 Chrome profile 的任务统一排队，每项任务绑定一个 tab，锁覆盖新聊天、模型选择、提交、结果保存和归档。先用唯一 taskId 调用 `chatgpt_task({action:"acquire",profileId,taskId})`，state:active 时保存 leaseId 并传给每次页面动作。state:queued 时默认每 20 秒重新申请，初次检查后最多 5 次；第 5 次仍不可用返回 timed_out，提前取消使用 cancel。无凭据的旧客户端被拒绝；CLI 同样强制检查。详见 [任务协议](skill/references/task-leases.md)。
+服务端 0.2.1 为每项任务独占一个 tab，锁覆盖该页的新聊天、模型选择、提交、结果保存和归档。不同 tab 的任务可并行。用唯一 taskId 调用 `chatgpt_task({action:"acquire",profileId,taskId})`，state:active 时保存 leaseId 并传给每次页面动作。服务端返回已认领的 tabKey 或 allocation:new_tab_slot；少于 4 个已打开或已预留页面时可分配新页名额，达到 4 个时复用空闲页，无空闲页才 queued，每 20 秒再检查、初次之后最多 5 次，仍不可用返回 timed_out。无凭据的旧客户端被拒绝，CLI 同样检查。详见 [任务协议](skill/references/task-leases.md)。
 
-默认两次提交至少相隔 10 秒，回答完成后再留 10 秒；按两个截止时间的较晚者计算，不叠加为 20 秒。服务端在新聊天、打开模型菜单和发送之前检查；PROFILE_COOLDOWN 返回 retryAfterMs，尚未下发页面命令，也未为下一次消息创建 run。不同 tab 和不同客户端共享此节奏，重复原 requestId 的查询仍保持幂等。参数 scheduling.minSubmissionIntervalMs / scheduling.postCompletionCooldownMs 可在本机配置中调整并重启服务；这些是本地保护间隔，不是网站公布的限额。
+同一 profile 两次发送至少相隔 10 秒，不等待其它 tab 的回答结束。某 tab 回答完成后，该页再留 10 秒才能新聊天、操作模型或再次发送；其它 tab 的新聊天和模型操作可继续。两个截止时间取较晚者，不叠加为 20 秒。PROFILE_COOLDOWN 返回 retryAfterMs，未下发页面命令或创建下一条 run；原 requestId 重查仍幂等。scheduling.minSubmissionIntervalMs / scheduling.postCompletionCooldownMs 是这两个本地配置项，不表示网站公布的限额。
 
 completed 仅表示回答结束，任务占用仍保留；整批必要结果保存、归档与 tab 清理完成后，以 `task({action:"release",profileId,leaseId,resultsSaved:true})` 释放。占用、队列和发送时间持久化，进程重启不会绕过限制；过期只清理无人继续等待的队列项，不自动抢占 active 任务。新任务不会在后台自动发送，普通 status/result/wait 不需要 leaseId。用户明确取消时可以 abandon 自己的占用，保留网页和未确认 run 的原状态。
 
-旧 MCP schema 缺少新工具或 leaseId 参数时，在子项目目录用同一服务的 `node src/cli.mjs task --input <UTF-8 JSON 文件>` 及相应动作方法操作，不需重新加载 Chrome 扩展。扩展仍为 0.1.2 / adapter 42 / content 5，服务及 MCP 为 0.2.0。
+旧 MCP schema 缺少新工具或 leaseId 参数时，在子项目目录用同一服务的 `node src/cli.mjs task --input <UTF-8 JSON 文件>` 及相应动作方法操作，不需重新加载 Chrome 扩展。扩展仍为 0.1.2 / adapter 42 / content 5，服务及 MCP 为 0.2.1（schedulerVersion:2）。
 
 ## 逐张生成与结果保存
 
@@ -131,7 +131,7 @@ Skill 按目标 Chrome profile 内全部当前 ChatGPT tab 计数，跨浏览器
 
 记录每个 tab 的 openedByThisTask 和完整身份；新建聊天不会改变 tab 的来源。整个任务及所需保存／归档完成后，关闭本任务新建的 tab，复用的 tab 保留；多图任务中间仍复用同一页。关闭前核对身份、草稿和活动状态，按实际工具能力关闭并验证；当前 MCP 没有关闭接口，Skill 使用可用的浏览器 tab 关闭能力。工具不可用或关闭失败时汇报遗留页面。服务端也强制执行新建前的四个 tab 阈值与每任务单页占用；关闭仍使用实际可用的浏览器工具，本次没有新增关闭 API。
 
-同一 profile 的并行需求进入服务端队列，实际串行执行。整批任务顺序如下：
+不同任务在不同 tab 并行，每项批量任务内部复用一页。connections.scheduling 的 lockScope:tab 和 activeTasks 明示占用范围与页面归属，queue 只记录等待空闲页的任务。整批任务顺序如下：
 
 1. 申请任务占用，取得 leaseId 后按四个 tab 阈值分配一页，记录 openedByThisTask。
 2. 持有 leaseId，在同一 tab 新建聊天、确认模型、以固定 requestId 提交。

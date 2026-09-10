@@ -12,8 +12,9 @@ export function policyError(code, message, details = {}) {
 }
 
 export class TaskScheduler {
-  constructor(store, options = {}) {
+  constructor(store, options = {}, inventory = () => null) {
     this.store = store;
+    this.inventory = inventory;
     this.policy = { minSubmissionIntervalMs: 10000, postCompletionCooldownMs: 10000,
       queuePollMs: 20000, queueExpiryMs: 120000, maxQueuePolls: 5, ...options };
     for (const [key, value] of Object.entries(this.policy)) {
@@ -21,24 +22,66 @@ export class TaskScheduler {
     }
   }
 
-  get data() { return this.store.data.scheduling ||= { profiles: {}, tasks: {} }; }
+  get data() {
+    const data = this.store.data.scheduling ||= { profiles: {}, tasks: {} };
+    if (data.version !== 2) {
+      // Preserve existing task IDs, leases and pending creation across upgrade.
+      for (const profile of Object.values(data.profiles)) delete profile.activeTaskId;
+      data.version = 2;
+    }
+    return data;
+  }
   profile(id) {
-    return this.data.profiles[id] ||= { activeTaskId: null, queue: [], lastSubmittedAt:
+    return this.data.profiles[id] ||= { queue: [], lastSubmittedAt:
       Object.values(this.store.data.runs).filter(r => r.profileId === id).reduce((latest, r) => Math.max(latest, r.createdAt), 0) || null };
   }
+  activeTasks(profileId) { return Object.values(this.data.tasks).filter(t => t.profileId === profileId && t.state === 'active'); }
   currentTabs(profileId) { return this.store.list().filter(t => t.profileId === profileId && !t.closed && t.connection === 'connected'); }
-  busy(profileId) {
-    const tabs = this.currentTabs(profileId);
-    const keys = new Set(tabs.map(t => t.key));
-    return tabs.some(t => ['generating', 'thinking', 'finalizing', 'awaiting_user'].includes(t.lastKnownActivity)) ||
-      Object.values(this.store.data.runs).some(r => r.profileId === profileId && keys.has(r.tabKey) &&
-        r.documentIdAtSend === this.store.data.tabs[r.tabKey]?.documentId && !terminal.has(r.phase));
+  owner(profileId, tabKey, exceptTaskId) {
+    const tab = this.store.data.tabs[tabKey];
+    return this.activeTasks(profileId).find(t => t.taskId !== exceptTaskId && (t.tabKey === tabKey ||
+      (tab?.conversationId && this.store.data.tabs[t.tabKey]?.conversationId === tab.conversationId)));
   }
-  cooldown(profileId) {
+  pendingOwner(profileId, tabId, exceptTaskId) {
+    return this.activeTasks(profileId).find(t => t.taskId !== exceptTaskId && t.creationPending && !t.newTabBaseline.includes(tabId));
+  }
+  busy(tabKey) {
+    const tab = this.store.data.tabs[tabKey];
+    return !!tab && (['generating', 'thinking', 'finalizing', 'awaiting_user'].includes(tab.activity) ||
+      Object.values(this.store.data.runs).some(r => !terminal.has(r.phase) &&
+        (r.tabKey === tabKey || (tab.conversationId && r.profileId === tab.profileId && r.conversationId === tab.conversationId))));
+  }
+  reusable(tab, taskId) {
+    return !tab.freshness.stale && tab.activity === 'idle' && tab.composerReady && !tab.draftLength &&
+      !this.busy(tab.key) && !this.owner(tab.profileId, tab.key, taskId) &&
+      !this.pendingOwner(tab.profileId, tab.tabId);
+  }
+  capacity(profileId, exceptTaskId) {
+    const ids = this.inventory(profileId);
+    const currentTabCount = ids ? new Set(ids).size : null;
+    const reservedTabCount = this.activeTasks(profileId).filter(t => !t.tabKey && t.taskId !== exceptTaskId).length;
+    return { currentTabCount, reservedTabCount, reuseThreshold: 4,
+      allocatedTabCount: currentTabCount === null ? null : currentTabCount + reservedTabCount };
+  }
+  allocation(profileId, taskId, tabKey) {
+    const tabs = this.currentTabs(profileId);
+    if (tabKey) {
+      const tab = tabs.find(t => t.key === tabKey);
+      if (!tab || !this.reusable(tab, taskId)) throw policyError('TAB_UNAVAILABLE', 'Requested tab is occupied, stale or not idle; inspect other available tabs');
+      return { tabKey };
+    }
+    const capacity = this.capacity(profileId, taskId);
+    if (capacity.allocatedTabCount !== null && capacity.allocatedTabCount < 4) return { tabKey: null };
+    const idle = tabs.find(t => this.reusable(t, taskId));
+    if (idle) return { tabKey: idle.key };
+    if (capacity.currentTabCount === null) throw policyError('INVENTORY_UNKNOWN', 'Current Chrome inventory is unknown; observe it before allocating a new tab');
+    return null;
+  }
+  cooldown(profileId, tabKey, includeSubmission = true) {
     const last = this.profile(profileId).lastSubmittedAt;
-    const completed = Object.values(this.store.data.runs).filter(r => r.profileId === profileId && r.completedAt)
+    const completed = Object.values(this.store.data.runs).filter(r => r.tabKey === tabKey && r.completedAt)
       .reduce((latest, r) => Math.max(latest, r.completedAt), 0);
-    const retryAt = Math.max(last === null ? 0 : last + this.policy.minSubmissionIntervalMs,
+    const retryAt = Math.max(!includeSubmission || last === null ? 0 : last + this.policy.minSubmissionIntervalMs,
       completed ? completed + this.policy.postCompletionCooldownMs : 0);
     return { retryAt, retryAfterMs: Math.max(0, retryAt - this.store.now()) };
   }
@@ -48,17 +91,20 @@ export class TaskScheduler {
       openedByThisTask: task.openedByThisTask, createdAt: task.createdAt, lastTouchedAt: task.lastTouchedAt,
       overdue: task.state === 'active' && this.store.now() - task.lastTouchedAt > 300000,
       polls: task.polls || 0, nextPollAt: task.nextPollAt,
-      creationPending: !!task.creationPending, ...(includeLease && task.state === 'active' ? { leaseId: task.leaseId } : {}) };
+      creationPending: !!task.creationPending,
+      allocation: task.state === 'active' ? (task.tabKey ? 'tab' : 'new_tab_slot') : null,
+      ...(includeLease && task.state === 'active' ? { leaseId: task.leaseId } : {}) };
   }
   view(profileId) {
     const p = this.profile(profileId);
-    return { profileId, policy: this.policy, activeTask: this.viewTask(this.data.tasks[p.activeTaskId]),
-      queue: p.queue.map(id => this.viewTask(this.data.tasks[id])), ...this.cooldown(profileId) };
+    return { profileId, lockScope: 'tab', policy: this.policy, activeTasks: this.activeTasks(profileId).map(t => this.viewTask(t)),
+      queue: p.queue.map(id => this.viewTask(this.data.tasks[id])), ...this.capacity(profileId), ...this.cooldown(profileId) };
   }
   prune(profileId) {
     const p = this.profile(profileId), now = this.store.now();
     p.queue = p.queue.filter(id => {
       const task = this.data.tasks[id];
+      if (!task || task.state !== 'queued') return false;
       if (now - task.lastTouchedAt <= this.policy.queueExpiryMs) return true;
       task.state = 'expired'; return false;
     });
@@ -84,6 +130,10 @@ export class TaskScheduler {
       this.prune(profileId);
       if (task?.state === 'expired') throw new Error('Queued task expired; report the timeout before starting a new task');
       const initial = !task;
+      // Resolve explicit allocation errors before creating a queue ticket.
+      const allocation = initial || this.store.now() >= task.nextPollAt
+        ? (adopted ? { tabKey: adopted.tabKey } : this.allocation(profileId, taskId, tabKey)) : null;
+      if (adopted && this.owner(profileId, adopted.tabKey, taskId)) throw policyError('TAB_OCCUPIED', 'The legacy run tab is already owned by another task');
       if (!task) {
         task = this.data.tasks[taskId] = { taskId, profileId, state: 'queued', createdAt: this.store.now(),
           lastTouchedAt: this.store.now(), tabKey: null, openedByThisTask: false, polls: 0 };
@@ -92,12 +142,11 @@ export class TaskScheduler {
       if (initial || this.store.now() >= task.nextPollAt) {
         task.lastTouchedAt = this.store.now();
         if (!initial) task.polls++;
-        // An existing legacy run needs an owner before it can be finished or
-        // stopped. It may resolve the busy state that holds the normal queue.
-        if (!p.activeTaskId && (adopted || (p.queue[0] === taskId && !this.busy(profileId)))) {
-          p.queue = p.queue.filter(id => id !== taskId); p.activeTaskId = taskId;
+        if (allocation) {
+          p.queue = p.queue.filter(id => id !== taskId);
           task.state = 'active'; task.leaseId = randomUUID();
-          if (adopted) { this.bind(task, adopted.tabKey); adopted.taskId = taskId; }
+          if (allocation.tabKey) this.bind(task, allocation.tabKey);
+          if (adopted) adopted.taskId = taskId;
         } else if (task.polls >= this.policy.maxQueuePolls) {
           p.queue = p.queue.filter(id => id !== taskId); task.state = 'timed_out';
         }
@@ -105,7 +154,7 @@ export class TaskScheduler {
       }
       return { ...this.viewTask(task, true), position: task.state === 'queued' ? p.queue.indexOf(taskId) + 1 : 0,
         retryAfterMs: task.state === 'queued' ? Math.max(0, task.nextPollAt - this.store.now()) : 0,
-        reason: task.state === 'timed_out' ? 'queue_timeout' : task.state === 'queued' ? (p.activeTaskId ? 'task_occupied' : 'profile_busy') : null,
+        reason: task.state === 'timed_out' ? 'queue_timeout' : task.state === 'queued' ? 'no_idle_tab_at_capacity' : null,
         scheduling: this.view(profileId) };
     }
     if (action === 'cancel') {
@@ -118,9 +167,9 @@ export class TaskScheduler {
     if (action === 'renew') { task.lastTouchedAt = this.store.now(); return this.viewTask(task, true); }
     if (action === 'abandon') {
       if (confirmAbandon !== true) throw new Error('Abandon requires confirmAbandon:true and an explicit user cancellation of this task');
-      task.state = 'abandoned'; task.releasedAt = this.store.now(); p.activeTaskId = null;
+      task.state = 'abandoned'; task.releasedAt = this.store.now();
       return { released: true, abandoned: true, task: this.viewTask(task), scheduling: this.view(profileId),
-        note: 'Run outcomes and drafts are unchanged. Any still-active page generation continues to block new work.' };
+        note: 'Run outcomes and drafts are unchanged. Any still-active page generation blocks reuse of that tab, not other tabs.' };
     }
     if (action === 'bind') {
       const tab = this.store.tabView(tabKey);
@@ -128,9 +177,11 @@ export class TaskScheduler {
       if (task.creationPending) {
         const candidates = this.currentTabs(profileId).filter(t => !task.newTabBaseline.includes(t.tabId));
         if (candidates.length !== 1 || candidates[0].key !== tabKey) throw new Error('New-tab outcome is uncertain; inspect current inventory before binding');
-        task.openedByThisTask = true; task.creationPending = false;
+      } else if (!task.tabKey && !this.reusable(tab, task.taskId)) {
+        throw policyError('TAB_UNAVAILABLE', 'Bind requires an idle unoccupied tab');
       }
       this.bind(task, tabKey);
+      if (task.creationPending) { task.openedByThisTask = true; task.creationPending = false; }
       return this.viewTask(task, true);
     }
     if (action === 'release') {
@@ -141,20 +192,22 @@ export class TaskScheduler {
           (this.store.tabView(task.tabKey).freshness.stale || tab.draftLength || ['generating', 'thinking', 'finalizing', 'awaiting_user'].includes(tab.activity)))) {
         throw policyError('TASK_UNRESOLVED', 'Task has an unresolved generation, draft or tab creation; preserve ownership and inspect it', { runIds: unresolved.map(r => r.id) });
       }
-      task.state = 'released'; task.releasedAt = this.store.now(); p.activeTaskId = null;
+      task.state = 'released'; task.releasedAt = this.store.now();
       return { released: true, task: this.viewTask(task), scheduling: this.view(profileId) };
     }
     throw new Error('Unknown task action');
   }
   requireLease(profileId, leaseId) {
-    const task = this.data.tasks[this.profile(profileId).activeTaskId];
-    if (!leaseId || task?.leaseId !== leaseId) throw policyError('TASK_LEASE_REQUIRED',
+    const task = leaseId && this.activeTasks(profileId).find(t => t.leaseId === leaseId);
+    if (!task) throw policyError('TASK_LEASE_REQUIRED',
       'Acquire your own chatgpt_task lease and pass leaseId to every page action. Older tool schemas must use src/cli.mjs task --input <UTF-8 JSON file> and the same CLI for actions.',
       { scheduling: this.view(profileId) });
     return task;
   }
   bind(task, tabKey) {
     if (task.tabKey && task.tabKey !== tabKey) throw policyError('TASK_TAB_MISMATCH', 'This task owns a different tab; finish and release it before allocating another');
+    const owner = this.owner(task.profileId, tabKey, task.taskId);
+    if (owner) throw policyError('TAB_OCCUPIED', 'This tab or conversation belongs to another task until its results are saved and its lease is released', { taskId: owner.taskId, tabKey });
     task.tabKey = tabKey; task.lastTouchedAt = this.store.now();
   }
   authorize(profileId, method, params, tabKey) {
@@ -162,11 +215,15 @@ export class TaskScheduler {
     if (task.creationPending) throw policyError('TAB_CREATION_UNCERTAIN', 'Inspect inventory and bind the created tab; do not repeat tab creation');
     if (method === 'tabs' && task.tabKey) throw policyError('TASK_TAB_MISMATCH', 'Reuse this task\'s existing tab instead of opening another');
     if (tabKey && task.tabKey && tabKey !== task.tabKey) throw policyError('TASK_TAB_MISMATCH', 'This task owns a different tab');
+    if (tabKey && this.owner(profileId, tabKey, task.taskId)) throw policyError('TAB_OCCUPIED', 'Another task owns this tab or conversation through result saving');
+    if (tabKey && !task.tabKey && this.pendingOwner(profileId, this.store.data.tabs[tabKey]?.tabId, task.taskId)) {
+      throw policyError('TAB_OCCUPIED', 'This tab may belong to a pending creation; wait for its ownership to be confirmed');
+    }
     if (workflowStarts.has(method)) {
-      if (this.busy(profileId)) throw policyError('PROFILE_BUSY', 'This profile has an active or unresolved generation; wait on the original run');
-      const cooldown = this.cooldown(profileId);
+      if (tabKey && this.busy(tabKey)) throw policyError('TAB_BUSY', 'This tab has an active or unresolved generation; wait on its original run');
+      const cooldown = this.cooldown(profileId, tabKey, method === 'send');
       if (cooldown.retryAfterMs > 0) throw policyError('PROFILE_COOLDOWN',
-        'Local submission cooldown: wait before starting the next conversation; no page command was sent', cooldown);
+        'Local send spacing or this tab\'s completion cooldown: no page command was sent', { ...cooldown, tabKey });
     }
     if (tabKey) this.bind(task, tabKey);
     task.lastTouchedAt = this.store.now();

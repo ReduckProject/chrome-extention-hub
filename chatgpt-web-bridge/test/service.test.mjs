@@ -183,15 +183,17 @@ async function fixture(t) {
   const ws = new WebSocket(`ws://127.0.0.1:${config.port}/extension`, { origin: `chrome-extension://${config.extensionId}` });
   await once(ws, 'open');
   const welcome = once(ws, 'message'); ws.send(JSON.stringify({ type: 'hello', token, profileId, browserSessionId: sessionId })); await welcome;
+  ws.send(JSON.stringify({ type: 'inventory', browserSessionId: sessionId, tabIds: [] }));
+  const until = async condition => { for (let i = 0; i < 100; i++) { if (condition()) return; await new Promise(r => setTimeout(r, 10)); } throw new Error('Fixture did not settle'); };
+  await until(() => service.browserStates.get(profileId)?.tabIds !== null);
   const rawRpc = (method, params = {}) => call(method, params, { config });
   const lease = await rawRpc('task', { action: 'acquire', profileId, taskId: 'fixture-task-owner' });
   const rpc = (method, params = {}) => rawRpc(method, { leaseId: lease.leaseId, ...params });
   const snapshot = data => ws.send(JSON.stringify({ type: 'snapshot', snapshot: data }));
-  const until = async condition => { for (let i = 0; i < 100; i++) { if (condition()) return; await new Promise(r => setTimeout(r, 10)); } throw new Error('Fixture did not settle'); };
   return { config, service, ws, rpc, rawRpc, lease, snapshot, until };
 }
 
-test('two RPC clients cannot interleave a task or take its tab after generation ends', async t => {
+test('two RPC clients can work on different tabs but cannot take a tab during generation or saving', async t => {
   const { service, ws, rpc, rawRpc, lease, snapshot, until } = await fixture(t);
   snapshot(snap(1)); snapshot(snap(2)); await until(() => service.store.list().length === 2);
   const [tabKey, secondKey] = service.store.list().map(tab => tab.key), commands = [];
@@ -200,8 +202,8 @@ test('two RPC clients cannot interleave a task or take its tab after generation 
     commands.push(m.command);
     ws.send(JSON.stringify({ type: 'result', id: m.id, result: { confirmed: true, accepted: true } }));
   });
-  const queued = await rawRpc('task', { action: 'acquire', profileId, taskId: 'other-client-task' });
-  assert.equal(queued.state, 'queued'); assert.equal(queued.position, 1); assert.equal(queued.leaseId, undefined);
+  const other = await rawRpc('task', { action: 'acquire', profileId, taskId: 'other-client-task', tabKey: secondKey });
+  assert.equal(other.state, 'active'); assert.ok(other.leaseId);
   for (const method of ['models', 'new_chat', 'send']) {
     await assert.rejects(rawRpc(method, { tabKey, prompt: 'must not send', requestId: 'legacy-request' }), { code: 'TASK_LEASE_REQUIRED' });
   }
@@ -210,20 +212,30 @@ test('two RPC clients cannot interleave a task or take its tab after generation 
   await assert.rejects(rpc('models', { tabKey: secondKey }), { code: 'TASK_TAB_MISMATCH' });
   const { run } = await rpc('send', { tabKey, prompt: 'one answer', requestId: 'owned-send' });
   assert.equal(run.taskId, lease.taskId);
+  await rawRpc('models', { tabKey: secondKey, leaseId: other.leaseId });
+  await rawRpc('new_chat', { tabKey: secondKey, leaseId: other.leaseId });
+  await assert.rejects(rawRpc('send', { tabKey: secondKey, leaseId: other.leaseId, prompt: 'parallel', requestId: 'parallel-too-early' }), { code: 'PROFILE_COOLDOWN' });
+  service.scheduler.profile(profileId).lastSubmittedAt -= 10000;
+  const parallel = await rawRpc('send', { tabKey: secondKey, leaseId: other.leaseId, prompt: 'parallel', requestId: 'parallel-after-spacing' });
+  assert.equal(parallel.run.phase, 'submitted');
+  assert.equal(service.store.data.runs[run.id].phase, 'submitted', 'The first answer need not end before the second starts');
   await assert.rejects(rpc('task', { action: 'release', profileId, resultsSaved: true }), { code: 'TASK_UNRESOLVED' });
   Object.assign(service.store.data.runs[run.id], { phase: 'completed', completedAt: Date.now() });
-  assert.equal((await rawRpc('task', { action: 'acquire', profileId, taskId: 'other-client-task' })).state, 'queued', 'Saving and archiving still own the profile');
+  await assert.rejects(rawRpc('task', { action: 'acquire', profileId, taskId: 'steal-saving-tab', tabKey }), { code: 'TAB_UNAVAILABLE' });
+  const third = await rawRpc('task', { action: 'acquire', profileId, taskId: 'third-client-task' });
+  assert.equal(third.state, 'active', 'A third task can reserve the remaining slot');
+  await assert.rejects(rawRpc('models', { tabKey, leaseId: third.leaseId }), { code: 'TAB_OCCUPIED' });
   assert.equal((await rpc('task', { action: 'release', profileId, resultsSaved: true })).released, true);
-  service.store.data.scheduling.tasks['other-client-task'].nextPollAt = 0;
-  const next = await rawRpc('task', { action: 'acquire', profileId, taskId: 'other-client-task' });
-  assert.equal(next.state, 'active'); assert.notEqual(next.leaseId, lease.leaseId);
+  await rawRpc('task', { action: 'bind', profileId, tabKey, leaseId: third.leaseId });
   await assert.rejects(rpc('models', { tabKey }), { code: 'TASK_LEASE_REQUIRED' });
-  await assert.rejects(rawRpc('new_chat', { tabKey, leaseId: next.leaseId }), { code: 'PROFILE_COOLDOWN' });
-  assert.deepEqual(commands, ['read', 'models', 'submit']);
-  assert.ok(!JSON.stringify((await rpc('status')).connections).includes(next.leaseId), 'Public status must not expose lease credentials');
+  await assert.rejects(rawRpc('new_chat', { tabKey, leaseId: third.leaseId }), { code: 'PROFILE_COOLDOWN' });
+  assert.deepEqual(commands, ['read', 'models', 'submit', 'models', 'read', 'submit']);
+  const status = await rpc('status');
+  assert.equal(status.connections[0].scheduling.activeTasks.length, 2);
+  assert.ok(!JSON.stringify(status.connections).includes(other.leaseId), 'Public status must not expose lease credentials');
 });
 
-test('profile pacing blocks rapid new chats and preserves simultaneous idempotent send retries', async t => {
+test('tab completion pacing preserves simultaneous idempotent send retries', async t => {
   const { service, ws, rpc, snapshot, until } = await fixture(t);
   let now = 1000000; service.store.now = () => now;
   snapshot(snap(1)); await until(() => service.store.list().length === 1);
@@ -237,7 +249,7 @@ test('profile pacing blocks rapid new chats and preserves simultaneous idempoten
   const replies = await Promise.all([rpc('send', args), rpc('send', args)]);
   assert.equal(replies[0].run.id, replies[1].run.id); assert.equal(commands.length, 1);
   const run = service.store.data.runs[replies[0].run.id];
-  await assert.rejects(rpc('new_chat', { tabKey }), { code: 'PROFILE_BUSY' });
+  await assert.rejects(rpc('new_chat', { tabKey }), { code: 'TAB_BUSY' });
   now += 50000; Object.assign(run, { phase: 'completed', completedAt: now });
   await assert.rejects(rpc('new_chat', { tabKey }), error => error.code === 'PROFILE_COOLDOWN' && error.details.retryAfterMs === 10000);
   assert.equal((await rpc('send', args)).existing, true);
@@ -291,6 +303,63 @@ test('a created tab is bound and counted before its first observation, so the ta
   assert.deepEqual(service.connectionViews()[0].currentTabIds, [10]);
   await assert.rejects(rpc('tabs', { action: 'new', count: 1 }), { code: 'TASK_TAB_MISMATCH' });
   assert.deepEqual(commands, ['new_chats']);
+});
+
+test('a pending page command holds only its task, while release waits for that command', async t => {
+  const { service, ws, rpc, rawRpc, snapshot, until } = await fixture(t);
+  snapshot(snap(1)); snapshot(snap(2)); await until(() => service.store.list().length === 2);
+  const [first, second] = service.store.list().map(tab => tab.key);
+  const other = await rawRpc('task', { action: 'acquire', profileId, taskId: 'pending-other-task', tabKey: second });
+  let held, released = false;
+  ws.on('message', data => {
+    const m = JSON.parse(data); if (m.type !== 'command') return;
+    if (m.params.tabId === 1) held = m;
+    else ws.send(JSON.stringify({ type: 'result', id: m.id, result: { confirmed: true } }));
+  });
+  const firstAction = rpc('models', { tabKey: first }); await until(() => held);
+  const releasing = rpc('task', { action: 'release', profileId, resultsSaved: true }).then(value => { released = true; return value; });
+  const secondAction = await rawRpc('models', { tabKey: second, leaseId: other.leaseId });
+  assert.equal(secondAction.confirmed, true); assert.equal(released, false);
+  ws.send(JSON.stringify({ type: 'result', id: held.id, result: { confirmed: true } }));
+  await firstAction; assert.equal((await releasing).released, true);
+});
+
+test('simultaneous sends on separate leases reserve only one prompt inside ten seconds', async t => {
+  const { service, ws, rpc, rawRpc, snapshot, until } = await fixture(t);
+  snapshot(snap(1)); snapshot(snap(2)); await until(() => service.store.list().length === 2);
+  const [first, second] = service.store.list().map(tab => tab.key);
+  const other = await rawRpc('task', { action: 'acquire', profileId, taskId: 'racing-other-task', tabKey: second });
+  const commands = [];
+  ws.on('message', data => {
+    const m = JSON.parse(data); if (m.type !== 'command') return;
+    commands.push(m.command); ws.send(JSON.stringify({ type: 'result', id: m.id, result: { accepted: true } }));
+  });
+  const replies = await Promise.allSettled([
+    rpc('send', { tabKey: first, prompt: 'first', requestId: 'racing-first-send' }),
+    rawRpc('send', { tabKey: second, leaseId: other.leaseId, prompt: 'second', requestId: 'racing-second-send' }),
+  ]);
+  assert.equal(replies.filter(r => r.status === 'fulfilled').length, 1);
+  assert.equal(replies.find(r => r.status === 'rejected').reason.code, 'PROFILE_COOLDOWN');
+  assert.equal(Object.keys(service.store.data.requests).length, 1); assert.deepEqual(commands, ['submit']);
+});
+
+test('concurrent allocation reserves the last slot and protects a new tab before its creation reply', async t => {
+  const { service, ws, rpc, rawRpc, snapshot, until } = await fixture(t);
+  await rpc('task', { action: 'release', profileId, resultsSaved: true });
+  for (let i = 1; i <= 3; i++) snapshot(snap(i, { activity: 'generating' }));
+  await until(() => service.connectionViews()[0].currentTabIds.length === 3);
+  const replies = await Promise.all(['slot-racing-a', 'slot-racing-b'].map(taskId => rawRpc('task', { action: 'acquire', profileId, taskId })));
+  const active = replies.find(r => r.state === 'active'), queued = replies.find(r => r.state === 'queued');
+  assert.ok(active.leaseId); assert.equal(queued.reason, 'no_idle_tab_at_capacity');
+  let held;
+  ws.on('message', data => { const m = JSON.parse(data); if (m.type === 'command') { held = m; snapshot(snap(4)); } });
+  const creation = rawRpc('tabs', { action: 'new', profileId, leaseId: active.leaseId });
+  await until(() => service.connectionViews()[0].currentTabIds.length === 4);
+  service.scheduler.data.tasks[queued.taskId].nextPollAt = 0;
+  assert.equal((await rawRpc('task', { action: 'acquire', profileId, taskId: queued.taskId })).state, 'queued');
+  ws.send(JSON.stringify({ type: 'result', id: held.id, result: { tabs: [{ tabId: 4, profileId, browserSessionId: sessionId }] } }));
+  assert.equal((await creation).task.tabKey, `${profileId}:${sessionId}:4`);
+  assert.equal(service.connectionViews()[0].currentTabIds.length, 4);
 });
 
 test('a background page with no push heartbeat completes through passive probes before lazy media loads', { timeout: 10000 }, async t => {
