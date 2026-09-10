@@ -2,7 +2,7 @@ import http from 'node:http';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import { WebSocketServer } from 'ws';
-import { StateStore } from './store.mjs';
+import { StateStore, ACCESS_RETRY_MS } from './store.mjs';
 import { tokenEquals } from './config.mjs';
 import { matchDownloadedFiles, saveTransferredOriginal, verifySavedOriginals } from './downloads.mjs';
 import { TaskScheduler, managedAction, policyError } from './scheduler.mjs';
@@ -16,6 +16,13 @@ function requireCompleteImageAssets(run, result) {
   }
 }
 
+function accessWaitingResult(error, method, params = {}) {
+  return { state: 'waiting_for_access', taskContinues: true, code: 'ACCESS_PAUSED', ...error.details,
+    nextAction: { method: 'access', params: { action: 'wait', profileId: error.details.profileId, timeoutMs: 25000 } },
+    continuation: { method, action: params.action, taskId: params.taskId, runId: params.runId, requestId: params.requestId,
+      instruction: 'Keep this task running. Wait until accessPause is null, then continue this step with the original parameters. Preserve remaining prompts, leaseId, runId and requestId; do not end the task or resend an uncertain submission.' } };
+}
+
 export class BridgeService {
   constructor({ config, stateFile = null }) {
     this.config = config;
@@ -27,6 +34,7 @@ export class BridgeService {
     this.locks = new Map();
     this.operationContext = new AsyncLocalStorage();
     this.runProbes = new Map();
+    this.accessRetries = new Map();
     this.wss = new WebSocketServer({ noServer: true, maxPayload: 2 * 1024 * 1024 });
     this.server = http.createServer((req, res) => this.http(req, res));
     this.server.on('upgrade', (req, socket, head) => {
@@ -46,6 +54,7 @@ export class BridgeService {
     this.tick = setInterval(() => {
       if (this.store.reconcile()) this.store.save().catch(error => this.logError(error));
       this.refreshRunningTabs().catch(error => this.logError(error));
+      this.refreshAccessPauses().catch(error => this.logError(error));
     }, 1000);
     this.tick.unref();
     return this.server.address().port;
@@ -88,6 +97,63 @@ export class BridgeService {
       jobs.push(entry.pending);
     }
     await Promise.all(jobs);
+  }
+
+  async refreshAccessPauses() {
+    if (this.stopping) return;
+    const jobs = [];
+    for (const [profileId, pause] of Object.entries(this.store.data.accessPauses)) {
+      if (pause.retryAt > this.store.now() || this.accessRetries.has(profileId) || !this.clients.has(profileId) ||
+          !this.browserStates.get(profileId)?.tabIds?.length) continue;
+      const job = this.dispatch('access', { action: 'resume', profileId }, { source: 'automatic_access_backoff' })
+        .finally(() => this.accessRetries.delete(profileId));
+      this.accessRetries.set(profileId, job); jobs.push(job);
+    }
+    await Promise.all(jobs);
+  }
+
+  async recoverAccess(profileId) {
+    return this.withLock(`access-retry:${profileId}`, async () => {
+      const pause = this.store.data.accessPauses[profileId];
+      if (!pause) return { resumed: false, alreadyUnpaused: true };
+      if (pause.retryAt > this.store.now()) return { resumed: false, waiting: true };
+      const browser = this.browserStates.get(profileId);
+      if (!this.clients.has(profileId) || !browser?.tabIds?.length) return { resumed: false, waiting: true, reason: 'connected_page_required' };
+      const attemptAt = this.store.now();
+      // Persist the next deadline BEFORE any page command, so a reconnect or
+      // daemon restart cannot turn this into rapid retries.
+      Object.assign(pause, { lastAttemptAt: attemptAt, retryAt: attemptAt + ACCESS_RETRY_MS,
+        retryState: 'checking', attempts: (pause.attempts || 0) + 1 });
+      delete pause.lastError;
+      this.store.changed(); await this.store.save();
+      try {
+        let next = 0;
+        const tabIds = [...browser.tabIds];
+        const checked = await Promise.allSettled(Array.from({ length: Math.min(4, tabIds.length) }, async () => {
+          while (next < tabIds.length) {
+            const tabId = tabIds[next++], key = `${profileId}:${browser.browserSessionId}:${tabId}`;
+            await this.command(profileId, 'probe', { tabId }, 2000);
+            let tab = this.store.data.tabs[key];
+            if (!tab || this.store.tabView(key).freshness.stale || tab.receivedAt < attemptAt) throw new Error('Fresh page observation unavailable');
+            if (tab.attentionType === 'rate_limit') {
+              await this.withLock(key, () => this.command(profileId, 'read', { tabId, documentId: tab.documentId,
+                assistantId: { operation: 'dismiss_rate_limit' } }, 4000));
+              await this.command(profileId, 'probe', { tabId }, 2000);
+            }
+          }
+        }));
+        const failure = checked.find(result => result.status === 'rejected');
+        if (failure) throw failure.reason;
+        if (this.stopping || this.browserStates.get(profileId) !== browser ||
+            browser.tabIds.some(id => !tabIds.includes(id))) throw new Error('Browser inventory changed during recovery');
+        return this.store.resumeAccess(profileId, { attemptAt });
+      } catch (error) {
+        pause.retryState = 'waiting'; pause.lastError = error.message.slice(0, 500);
+        return { resumed: false, waiting: true, reason: pause.lastError };
+      } finally {
+        this.store.changed(); await this.store.save();
+      }
+    });
   }
 
   extension(ws) {
@@ -154,7 +220,14 @@ export class BridgeService {
           const pending = this.pending.get(message.id);
           if (pending?.profileId === profileId) {
             clearTimeout(pending.timer); this.pending.delete(message.id);
-            if (message.error) pending.reject(new Error(String(message.error).slice(0, 1000)));
+            if (message.error) {
+              const errorText = String(message.error).slice(0, 1000);
+              if (errorText.startsWith('ChatGPT access is rate limited:')) {
+                this.store.pauseAccess(profileId, { message: errorText, basis: 'page_action' });
+                this.store.changed(); this.store.save().catch(error => this.logError(error));
+                try { this.store.assertAccessAllowed(profileId); } catch (error) { pending.reject(error); }
+              } else pending.reject(new Error(errorText));
+            }
             else pending.resolve(message.result);
           }
         } else if (message.type === 'download') {
@@ -205,7 +278,9 @@ export class BridgeService {
     const passive = command === 'probe' || (command === 'read' &&
       (params.assistantId?.operation === 'diagnostics' ||
         (params.assistantId?.operation === 'response' && !params.assistantId.loadImages && !params.assistantId.includeAssets)));
-    if (!passive && command !== 'stop') this.store.assertAccessAllowed(profileId);
+    const recovery = command === 'read' && params.assistantId?.operation === 'dismiss_rate_limit' &&
+      this.store.data.accessPauses[profileId]?.retryState === 'checking';
+    if (!passive && !recovery && command !== 'stop') this.store.assertAccessAllowed(profileId);
     const ws = this.clients.get(profileId);
     if (!ws || ws.readyState !== 1) return Promise.reject(new Error('Chrome extension is not connected'));
     return new Promise((resolve, reject) => {
@@ -256,14 +331,15 @@ export class BridgeService {
     return this.operationContext.run(operation, async () => {
       try {
         const result = await this.perform(method, params);
-        operation.outcome = result.resultError ? 'result_unavailable' : 'returned';
+        operation.outcome = result.state === 'waiting_for_access' ? 'waiting_for_access' : result.resultError ? 'result_unavailable' : 'returned';
         operation.runId ||= result.run?.id;
         operation.existing = result.existing;
         operation.runPhase = result.run?.phase;
         operation.error = result.resultError?.slice(0, 500);
         return result;
       } catch (error) {
-        operation.outcome = 'error'; operation.error = error.message.slice(0, 500); operation.code = error.code; throw error;
+        operation.outcome = error.code === 'ACCESS_PAUSED' ? 'waiting_for_access' : 'error';
+        operation.error = error.message.slice(0, 500); operation.code = error.code; throw error;
       } finally {
         operation.finishedAt = Date.now(); this.store.changed(); await this.store.save();
       }
@@ -314,7 +390,8 @@ export class BridgeService {
         if (method !== 'result') throw error;
         const cached = run?.responseCache;
         return { run: this.store.runView(params.runId), result: cached || null,
-          resultSource: cached ? 'cache' : null, resultError: error.message, code: error.code, ...error.details };
+          resultSource: cached ? 'cache' : null, resultError: error.message, code: error.code, ...error.details,
+          ...(error.code === 'ACCESS_PAUSED' ? accessWaitingResult(error, method, params) : {}) };
       }
       const result = await this.execute(method, params, task);
       if (method === 'tabs') {
@@ -337,7 +414,7 @@ export class BridgeService {
 
   async execute(method, params = {}, task = null) {
     switch (method) {
-      case 'health': return { ok: true, service: 'chatgpt-web-bridge', protocol: 1, version: '0.2.1', schedulerVersion: 2, connectedProfiles: [...this.clients.keys()], connections: this.connectionViews(), revision: this.store.data.revision };
+      case 'health': return { ok: true, service: 'chatgpt-web-bridge', protocol: 1, version: '0.2.2', schedulerVersion: 2, accessRecoveryVersion: 1, connectedProfiles: [...this.clients.keys()], connections: this.connectionViews(), revision: this.store.data.revision };
       case 'refresh_observers': {
         if (this.pending.size) throw new Error('Wait for outstanding page commands before updating observers');
         const profiles = params.profileId ? [params.profileId] : [...this.clients.keys()];
@@ -407,14 +484,14 @@ export class BridgeService {
         const profileId = params.profileId || (this.clients.size === 1 ? [...this.clients.keys()][0] : null);
         if (!profileId) throw new Error('Choose a profileId explicitly');
         const action = params.action || 'status';
-        if (!['status', 'pause', 'resume'].includes(action)) throw new Error('Unknown access action');
+        if (!['status', 'pause', 'resume', 'wait'].includes(action)) throw new Error('Unknown access action');
+        if (action === 'wait') return this.store.waitAccess(profileId, params.timeoutMs);
         if (action === 'pause') {
           if (!this.clients.has(profileId)) throw new Error('Choose a connected profileId');
-          this.store.data.accessPauses[profileId] ||= { reason: 'rate_limit', message: 'User reported a website access restriction',
-            observedAt: Date.now(), retryAt: Date.now() + 300000, basis: 'user_report' };
+          this.store.pauseAccess(profileId, { basis: 'user_report' });
           this.store.changed(); await this.store.save();
         }
-        const recovery = action === 'resume' ? this.store.resumeAccess(profileId) : {};
+        const recovery = action === 'resume' ? await this.recoverAccess(profileId) : {};
         if (action === 'resume') await this.store.save();
         return { profileId, accessPause: this.store.accessPause(profileId), ...recovery,
           recentOperations: this.store.data.operations.filter(operation => operation.profileId === profileId).slice(-30) };
@@ -575,6 +652,7 @@ export class BridgeService {
     if (req.headers.origin || !tokenEquals(req.headers.authorization, `Bearer ${this.config.token}`)) return respond(403, { error: 'Forbidden' });
     if (req.method === 'GET' && req.url === '/health') return respond(200, await this.dispatch('health'));
     if (req.method !== 'POST' || req.url !== '/rpc') return respond(404, { error: 'Not found' });
+    let method, params;
     try {
       const chunks = []; let length = 0;
       for await (const chunk of req) {
@@ -582,11 +660,16 @@ export class BridgeService {
         if (length > 1024 * 1024) throw new Error('Request too large');
         chunks.push(chunk);
       }
-      const { method, params, client } = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      const request = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      ({ method, params } = request);
+      const { client } = request;
       const caller = client && Number.isInteger(client.pid) && client.pid > 0
         ? { reportedPid: client.pid, entry: typeof client.entry === 'string' ? client.entry.slice(0, 80) : null } : null;
       const result = await this.dispatch(method, params, caller);
       respond(200, { result });
-    } catch (error) { respond(400, { error: error.message, code: error.code, details: error.details }); }
+    } catch (error) {
+      if (error.code === 'ACCESS_PAUSED') respond(200, { result: accessWaitingResult(error, method, params) });
+      else respond(400, { error: error.message, code: error.code, details: error.details });
+    }
   }
 }

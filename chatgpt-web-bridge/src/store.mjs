@@ -5,6 +5,7 @@ import { EventEmitter } from 'node:events';
 import { conversationId, isChatGPT } from './config.mjs';
 
 const terminal = new Set(['completed', 'stopped', 'error']);
+export const ACCESS_RETRY_MS = 300000;
 export const hash = value => createHash('sha256').update(String(value)).digest('hex');
 
 function finishedResponseStream(run, tab) {
@@ -36,6 +37,9 @@ export class StateStore extends EventEmitter {
       if (data.schema !== 1 || !data.tabs || !data.runs || !data.requests) throw new Error('Unsupported or invalid state file');
       this.data = data;
       this.data.accessPauses ||= {};
+      for (const pause of Object.values(this.data.accessPauses)) if (pause.retryState === 'checking') {
+        pause.retryState = 'waiting'; pause.lastError = 'Recovery interrupted; keeping its persisted retry deadline';
+      }
       this.data.operations ||= [];
       // Cached observations survive restarts; live connection claims do not.
       for (const tab of Object.values(this.data.tabs)) tab.restartPending = true;
@@ -61,7 +65,8 @@ export class StateStore extends EventEmitter {
       const { updatedAt, responseCache, ...state } = run;
       const tab = this.data.tabs[run.tabKey];
       const signature = JSON.stringify([state, tab?.activity, tab?.observationError,
-        this.connections.has(run.profileId), !!this.data.accessPauses[run.profileId]]);
+        this.connections.has(run.profileId), this.data.accessPauses[run.profileId]?.retryAt,
+        this.data.accessPauses[run.profileId]?.retryState]);
       if (this.runChanges.get(run.id)?.signature !== signature) {
         this.runChanges.set(run.id, { signature, revision: this.data.revision });
       }
@@ -88,12 +93,7 @@ export class StateStore extends EventEmitter {
       lastContentChangeAt: signatureChanged ? now : previous.lastContentChangeAt,
       lastResponseChangeAt: responseChanged ? now : previous.lastResponseChangeAt ?? previous.lastContentChangeAt,
     };
-    if (incoming.attentionType === 'rate_limit' && (previous?.attentionType !== 'rate_limit' ||
-        previous.documentId !== incoming.documentId || !this.data.accessPauses[profileId])) {
-      // Five minutes is our conservative backoff, not a claimed website reset time.
-      this.data.accessPauses[profileId] = { reason: 'rate_limit', message: incoming.attention,
-        observedAt: now, retryAt: now + 300000, sourceTabKey: key, basis: 'bridge_backoff' };
-    }
+    if (incoming.attentionType === 'rate_limit') this.pauseAccess(profileId, { message: incoming.attention, sourceTabKey: key });
     this.reconcile();
     this.changed();
     return key;
@@ -123,27 +123,42 @@ export class StateStore extends EventEmitter {
       this.connections.has(profileId) && this.now() - tab.receivedAt <= this.staleMs) ? true : notices.length ? null : false;
     const remainingMs = Math.max(0, pause.retryAt - this.now());
     return { ...pause, retryAfter: new Date(pause.retryAt).toISOString(), remainingMs, noticeVisible,
-      observationPending: noticeVisible === null, resumeRequired: true };
+      observationPending: noticeVisible === null, autoResume: true, resumeRequired: false,
+      retryState: pause.retryState || 'waiting', retryAfterMs: remainingMs };
+  }
+
+  pauseAccess(profileId, { message = 'User reported a website access restriction', sourceTabKey, basis = 'bridge_backoff' } = {}) {
+    // One shared deadline: heartbeats, dialog flicker and other tabs do not
+    // continually postpone the same five-minute wait.
+    return this.data.accessPauses[profileId] ||= { reason: 'rate_limit', message,
+      observedAt: this.now(), retryAt: this.now() + ACCESS_RETRY_MS, sourceTabKey, basis };
   }
 
   assertAccessAllowed(profileId) {
     const pause = this.accessPause(profileId);
-    if (pause) throw new Error('ChatGPT access paused: ' + pause.message +
-      '. Access remains paused after ' + pause.retryAfter +
-      '; resume only on an explicit user request after checking the current page. No automatic retry.');
+    if (pause) throw Object.assign(new Error('ChatGPT access paused: ' + pause.message +
+      '. Automatic recovery check at ' + pause.retryAfter + '; wait with access action:wait, then continue the original task and request IDs.'),
+      { code: 'ACCESS_PAUSED', details: { profileId, accessPause: pause, autoResume: true, retryAt: pause.retryAt, retryAfterMs: pause.remainingMs } });
   }
 
-  resumeAccess(profileId) {
+  resumeAccess(profileId, { attemptAt } = {}) {
     const pause = this.accessPause(profileId);
     if (!pause) return { resumed: false, alreadyUnpaused: true };
-    if (pause.remainingMs > 0) throw new Error('The local access backoff has not elapsed');
+    const checkedAttempt = attemptAt !== undefined && pause.lastAttemptAt === attemptAt && pause.retryState === 'checking';
+    if (!checkedAttempt && pause.remainingMs > 0) throw new Error('The local access backoff has not elapsed');
     if (pause.noticeVisible !== false) throw new Error('The website restriction is still visible or its observation is stale');
     if (!this.list().some(tab => tab.profileId === profileId && !tab.freshness.stale)) {
       throw new Error('A fresh page observation is required before explicit access recovery');
     }
     delete this.data.accessPauses[profileId];
+    // Waiting for access must not consume the separate idle-tab timeout.
+    for (const task of Object.values(this.data.scheduling?.tasks || {})) if (task.profileId === profileId && task.state === 'queued') {
+      task.lastTouchedAt = this.now(); task.nextPollAt = this.now();
+    }
     this.changed();
-    return { resumed: true, websiteRecoveryVerified: false };
+    this.reconcile();
+    return { resumed: true, automatic: checkedAttempt, websiteRecoveryVerified: false,
+      continuation: 'Continue the original task; inspect existing run/request IDs before retrying an unsubmitted action.' };
   }
 
   list() { return Object.keys(this.data.tabs).map(key => this.tabView(key)); }
@@ -252,13 +267,13 @@ export class StateStore extends EventEmitter {
         continue;
       }
       if (tab.attentionType === 'rate_limit' && tab.documentId === run.documentIdAtSend) {
-        run.phase = 'awaiting_user'; run.attention = tab.attention; run.attentionType = 'rate_limit';
+        run.phase = 'rate_limited'; run.attention = tab.attention; run.attentionType = 'rate_limit';
         if (JSON.stringify(run) !== before) { run.updatedAt = this.now(); changed = true; }
         continue;
       }
       if (run.attentionType === 'rate_limit') {
         delete run.attentionType; delete run.attention;
-        if (run.phase === 'awaiting_user') run.phase = run.accepted ? 'submitted' : 'submission_unknown';
+        if (['awaiting_user', 'rate_limited'].includes(run.phase)) run.phase = run.accepted ? 'submitted' : 'submission_unknown';
       }
       const userConfirmed = tab.userCount > run.baseline.userCount && textMatches;
       if (!run.accepted && userConfirmed) run.accepted = true;
@@ -321,7 +336,7 @@ export class StateStore extends EventEmitter {
 
   async wait({ runId, afterRevision = this.data.revision, timeoutMs = 20000 }) {
     const run = this.runView(runId);
-    if (terminal.has(run.phase) || run.phase === 'awaiting_user' || run.observation?.accessPause) {
+    if (terminal.has(run.phase) || (run.phase === 'awaiting_user' && run.attentionType !== 'rate_limit')) {
       return { revision: this.data.revision, run };
     }
     if ((this.runChanges.get(runId)?.revision || 0) <= afterRevision) {
@@ -336,5 +351,17 @@ export class StateStore extends EventEmitter {
       });
     }
     return { revision: this.data.revision, run: this.runView(runId) };
+  }
+
+  async waitAccess(profileId, timeoutMs = 25000) {
+    const signature = () => JSON.stringify(this.data.accessPauses[profileId] || null);
+    const before = signature();
+    if (this.data.accessPauses[profileId]) await new Promise(resolve => {
+      const done = () => { clearTimeout(timer); this.off('change', onChange); resolve(); };
+      const onChange = () => { if (signature() !== before) done(); };
+      const timer = setTimeout(done, Math.min(Math.max(timeoutMs, 0), 25000));
+      this.on('change', onChange); onChange();
+    });
+    return { profileId, accessPause: this.accessPause(profileId), resumed: !this.data.accessPauses[profileId] };
   }
 }

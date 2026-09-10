@@ -90,11 +90,13 @@ test('a visible access limit pauses every tab in its profile and preserves idemp
   const { run } = await store.reserve(params);
   store.submissionResult(run.id, { accepted: false });
   snap(1, { activity: 'needs_attention', attentionType: 'rate_limit', attention: '请求过于频繁，请稍等几分钟后再重试。' });
-  assert.equal(run.phase, 'awaiting_user'); assert.equal(run.accepted, false);
+  assert.equal(run.phase, 'rate_limited'); assert.equal(run.accepted, false);
   assert.equal(store.tabView(second).accessPause.remainingMs, 300000);
   assert.equal((await store.reserve(params)).existing, true);
   await assert.rejects(store.reserve({ tabKey: second, prompt: 'another', requestId: 'another-request' }), /access paused/);
-  const wait = await store.wait({ runId: run.id, afterRevision: store.data.revision, timeoutMs: 25000 });
+  const started = Date.now();
+  const wait = await store.wait({ runId: run.id, afterRevision: store.data.revision, timeoutMs: 25 });
+  assert.ok(Date.now() - started >= 20, 'Rate-limit waits must not spin immediately');
   assert.equal(wait.run.attentionType, 'rate_limit');
   advance(10000);
   snap(1, { activity: 'needs_attention', attentionType: 'rate_limit', attention: '请求过于频繁，请稍等几分钟后再重试。' });
@@ -103,7 +105,7 @@ test('a visible access limit pauses every tab in its profile and preserves idemp
   assert.equal(run.phase, 'submission_unknown');
   assert.equal(store.accessPause(profile).remainingMs, 290000, 'Dismissing the popup does not skip the backoff');
   advance(290001); snap(1); snap(2);
-  assert.equal(store.accessPause(profile).resumeRequired, true);
+  assert.equal(store.accessPause(profile).resumeRequired, false);
   assert.throws(() => store.assertAccessAllowed(profile), /access paused/);
   assert.equal(store.resumeAccess(profile).resumed, true);
   assert.equal(store.accessPause(profile), null);
@@ -121,11 +123,12 @@ test('a persistent visible restriction outlasts the local backoff and survives a
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'bridge-rate-limit-'));
   try {
     store.file = path.join(directory, 'state.json');
-    // Record a newly displayed notice to persist a fresh backoff.
+    // A flickering notice must not restart the same backoff.
     snap(1); snap(1, limit); await store.save();
     const restored = new StateStore({ file: store.file, now: store.now });
     await restored.load();
-    assert.equal(restored.accessPause(profile).remainingMs, 300000);
+    assert.equal(restored.accessPause(profile).remainingMs, 0);
+    assert.equal(restored.accessPause(profile).autoResume, true);
   } finally { await fs.rm(directory, { recursive: true, force: true }); }
 });
 
@@ -137,7 +140,7 @@ test('a stale restriction observation is unknown and cannot silently release the
   assert.equal(store.accessPause(profile).observationPending, true);
   assert.throws(() => store.assertAccessAllowed(profile), /access paused/);
   snap(1);
-  assert.equal(store.accessPause(profile).resumeRequired, true);
+  assert.equal(store.accessPause(profile).resumeRequired, false);
   assert.equal(store.resumeAccess(profile).resumed, true);
   assert.equal(store.accessPause(profile), null);
 });
@@ -148,13 +151,29 @@ test('explicit recovery requires elapsed backoff and a fresh clear page but neve
   snap(1, limit);
   assert.throws(() => store.resumeAccess(profile), /not elapsed/);
   advance(1800000);
-  assert.equal(store.accessPause(profile).resumeRequired, true);
+  assert.equal(store.accessPause(profile).resumeRequired, false);
   assert.throws(() => store.resumeAccess(profile), /still visible or.*stale/);
   snap(1, limit);
   assert.throws(() => store.resumeAccess(profile), /still visible/);
   snap(1);
   assert.equal(store.resumeAccess(profile).websiteRecoveryVerified, false);
   assert.equal(store.accessPause(profile), null);
+});
+
+test('waiting for access preserves queued tasks and wakes only for the target profile', async () => {
+  const { store, snap, advance } = fixture();
+  snap(1, { activity: 'needs_attention', attentionType: 'rate_limit', attention: 'Too many requests' });
+  store.data.scheduling = { tasks: { queued: { profileId: profile, state: 'queued', polls: 2, lastTouchedAt: store.now(), nextPollAt: store.now() + 20000 } } };
+  let settled = false;
+  const wait = store.waitAccess(profile, 500).then(result => { settled = true; return result; });
+  store.pauseAccess('other-profile'); store.changed();
+  await new Promise(resolve => setTimeout(resolve, 15)); assert.equal(settled, false);
+  advance(300001); snap(1);
+  store.resumeAccess(profile);
+  assert.equal((await wait).resumed, true);
+  assert.equal(store.data.scheduling.tasks.queued.polls, 2);
+  assert.equal(store.data.scheduling.tasks.queued.lastTouchedAt, store.now());
+  assert.equal(store.listenerCount('change'), 0);
 });
 test('three image runs overlap and complete independently on their own conversations', async () => {
   const { store, snap, advance } = fixture();

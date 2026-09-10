@@ -1,4 +1,4 @@
-# 任务占用协议（服务端 0.2.1）
+# 任务占用协议（服务端 0.2.2）
 
 每项任务独占并复用一个 tab，整批多图算一项任务。同 profile 的不同任务可以在不同 tab 并行，不能抢占同一 tab 或同一聊天。connections.scheduling 返回 lockScope:tab、activeTasks、queue、currentTabCount、reservedTabCount 和本地发送间隔，不包含 leaseId；当前页面和预留新页名额共同计入 4 个的复用阈值。
 
@@ -20,6 +20,6 @@ MCP 未加载新工具或旧 schema 没有 leaseId 时，把相同 JSON 写入 U
 - 服务重启和从 0.2.0 升级保留任务、leaseId、队列、run、requestId 和发送时间。activeTasks 中超过 5 分钟未活动的任务显示 overdue，仍不自动交给别人；由原任务恢复并收尾。
 - 升级前未纳管 run 仅由其原任务通过 acquire 的 adoptRunId 建立占用，只绑定原 tab 和 run，不重新发送。
 - 只有用户明确取消本任务时，才可 `task({action:"abandon",profileId,leaseId,confirmAbandon:true})` 放弃占用。它不关 tab、不清草稿、不停止生成、不改变 unknown；仍在生成的页面只阻止该页复用，其它 tab 可继续。
-- accessPause 仍作用于整个 profile，优先于队列与冷却。只有用户明确要求恢复才执行主 Skill 的 access 流程；解除本地暂停不是网站恢复证明，等待项也不会自动发送。
+- accessPause 作用于整个 profile，按 [限流恢复协议](access-recovery.md) 等待 5 分钟自动检查并继续原步骤；不得因限流结束批次或丢弃后续提示词，等待不消耗排队轮询次数或导致排队过期。解除本地暂停不是网站恢复证明；已提交请求先查原 run，不盲目重发。
 
 配置项 scheduling.minSubmissionIntervalMs（默认 10000）控制 profile 发送间隔，scheduling.postCompletionCooldownMs（默认 10000）控制对应 tab 完成后的等待。修改后重启服务，不打印含认证密钥的完整配置。

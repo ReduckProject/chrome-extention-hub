@@ -55,7 +55,7 @@ node src/cli.mjs status
 | `chatgpt_models` | 读取菜单勾选的模型名称和当前推理强度；必要时关闭没有草稿的图片查看器 |
 | `chatgpt_select_model` | 按精确标签选择并读回，检查 `confirmed:true` |
 | `chatgpt_send` | 提交 prompt，返回持久化 run；必须提供稳定 requestId |
-| `chatgpt_access` | 查询／记录 profile 暂停；只有用户明确要求恢复时才调用 resume，不自动重试网站请求 |
+| `chatgpt_access` | 查询／记录暂停，5 分钟自动检查恢复；wait 保持任务等待，恢复后继续原步骤 |
 | `chatgpt_result` | 按 runId 默认返回对应回答的完整正文和图片信息；需要图片哈希时传 `includeAssets:true` |
 | `chatgpt_download` | 点击对应图片保存控件，验证下载文件，返回路径 |
 | `chatgpt_recover_images` | 网页保存没有产生本机文件时，经同一扩展传输已加载的同源原图字节，并核对哈希 |
@@ -113,13 +113,13 @@ MCP 返回 structuredContent JSON，并附带相同内容的文本。状态字�
 
 completed 仅表示回答结束，任务占用仍保留；整批必要结果保存、归档与 tab 清理完成后，以 `task({action:"release",profileId,leaseId,resultsSaved:true})` 释放。占用、队列和发送时间持久化，进程重启不会绕过限制；过期只清理无人继续等待的队列项，不自动抢占 active 任务。新任务不会在后台自动发送，普通 status/result/wait 不需要 leaseId。用户明确取消时可以 abandon 自己的占用，保留网页和未确认 run 的原状态。
 
-旧 MCP schema 缺少新工具或 leaseId 参数时，在子项目目录用同一服务的 `node src/cli.mjs task --input <UTF-8 JSON 文件>` 及相应动作方法操作，不需重新加载 Chrome 扩展。扩展仍为 0.1.2 / adapter 42 / content 5，服务及 MCP 为 0.2.1（schedulerVersion:2）。
+旧 MCP schema 缺少新工具或 leaseId 参数时，在子项目目录用同一服务的 `node src/cli.mjs task --input <UTF-8 JSON 文件>` 及相应动作方法操作，不需重新加载 Chrome 扩展。扩展仍为 0.1.2 / adapter 43 / content 5，服务及 MCP 为 0.2.2（schedulerVersion:2 / accessRecoveryVersion:1）。
 
 ## 逐张生成与结果保存
 
 状态观察、`status`（含 `refresh:true`）及默认 `result` 只读取已有页面，不刷新会话、不主动加载图片。需要获取后台 lazy 图片时，在回答 completed 后明确调用一次 `result({runId,loadImages:true,leaseId})`，再间隔 10–20 秒读取默认 result，最多检查 3 次；`eager/pending` 不重复启动加载。哈希读取及原图分块传输共用页面内字节缓存，最多 4 个资源、64 MiB、5 分钟，避免每个 512 KiB 分块重新请求完整图片。
 
-网页显示“请求过于频繁／暂时限制访问对话记录”时，状态返回 `attentionType:rate_limit`。同一 Chrome profile 的所有 tab 共享 `accessPause`。暂停不会因 5 分钟到期或弹窗消失自动解除，始终返回 `resumeRequired:true`。只有用户明确要求恢复／再试一次时，才在本地退避已结束、页面观测新鲜且没有限制提示后调用 `chatgpt_access({action:"resume",profileId})`（CLI 方法为 access）。`resumed:true` 只解除本地暂停，`websiteRecoveryVerified:false` 表明网站恢复仍未经验证，不自动重试原请求。新聊天、发送、模型操作、图片加载、哈希、下载和恢复均暂停；默认正文及状态仍可查询，wait 立即返回。已完成回答保留 completed，原 runId/requestId 和草稿保留。用户报告而页面尚未识别的限制可用 access 的 pause 操作记录。
+网页显示“请求过于频繁／暂时限制访问对话记录”时，同 profile 共享 accessPause。0.2.2 起等待 5 分钟后自动读取页面、确认旧限流弹窗并再次观察，仍受限则再等 5 分钟；autoResume:true、resumeRequired:false，无需手动批准恢复。被挡住的动作返回 HTTP 200 / state:waiting_for_access / taskContinues:true，不作为 MCP 错误或 CLI 失败。调用方必须用 access({action:"wait",profileId,timeoutMs:25000}) 保持任务等待，恢复后继续原步骤和剩余提示词，不能结束批次；已有 run/request ID 先核对，服务不会盲目重放请求。等待不消耗空闲页检查次数或导致排队过期。详见 [限流等待与继续执行](skill/references/access-recovery.md)。
 
 `status({tabKey,diagnostics:true})` 只读取指定页面已缓冲的 Resource Timing，请求 URL 不含查询值，返回时间、路径、响应码等元数据。缓冲可能不完整，不能单靠时序确定调用方。服务另保存最近 400 次会产生页面操作的 RPC 审计；诊断最多返回最近 30 次相关操作，包括下发的页面命令、调用进程报告的 PID（旧客户端可能缺失）和结果，排除提示词、正文及认证信息。网页自身、手动操作或其他工具的请求不属于桥接器审计范围。
 

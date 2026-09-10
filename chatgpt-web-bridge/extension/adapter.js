@@ -1,5 +1,5 @@
 (() => {
-  const adapterVersion = 42;
+  const adapterVersion = 43;
   if (globalThis.ChatGPTBridgeAdapter?.version === adapterVersion) return;
   globalThis.ChatGPTBridgeAdapter?.dispose?.();
   const doc = document;
@@ -158,13 +158,25 @@
   const downloadButtons = assistant => all('button,[role="button"],a[download]', turnRoot(assistant) || doc.createElement('div'))
     .filter(n => /^(download( image| original| file)?|下载(此图片|图片|原图|文件)?|保存图片)$/i.test(label(n)));
   const imageViewer = () => all('[role="dialog"]').find(root => imageElements(root).length && buttons(root).some(n => /^(关闭全屏显示|Close full screen|Close fullscreen)$/i.test(label(n))));
-  function accessNotice() {
+  function accessNoticeNode() {
     // Match website UI, never quoted instructions or refusal prose in messages.
     const nodes = all('[role="dialog"],[role="alertdialog"],[role="alert"],[role="status"],[data-testid="conversation-error"]')
       .filter(n => !n.closest('[data-message-author-role],article,[data-turn],form,[data-testid="composer"]'));
-    const message = nodes.map(text).find(t =>
-      /请求过于频繁|访问.{0,12}频繁|暂时限制.{0,20}(对话|会话|聊天)|too many requests|rate limit|requests.{0,20}(too (quickly|frequently)|too often)|temporarily.{0,30}(restrict|limit).{0,50}(conversation|chat)/i.test(t));
-    return message ? { type: 'rate_limit', message: message.slice(0, 500) } : null;
+    return nodes.find(n =>
+      /请求过于频繁|访问.{0,12}频繁|暂时限制.{0,20}(对话|会话|聊天)|too many requests|rate limit|requests.{0,20}(too (quickly|frequently)|too often)|temporarily.{0,30}(restrict|limit).{0,50}(conversation|chat)/i.test(text(n)));
+  }
+  function accessNotice() {
+    const node = accessNoticeNode();
+    return node ? { type: 'rate_limit', message: text(node).slice(0, 500) } : null;
+  }
+  async function dismissRateLimit() {
+    const node = accessNoticeNode();
+    if (!node) return { dismissed: false, noticeVisible: false };
+    const acknowledgements = buttons(node).filter(n => /^(明白了|知道了|好的|确定|OK|Okay|Got it|Dismiss|Close|关闭)$/i.test(label(n)));
+    if (acknowledgements.length !== 1) return { dismissed: false, noticeVisible: true, reason: 'acknowledgement_not_found' };
+    acknowledgements[0].click();
+    await until(() => !accessNotice(), 1000);
+    return { dismissed: true, noticeVisible: !!accessNotice() };
   }
   function assertAccessAllowed() {
     const notice = accessNotice();
@@ -474,6 +486,7 @@
     // validates and locks these fixed operations before using this envelope.
     if (assistantId && typeof assistantId === 'object') {
       if (assistantId.operation === 'diagnostics') return diagnostics();
+      if (assistantId.operation === 'dismiss_rate_limit') return dismissRateLimit();
       if (assistantId.operation === 'new_chat') return newChat();
       if (assistantId.operation === 'response') {
         if (assistantId.loadImages === true) loadPendingImages(assistantId.assistantId, assistantId.completedResponse);

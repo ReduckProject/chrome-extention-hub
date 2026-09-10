@@ -41,7 +41,10 @@ test('a profile rate limit blocks browser requests across tabs but permits passi
     ['send', { tabKey: second, prompt: 'next', requestId: 'must-not-reserve' }],
     ['download', { runId: run.id }],
     ['recover_images', { runId: run.id }],
-  ]) await assert.rejects(rpc(method, args), /access paused/);
+  ]) {
+    const waiting = await rpc(method, args);
+    assert.equal(waiting.state, 'waiting_for_access'); assert.equal(waiting.taskContinues, true);
+  }
   assert.equal(service.store.data.requests['must-not-reserve'], undefined);
   assert.equal(commands.length, 0);
   await rpc('status', { refresh: true });
@@ -148,7 +151,7 @@ test('lazy loading is an explicit completed-result operation, never a default qu
   assert.equal(result.result.complete, true); assert.equal(result.result.images[0].loaded, false);
 });
 
-test('an expired pause stays latched across clients; diagnostics and audit never cause a page mutation', async t => {
+test('paused actions return a continuing wait state while diagnostics stay passive', async t => {
   const { service, ws, rpc, snapshot, until } = await fixture(t);
   snapshot(snap(1)); await until(() => service.store.list().length === 1);
   const tabKey = service.store.list()[0].key;
@@ -156,13 +159,15 @@ test('an expired pause stays latched across clients; diagnostics and audit never
   ws.on('message', data => {
     const message = JSON.parse(data); if (message.type !== 'command') return;
     commands.push(message);
+    if (message.command === 'probe') snapshot(snap(1));
     ws.send(JSON.stringify({ type: 'result', id: message.id, result: { source: 'existing_browser_resource_timing', requests: [] } }));
   });
+  clearInterval(service.tick);
   await rpc('access', { action: 'pause', profileId });
   service.store.data.accessPauses[profileId].retryAt = Date.now() - 1;
-  assert.equal((await rpc('access', { profileId })).accessPause.resumeRequired, true);
-  await assert.rejects(rpc('send', { tabKey, prompt: 'private prompt must not appear in audit', requestId: 'paused-client' }), /access paused/);
-  await assert.rejects(rpc('tabs', { action: 'new', count: 1, profileId }), /access paused/);
+  assert.equal((await rpc('access', { profileId })).accessPause.resumeRequired, false);
+  assert.equal((await rpc('send', { tabKey, prompt: 'private prompt must not appear in audit', requestId: 'paused-client' })).state, 'waiting_for_access');
+  assert.equal((await rpc('tabs', { action: 'new', count: 1, profileId })).state, 'waiting_for_access');
   assert.equal(commands.length, 0);
   const inspected = await rpc('status', { tabKey, diagnostics: true });
   assert.equal(inspected.diagnostics.source, 'existing_browser_resource_timing');
@@ -174,7 +179,8 @@ test('an expired pause stays latched across clients; diagnostics and audit never
   assert.ok(!JSON.stringify(audit).includes('private prompt'));
   const recovered = await rpc('access', { action: 'resume', profileId });
   assert.equal(recovered.resumed, true); assert.equal(recovered.websiteRecoveryVerified, false);
-  assert.equal(commands.length, 1, 'Explicit recovery changes local policy and does not retry a website request');
+  assert.equal(commands.length, 2, 'Recovery observes the page without resending the prompt');
+  assert.equal(commands[1].command, 'probe');
 });
 async function fixture(t) {
   const config = { port: 0, token, extensionId: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' };
@@ -192,6 +198,86 @@ async function fixture(t) {
   const snapshot = data => ws.send(JSON.stringify({ type: 'snapshot', snapshot: data }));
   return { config, service, ws, rpc, rawRpc, lease, snapshot, until };
 }
+
+test('automatic five-minute recovery lets a paused batch continue with its original prompts and lease', async t => {
+  const { service, ws, rpc, snapshot, until } = await fixture(t); clearInterval(service.tick);
+  let now = 1000000, notice = true; service.store.now = () => now;
+  const observation = id => snap(id, id === 1 && notice ? { activity: 'needs_attention', attentionType: 'rate_limit', attention: 'Too many requests' } : {});
+  snapshot(observation(1)); snapshot(observation(2)); await until(() => service.store.list().length === 2);
+  const tabKey = service.store.list().find(t => t.tabId === 2).key;
+  const commands = [];
+  ws.on('message', data => {
+    const m = JSON.parse(data); if (m.type !== 'command') return;
+    commands.push(m);
+    if (m.params.assistantId?.operation === 'dismiss_rate_limit') notice = false;
+    if (m.command === 'probe') snapshot(observation(m.params.tabId));
+    ws.send(JSON.stringify({ type: 'result', id: m.id, result: { accepted: true, confirmed: true, dismissed: !notice } }));
+  });
+  const prompts = ['first exact prompt', 'second exact prompt'];
+  const args = { tabKey, prompt: prompts[0], requestId: 'paused-batch-first' };
+  const waiting = await rpc('send', args);
+  assert.equal(waiting.state, 'waiting_for_access'); assert.equal(waiting.taskContinues, true);
+  assert.equal(waiting.continuation.requestId, args.requestId); assert.equal(Object.keys(service.store.data.requests).length, 0);
+  now += 299999; await service.refreshAccessPauses(); assert.equal(commands.length, 0);
+  const accessWait = rpc('access', { action: 'wait', profileId, timeoutMs: 1000 });
+  now++; await Promise.all([service.refreshAccessPauses(), service.refreshAccessPauses()]);
+  await accessWait;
+  assert.equal((await rpc('access', { profileId })).accessPause, null);
+  assert.equal(commands.filter(c => c.params.assistantId?.operation === 'dismiss_rate_limit').length, 1);
+  assert.equal(commands.filter(c => c.command === 'submit').length, 0, 'Recovery itself never replays a prompt');
+  const first = await rpc('send', args);
+  assert.equal((await rpc('send', args)).existing, true);
+  Object.assign(service.store.data.runs[first.run.id], { phase: 'completed', completedAt: now });
+  now += 10000; snapshot(observation(2)); await until(() => service.store.data.tabs[tabKey].receivedAt === now);
+  await rpc('new_chat', { tabKey });
+  await rpc('send', { tabKey, prompt: prompts[1], requestId: 'paused-batch-second' });
+  assert.deepEqual(commands.filter(c => c.command === 'submit').map(c => c.params.prompt), prompts);
+  assert.equal(Object.keys(service.store.data.requests).length, 2);
+});
+
+test('a persistent notice schedules another five minutes instead of retrying each tick', async t => {
+  const { service, ws, rpc, snapshot, until } = await fixture(t); clearInterval(service.tick);
+  let now = 1000000; service.store.now = () => now;
+  const limited = () => snap(1, { activity: 'needs_attention', attentionType: 'rate_limit', attention: 'Too many requests' });
+  snapshot(limited()); await until(() => service.store.accessPause(profileId));
+  const commands = [];
+  ws.on('message', data => {
+    const m = JSON.parse(data); if (m.type !== 'command') return;
+    commands.push(m.command);
+    if (m.command === 'probe') snapshot(limited());
+    ws.send(JSON.stringify({ type: 'result', id: m.id, result: { dismissed: false, noticeVisible: true } }));
+  });
+  now += 300000; await service.refreshAccessPauses();
+  assert.deepEqual(commands, ['probe', 'read', 'probe']);
+  assert.equal(service.store.accessPause(profileId).retryAfterMs, 300000);
+  assert.equal(service.store.accessPause(profileId).attempts, 1);
+  await service.refreshAccessPauses(); await rpc('access', { action: 'resume', profileId });
+  assert.equal(commands.length, 3);
+  now += 299999; await service.refreshAccessPauses(); assert.equal(commands.length, 3);
+  now++; await service.refreshAccessPauses(); assert.equal(commands.length, 6);
+  assert.equal(service.store.accessPause(profileId).attempts, 2);
+});
+
+test('idle-tab queue survives a five-minute access pause without expiring or consuming polls', async t => {
+  const { service, ws, rpc, rawRpc, snapshot, until } = await fixture(t); clearInterval(service.tick);
+  let now = 1000000; service.store.now = () => now;
+  for (let i = 1; i <= 3; i++) await rawRpc('task', { action: 'acquire', profileId, taskId: `slot-before-pause-${i}` });
+  const queued = await rawRpc('task', { action: 'acquire', profileId, taskId: 'wait-through-access-pause' });
+  assert.equal(queued.state, 'queued');
+  snapshot(snap(1, { activity: 'needs_attention', attentionType: 'rate_limit', attention: 'Too many requests' }));
+  await until(() => service.store.accessPause(profileId));
+  assert.equal((await rawRpc('task', { action: 'acquire', profileId, taskId: queued.taskId })).state, 'waiting_for_access');
+  ws.on('message', data => {
+    const m = JSON.parse(data); if (m.type !== 'command') return;
+    if (m.command === 'probe') snapshot(snap(1));
+    ws.send(JSON.stringify({ type: 'result', id: m.id, result: {} }));
+  });
+  now += 300000; await service.refreshAccessPauses();
+  assert.equal(service.scheduler.data.tasks[queued.taskId].polls, 0);
+  await rpc('task', { action: 'release', profileId, resultsSaved: true });
+  const resumed = await rawRpc('task', { action: 'acquire', profileId, taskId: queued.taskId });
+  assert.equal(resumed.state, 'active'); assert.equal(resumed.polls, 1);
+});
 
 test('two RPC clients can work on different tabs but cannot take a tab during generation or saving', async t => {
   const { service, ws, rpc, rawRpc, lease, snapshot, until } = await fixture(t);

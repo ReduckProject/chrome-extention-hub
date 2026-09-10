@@ -3,6 +3,32 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import { JSDOM } from 'jsdom';
 const source = await fs.readFile(new URL('../extension/adapter.js', import.meta.url), 'utf8');
+
+test('rate-limit recovery acknowledges only the matching website dialog without submitting or fetching', async () => {
+  const { dom, document, adapter } = page();
+  document.body.insertAdjacentHTML('beforeend', '<div role="dialog" id="restriction">请求过于频繁，暂时限制访问对话记录。<button>明白了</button></div><div role="dialog" id="login">请登录<button>确定</button></div>');
+  let acknowledged = 0, unrelated = 0, submitted = 0;
+  document.querySelector('#restriction button').onclick = () => { acknowledged++; document.querySelector('#restriction').remove(); };
+  document.querySelector('#login button').onclick = () => unrelated++;
+  document.querySelector('[data-testid="send-button"]').onclick = () => submitted++;
+  dom.window.fetch = () => { throw new Error('Recovery must not fetch'); };
+  document.querySelector('textarea').value = 'Preserve this draft';
+  const result = await adapter.read({ operation: 'dismiss_rate_limit' });
+  assert.equal(result.dismissed, true); assert.equal(result.noticeVisible, false);
+  assert.equal(acknowledged, 1); assert.equal(unrelated, 0); assert.equal(submitted, 0);
+  assert.equal(document.querySelector('textarea').value, 'Preserve this draft');
+  assert.equal((await adapter.read({ operation: 'dismiss_rate_limit' })).dismissed, false);
+  dom.window.close();
+});
+
+test('rate-limit recovery leaves a retry button and quoted assistant instructions untouched', async () => {
+  const { dom, document, adapter } = page('<article><div role="alert">请求过于频繁<button>明白了</button></div></article>');
+  document.body.insertAdjacentHTML('beforeend', '<div role="alertdialog">Too many requests<button>Retry</button></div>');
+  let clicks = 0; for (const button of document.querySelectorAll('button')) button.onclick = () => clicks++;
+  const result = await adapter.read({ operation: 'dismiss_rate_limit' });
+  assert.equal(result.dismissed, false); assert.equal(result.noticeVisible, true); assert.equal(clicks, 0);
+  dom.window.close();
+});
 function page(extra = '', setup = () => {}) {
   const dom = new JSDOM(`<html><body><header><button data-testid="model-switcher-dropdown-button">Thinking</button></header>
     <main>${extra}</main><form><textarea id="prompt-textarea"></textarea><button data-testid="send-button" type="button">Send</button></form></body></html>`, { url: 'https://chatgpt.com/c/fixture', runScripts: 'outside-only' });
