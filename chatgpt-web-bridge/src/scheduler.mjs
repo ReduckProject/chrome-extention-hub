@@ -14,7 +14,7 @@ export function policyError(code, message, details = {}) {
 export class TaskScheduler {
   constructor(store, options = {}) {
     this.store = store;
-    this.policy = { minSubmissionIntervalMs: 120000, postCompletionCooldownMs: 30000,
+    this.policy = { minSubmissionIntervalMs: 10000, postCompletionCooldownMs: 10000,
       queuePollMs: 20000, queueExpiryMs: 120000, maxQueuePolls: 5, ...options };
     for (const [key, value] of Object.entries(this.policy)) {
       if (!Number.isInteger(value) || value < 0 || value > 3600000) throw new Error(`Invalid scheduling.${key}`);

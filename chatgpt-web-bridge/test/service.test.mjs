@@ -239,12 +239,12 @@ test('profile pacing blocks rapid new chats and preserves simultaneous idempoten
   const run = service.store.data.runs[replies[0].run.id];
   await assert.rejects(rpc('new_chat', { tabKey }), { code: 'PROFILE_BUSY' });
   now += 50000; Object.assign(run, { phase: 'completed', completedAt: now });
-  await assert.rejects(rpc('new_chat', { tabKey }), error => error.code === 'PROFILE_COOLDOWN' && error.details.retryAfterMs === 70000);
+  await assert.rejects(rpc('new_chat', { tabKey }), error => error.code === 'PROFILE_COOLDOWN' && error.details.retryAfterMs === 10000);
   assert.equal((await rpc('send', args)).existing, true);
   assert.equal(service.store.data.requests['blocked-next'], undefined);
   await assert.rejects(rpc('send', { tabKey, prompt: 'two', requestId: 'blocked-next' }), { code: 'PROFILE_COOLDOWN' });
   assert.equal(service.store.data.requests['blocked-next'], undefined);
-  now += 70000;
+  now += 10000;
   snapshot(snap(1)); await until(() => service.store.data.tabs[tabKey].receivedAt === now);
   await rpc('new_chat', { tabKey });
   await rpc('send', { tabKey, prompt: 'two', requestId: 'blocked-next' });

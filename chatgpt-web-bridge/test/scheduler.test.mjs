@@ -64,12 +64,12 @@ test('service restart retains lease ownership and the submission cooldown on dis
   store.file = path.join(dir, 'state.json');
   const a = acquire('persist-owner-a'); acquire('persist-queued-b');
   scheduler.submitted(scheduler.requireLease(profile, a.leaseId), { id: 'intent' });
-  await store.save(); advance(10000);
+  await store.save(); advance(1000);
   const restored = new StateStore({ file: store.file, now: store.now }); await restored.load();
   const next = new TaskScheduler(restored);
   assert.equal(next.requireLease(profile, a.leaseId).taskId, a.taskId);
   assert.equal(next.view(profile).queue[0].taskId, 'persist-queued-b');
-  assert.equal(next.cooldown(profile).retryAfterMs, 110000);
+  assert.equal(next.cooldown(profile).retryAfterMs, 9000);
 });
 
 test('legacy run adoption resolves a blocked queue without resending; abandonment preserves unknown outcomes', async () => {
@@ -91,7 +91,7 @@ test('legacy run adoption resolves a blocked queue without resending; abandonmen
   advance(20000); assert.equal(acquire('queued-new-task').state, 'active');
 });
 
-test('a long response still requires thirty seconds after completion before another workflow starts', () => {
+test('a long response allows the next workflow exactly ten seconds after completion', () => {
   const { store, scheduler, acquire, advance } = fixture();
   const owner = acquire('long-response-owner');
   const run = { id: 'long-run', profileId: profile, createdAt: store.now() };
@@ -99,6 +99,9 @@ test('a long response still requires thirty seconds after completion before anot
   scheduler.submitted(scheduler.requireLease(profile, owner.leaseId), run);
   advance(180000); run.phase = 'completed'; run.completedAt = store.now();
   assert.throws(() => scheduler.authorize(profile, 'new_chat', { leaseId: owner.leaseId }), error =>
-    error.code === 'PROFILE_COOLDOWN' && error.details.retryAfterMs === 30000);
-  advance(30000); scheduler.authorize(profile, 'new_chat', { leaseId: owner.leaseId });
+    error.code === 'PROFILE_COOLDOWN' && error.details.retryAfterMs === 10000);
+  advance(9999);
+  assert.throws(() => scheduler.authorize(profile, 'new_chat', { leaseId: owner.leaseId }), error =>
+    error.code === 'PROFILE_COOLDOWN' && error.details.retryAfterMs === 1);
+  advance(1); scheduler.authorize(profile, 'new_chat', { leaseId: owner.leaseId });
 });

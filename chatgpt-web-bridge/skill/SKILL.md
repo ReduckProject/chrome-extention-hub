@@ -12,7 +12,7 @@ description: 通过本机 ChatGPT Web Bridge MCP 控制 Chrome 中已登录的 C
 - 为整项任务生成一个唯一 taskId（建议 UUID），调用 `chatgpt_task({action:"acquire",profileId,taskId})`。只有 state:active 且取得 leaseId 后才能操作页面；state:queued 时按 retryAfterMs 等待（默认 20 秒）再以原 taskId acquire，初次检查后最多 5 次，state:timed_out/expired 就中断汇报。提前结束等待时 cancel 自己的队列项，不换 taskId 重新排队绕过上限，也不复制 status 中其他任务的 taskId。
 - new_chat、models、select_model、send、download、recover_images、stop，以及 tabs:new、result 的 loadImages/includeAssets 操作，都传本任务的 leaseId。默认 status/result/wait 不需要占用。旧 MCP schema 不接受 leaseId 或没有 chatgpt_task 时，使用同一服务 CLI 的 task 和对应动作方法传参；无凭据的旧客户端会被服务端拒绝，不自动抢占。
 - 一个任务绑定并复用一个 tab，占用持续到整批结果保存和要求的归档、tab 清理结束，随后 `task({action:"release",profileId,leaseId,resultsSaved:true})`。回答 completed 不释放占用；长时间归档可 renew，占用不会因超时自动转交。用户明确取消本任务且无法正常收尾时才可 abandon 并传 confirmAbandon:true；这不停止网页或改变未确认 run 的结果，仍在生成的页面继续阻止新任务。升级前已有的 run 仅由原任务通过 acquire 的 adoptRunId 认领，不重新发送。
-- 连续发送默认至少相隔 120 秒，回答完成后至少再留 30 秒；这只是本地保守节奏，不表示网站限额或已恢复。PROFILE_COOLDOWN 返回 retryAfterMs，期间不开新聊天、不换 tab，按剩余时间分段等待（单次最多 60 秒），再用原参数操作；不同于等待空闲页的 5 次轮询。accessPause 优先，出现后立即停止该等待流程。
+- 连续发送默认至少相隔 10 秒，回答完成后再留 10 秒（按较晚截止时间计算，不叠加为 20 秒）；这只是本地保守节奏，不表示网站限额或已恢复。PROFILE_COOLDOWN 返回 retryAfterMs，期间不开新聊天、不换 tab，按剩余时间分段等待（单次最多 60 秒），再用原参数操作；不同于等待空闲页的 5 次轮询。accessPause 优先，出现后立即停止该等待流程。
 
 - 只按实际返回的 `tabKey` 和 `runId` 操作，不使用“当前 tab”或位置编号。同一 profile 下同一聊天可能开在两个 tab，不能并发向同一聊天发送。
 - 窗口管理按 ChatGPT 标签页（tab）执行。在选定 Chrome profile 内统计跨浏览器窗口的全部当前 ChatGPT tab，优先用 connections.currentTabIds 去重计数；未上报、frozen/discarded 的已打开 tab 也计入，已关闭历史和其他网站不计入。每次新建前重新检查数量：大于等于 4 个时只允许复用，不能继续新开；小于 4 个时优先复用本任务已有空闲 tab，没有才可用 `chatgpt_tabs({action:"new",count:1,leaseId})` 新建一个。并行任务也逐个分配并检查，不能批量创建越过阈值；数量无法确认时不据此新开。

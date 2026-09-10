@@ -22,4 +22,4 @@ MCP 未加载新工具或旧 schema 没有 leaseId 时，把同样的 JSON 写�
 - 只有用户明确取消本任务时，才能 `task({action:"abandon",profileId,leaseId,confirmAbandon:true})` 放弃占用。它不关 tab、不清草稿、不停止生成、不把 unknown 改为失败或完成；当前仍在生成的页面继续阻止新任务。不能因排队慢就放弃或接管别的任务。
 - accessPause 优先于队列与冷却。只有用户明确要求恢复才按主 Skill 的 access 流程检查并操作；解除本地暂停不是网站恢复证明，队列也不会自动发送任何提示词。
 
-本机配置项为 connection.json 的 scheduling.minSubmissionIntervalMs（默认 120000）和 scheduling.postCompletionCooldownMs（默认 30000），修改后重启本机服务。不要打印包含认证密钥的完整配置，也不为通过一次失败提交临时降低保护间隔。
+本机配置项为 connection.json 的 scheduling.minSubmissionIntervalMs（默认 10000）和 scheduling.postCompletionCooldownMs（默认 10000），修改后重启本机服务。不要打印包含认证密钥的完整配置，也不为通过一次失败提交临时降低保护间隔。

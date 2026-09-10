@@ -109,7 +109,7 @@ MCP 返回 structuredContent JSON，并附带相同内容的文本。状态字�
 
 服务端 0.2.0 将同一 Chrome profile 的任务统一排队，每项任务绑定一个 tab，锁覆盖新聊天、模型选择、提交、结果保存和归档。先用唯一 taskId 调用 `chatgpt_task({action:"acquire",profileId,taskId})`，state:active 时保存 leaseId 并传给每次页面动作。state:queued 时默认每 20 秒重新申请，初次检查后最多 5 次；第 5 次仍不可用返回 timed_out，提前取消使用 cancel。无凭据的旧客户端被拒绝；CLI 同样强制检查。详见 [任务协议](skill/references/task-leases.md)。
 
-默认两次提交至少相隔 120 秒，回答完成后至少再留 30 秒。服务端在新聊天、打开模型菜单和发送之前检查；PROFILE_COOLDOWN 返回 retryAfterMs，尚未下发页面命令，也未为下一次消息创建 run。不同 tab 和不同客户端共享此节奏，重复原 requestId 的查询仍保持幂等。参数 scheduling.minSubmissionIntervalMs / scheduling.postCompletionCooldownMs 可在本机配置中调整并重启服务；这些是本地保护间隔，不是网站公布的限额。
+默认两次提交至少相隔 10 秒，回答完成后再留 10 秒；按两个截止时间的较晚者计算，不叠加为 20 秒。服务端在新聊天、打开模型菜单和发送之前检查；PROFILE_COOLDOWN 返回 retryAfterMs，尚未下发页面命令，也未为下一次消息创建 run。不同 tab 和不同客户端共享此节奏，重复原 requestId 的查询仍保持幂等。参数 scheduling.minSubmissionIntervalMs / scheduling.postCompletionCooldownMs 可在本机配置中调整并重启服务；这些是本地保护间隔，不是网站公布的限额。
 
 completed 仅表示回答结束，任务占用仍保留；整批必要结果保存、归档与 tab 清理完成后，以 `task({action:"release",profileId,leaseId,resultsSaved:true})` 释放。占用、队列和发送时间持久化，进程重启不会绕过限制；过期只清理无人继续等待的队列项，不自动抢占 active 任务。新任务不会在后台自动发送，普通 status/result/wait 不需要 leaseId。用户明确取消时可以 abandon 自己的占用，保留网页和未确认 run 的原状态。
 
