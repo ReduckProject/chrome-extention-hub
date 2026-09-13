@@ -37,9 +37,9 @@ test('the first snapshot waits for the current adapter and duplicate bootstrap i
   assert.equal(f.snapshots.length, 0); assert.equal(f.listeners.length, 0);
   f.loaded(); await pending;
   assert.equal(f.snapshots.length, 1); assert.equal(f.snapshots[0].adapterVersion, 42);
-  assert.equal(f.snapshots[0].contentVersion, 5); assert.equal(f.listeners.length, 1);
+  assert.equal(f.snapshots[0].contentVersion, 6); assert.equal(f.listeners.length, 1);
   const probed = await new Promise(resolve => f.listeners[0]({ type: 'command', command: 'probe' }, { id: 'fixture-extension' }, resolve));
-  assert.equal(probed.result.adapterVersion, 42); assert.equal(probed.result.contentVersion, 5);
+  assert.equal(probed.result.adapterVersion, 42); assert.equal(probed.result.contentVersion, 6);
   await f.run(); assert.equal(f.listeners.length, 1); assert.equal(f.counts().loadCount, 1);
 });
 
@@ -58,6 +58,23 @@ test('explicitly preloaded current adapter recovers observations without a new w
   f.context.ChatGPTBridgeAdapter = { version: 42, snapshot: () => ({ adapterVersion: 42, activity: 'idle' }) };
   await f.run();
   assert.equal(f.counts().loadCount, 0); assert.equal(f.snapshots.length, 1);
-  assert.equal(f.snapshots[0].adapterVersion, 42); assert.equal(f.snapshots[0].contentVersion, 5);
+  assert.equal(f.snapshots[0].adapterVersion, 42); assert.equal(f.snapshots[0].contentVersion, 6);
   assert.equal(f.snapshots[0].observationError, undefined); assert.equal(f.listeners.length, 1);
+});
+
+test('submit forwards attachment payload and expiry and confirms the background before clicking', async () => {
+  const f = fixture(); let forwarded, beforeSend;
+  f.context.ChatGPTBridgeAdapter = { version: 45, snapshot: () => ({ adapterVersion: 45 }),
+    async submit(...args) { forwarded = args.slice(0, 4); await args[4](); return { accepted: true }; } };
+  const send = f.context.chrome.runtime.sendMessage;
+  f.context.chrome.runtime.sendMessage = message => {
+    if (message.type === 'before_submit') { beforeSend = message; return Promise.resolve({ ok: true }); }
+    return send(message);
+  };
+  await f.run();
+  const attachments = [{ name: 'file.txt', size: 0, type: 'text/plain', data: '' }];
+  const result = await new Promise(resolve => f.listeners[0]({ type: 'command', command: 'submit', prompt: '',
+    expectedModel: 'Thinking', attachments, expiresAt: 1234, runId: 'upload-run' }, { id: 'fixture-extension' }, resolve));
+  assert.equal(result.result.accepted, true); assert.deepEqual(forwarded, ['', 'Thinking', attachments, 1234]);
+  assert.equal(beforeSend.runId, 'upload-run');
 });

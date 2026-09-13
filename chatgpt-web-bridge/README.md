@@ -31,7 +31,9 @@ flowchart LR
 - Skill **chatgpt-chrome-bridge**，源码见 [skill/SKILL.md](skill/SKILL.md)，可复制到个人 Codex skills 目录下的同名文件夹。
 - 项目依赖：`@modelcontextprotocol/sdk@1.30.0`、`ws@8.21.3`、调研用 `chrome-devtools-mcp@1.9.0`；测试依赖 `jsdom@29.0.2`。使用现有 Node 24.13.0。
 
-日常使用只需专用 Chrome 扩展和 MCP/CLI 服务。扩展权限为 `https://chatgpt.com/*`、storage、scripting、downloads、alarms。运行桥接不依赖 Chrome DevTools MCP，不需要远程调试。
+日常使用只需专用 Chrome 扩展和 MCP/CLI 服务。扩展权限为 `https://chatgpt.com/*`、storage、scripting、downloads、alarms、declarativeNetRequestWithHostAccess。运行桥接不依赖 Chrome DevTools MCP，不需要远程调试。
+
+每次通过桥接发送消息前，扩展会通过 Chrome 网络规则阻止所有 ChatGPT tab 对 `/backend-api/conversations` 的 XHR/fetch 请求（包括查询参数）30 秒，以避免多 tab 同步刷新会话列表放大限流；30 秒内再次发送会重置倒计时。发送消息使用的单数路径 `/backend-api/conversation` 不受影响。规则作用范围是当前 Chrome profile 中安装此扩展的 tab，不影响其它 Chrome profile。
 
 ## 使用
 
@@ -48,13 +50,13 @@ node src/cli.mjs status
 
 | MCP 工具 | 作用 |
 |---|---|
-| `chatgpt_task` | 单 tab 任务占用；有容量即可并行，满额无空闲才等待；保存／归档后 release |
-| `chatgpt_tabs` | 列出当前清单；持有 leaseId 且少于四个 tab 时以 `action:new,count:1` 新建一页 |
+| `chatgpt_task` | 单 tab 任务占用；有容量即可并行，满额无空闲才等待；保存／归档后 release；已确认关闭且无未完成 run 的 tab 自动释放 |
+| `chatgpt_tabs` | 列出当前清单；持有 leaseId 且少于四个 tab 时以 `action:new,count:1` 新建一页；`action:close` 关闭本任务占用的指定页 |
 | `chatgpt_new_chat` | 在指定的同一个 tab 点击“新聊天”，确认空白输入框；串行生图先保存上一张原图再调用 |
 | `chatgpt_status` | 查询模型、活动、连接、新鲜度、任务；`refresh:true` 并行探测 |
 | `chatgpt_models` | 读取菜单勾选的模型名称和当前推理强度；必要时关闭没有草稿的图片查看器 |
 | `chatgpt_select_model` | 按精确标签选择并读回，检查 `confirmed:true` |
-| `chatgpt_send` | 提交 prompt，返回持久化 run；必须提供稳定 requestId |
+| `chatgpt_send` | 发送文字、图片或文件，返回持久化 run；必须提供稳定 requestId |
 | `chatgpt_access` | 查询／记录暂停，5 分钟自动检查恢复；wait 保持任务等待，恢复后继续原步骤 |
 | `chatgpt_result` | 按 runId 默认返回对应回答的完整正文和图片信息；需要图片哈希时传 `includeAssets:true` |
 | `chatgpt_download` | 点击对应图片保存控件，验证下载文件，返回路径 |
@@ -83,6 +85,48 @@ MCP 返回 structuredContent JSON，并附带相同内容的文本。状态字�
 
 图片加载不重置回答内容的稳定计时。`wait` 在任务结束后立即返回，不再等待图片；完成是否满足提示词、是否真的生图，由调用方检查结果。`imageCount` 是已观测图片数，`loadedImageCount` 是加载成功数，`downloadCount` 是已验证保存的文件数。
 
+## 发送图片和文件
+
+`chatgpt_send` 和 CLI 的 `send` 共用 `attachments` 参数，每项可提供本机文件的绝对路径，或直接传入图片／文件内容，无需先写入临时文件。支持文字加附件，也可省略 `prompt` 只发附件；`kind` 仍表示期望的回答类型，不表示附件类型。
+
+直接传图片内容（`data` 也可填标准带 padding 的纯 base64，此时可用 `mimeType:"image/png"` 指定类型）：
+
+```javascript
+chatgpt_send({
+  tabKey, leaseId,
+  requestId: "pasted-image-001",
+  prompt: "分析这张图片",
+  attachments: [{
+    name: "reference.png",
+    data: "data:image/png;base64,<图片内容>"
+  }]
+})
+```
+
+`name` 是带扩展名的文件名，不能含目录。`mimeType` 可省略，默认从 data URL 或文件扩展名识别；同时指定时须与 data URL 一致。普通文件同样可用 `{name:"report.pdf",mimeType:"application/pdf",data:"<base64内容>"}`。`data` 不接受远程 URL，也不自动下载链接。单个附件使用 `path` 或 `name/data` 其中一种，同一消息可混合两种来源。示例中的内容占位符需替换为实际编码。
+
+从本地路径发送：
+
+```javascript
+chatgpt_send({
+  tabKey, leaseId,
+  requestId: "review-reference-001",
+  prompt: "结合参考图和说明文档，分析设计要求。",
+  attachments: [
+    { path: "E:\\Materials\\参考图.png" },
+    { path: "E:\\Materials\\说明.pdf" }
+  ]
+})
+```
+
+桥接器每条消息最多接收 10 个文件、总计 20 MiB（按解码后的字节计算），文件名须互不重复。服务读取文件或解码直接传入的内容并计算 SHA-256，通过已认证的本机连接将字节交给扩展；网页使用文件输入框或粘贴事件上传，不需要改写系统剪贴板。网页自身的文件格式、账号和模型限制仍适用。历史 run 保存文件名、类型、大小、哈希及本地来源的路径，不保存文件正文或 base64。
+
+附件发送会立即返回持久化的 `runId`，最初可能为 `submitting`。继续通过 `status` / `wait` 查询，再用 `result` 获取回答。网页最多等待 90 秒确认附件卡片齐全、上传进度结束且发送按钮可用，然后点击发送；上传失败、超时、草稿或模型被修改时不会点击发送，保留草稿供检查。`submission_unknown` 仍须查询原 run，不能换 requestId 重发。
+
+同一 requestId 的重查也校验附件来源、文件名、类型及内容；直接传入的纯 base64 和 data URL 在解码内容及元数据一致时视为同一请求。本地路径方式须保持原文件可读且内容不变；文件变更或增删附件会被拒绝，重复请求不会再次上传。文件已经移动或删除时，直接用原 `runId` 查询。附件草稿会阻止新聊天、关闭页面和释放占用，避免丢失尚未发送的内容。
+
+此功能要求 **adapter 45 / content 6**。升级源码后运行 `npm run setup`，重新加载 Chrome 扩展及需要发送附件的目标页面，并重启桥接服务、重新加载 MCP 工具定义。旧观察器会明确拒绝附件请求。附件流程已通过模拟 DOM 和本机服务集成测试，尚未进行真实 ChatGPT 上传验收。
+
 ## 查询网页回答
 
 `chatgpt_result({runId})` 默认读取绑定到该任务的 assistant 正文和图片信息，不读取其他聊天或其他回答。回答正在输出时也能查询已有内容，`result.complete:false` 表示这份内容尚未确认完整。普通文字拒绝作为网页正文返回，不额外猜测拒绝分类。例如回答已经结束且没有图片时，返回字段节选为：
@@ -103,7 +147,7 @@ MCP 返回 structuredContent JSON，并附带相同内容的文本。状态字�
 
 `result.images` 包含网页中实际观察到的图片 URL、尺寸、alt、`loaded` 和 `loadState:loaded|pending|error`，也包括小图及加载失败的图片。默认读取这些信息不下载图片或计算哈希，因此媒体问题不会阻断正文读取。`includeAssets:true` 才额外读取已加载的同源图片字节并计算 SHA-256，成功的哈希位于 `assets`；单张失败在该图片的 `assetError` 中说明。`includeText:false` 保留为仅查询 run 元数据的兼容参数。
 
-已查询过的正文和图片信息会缓存。原页面离开或断线后，可返回 `resultSource:cache` 及该份内容的 `observedAt`、`complete`，并用 `resultError` 说明为何不能实时读取；未产生或从未缓存过的回答可能返回 `result:null`，不会拿其他回答代替。缓存不是已下载原图，原图保存仍以 `verifiedDownloads` 为准。
+已查询过的正文和图片信息会缓存。原页面离开或断线后，可返回 `resultSource:cache` 及该份内容的 `observedAt`、`complete`，并用 `resultError` 说明为何不能实时读取；对于已完成且 `resultLength` 与 `resultPreview` 长度相同的短回答，即使从未查询过原文，也会以 `resultSource:run_preview` 返回已观测的完整文本（例如生图额度用尽提示）。较长回答的预览可能被截断，未产生或从未缓存过的这类回答仍可能返回 `result:null`，不会拿其他回答代替。缓存不是已下载原图，原图保存仍以 `verifiedDownloads` 为准。
 
 ## 任务占用与提交节奏
 
@@ -111,9 +155,9 @@ MCP 返回 structuredContent JSON，并附带相同内容的文本。状态字�
 
 同一 profile 两次发送至少相隔 10 秒，不等待其它 tab 的回答结束。某 tab 回答完成后，该页再留 10 秒才能新聊天、操作模型或再次发送；其它 tab 的新聊天和模型操作可继续。两个截止时间取较晚者，不叠加为 20 秒。PROFILE_COOLDOWN 返回 retryAfterMs，未下发页面命令或创建下一条 run；原 requestId 重查仍幂等。scheduling.minSubmissionIntervalMs / scheduling.postCompletionCooldownMs 是这两个本地配置项，不表示网站公布的限额。
 
-completed 仅表示回答结束，任务占用仍保留；整批必要结果保存、归档完成后，以 `task({action:"release",profileId,leaseId,resultsSaved:true})` 释放。占用、队列和发送时间持久化，进程重启不会绕过限制；过期只清理无人继续等待的队列项，不自动抢占 active 任务。新任务不会在后台自动发送，普通 status/result/wait 不需要 leaseId。用户明确取消时可以 abandon 自己的占用，保留网页和未确认 run 的原状态。
+completed 仅表示回答结束；通常整批必要结果保存、归档完成后，以 `task({action:"release",profileId,leaseId,resultsSaved:true})` 释放。若 tab 已被确认关闭且没有未完成 run，服务会自动将任务转为 `released`；若仍有 `generating`、`submission_unknown` 等未完成 run，则转为 `orphaned`，移出 active lease 但保留 run 和告警，不能复用原 taskId。占用、队列和发送时间持久化，进程重启不会绕过限制；过期只清理无人继续等待的队列项，不自动抢占仍有当前 tab 或未决 run 的 active 任务。新任务不会在后台自动发送，普通 status/result/wait 不需要 leaseId。用户明确取消时可以 abandon 自己的占用，保留网页和未确认 run 的原状态。
 
-旧 MCP schema 缺少新工具或 leaseId 参数时，在子项目目录用同一服务的 `node src/cli.mjs task --input <UTF-8 JSON 文件>` 及相应动作方法操作，不需重新加载 Chrome 扩展。扩展仍为 0.1.2 / adapter 43 / content 5，服务及 MCP 为 0.2.2（schedulerVersion:2 / accessRecoveryVersion:1）。
+旧 MCP schema 缺少新工具或 leaseId 参数时，在子项目目录用同一服务的 `node src/cli.mjs task --input <UTF-8 JSON 文件>` 及相应动作方法操作；仅任务占用协议不需重新加载 Chrome 扩展。当前扩展为 0.1.4 / adapter 45 / content 6，服务及 MCP 为 0.2.2（schedulerVersion:2 / accessRecoveryVersion:1）。附件上传需更新扩展及目标页面。
 
 ## 逐张生成与结果保存
 
@@ -140,6 +184,20 @@ Skill 按目标 Chrome profile 内全部当前 ChatGPT tab 计数，跨浏览器
 5. 整批结果保存和归档完成后，显式 release 释放占用。
 
 `submission_unknown` 表示网页是否接受尚未确认。先查询或用**相同 ID、相同参数**重试，不能换 ID 重发。重复请求返回 existing:true 和原 runId。已有草稿不会被覆盖。
+
+## 关闭标签页
+
+保存必要结果及归档后，在释放任务占用之前调用：
+
+```javascript
+chatgpt_tabs({ action: "close", tabKey, leaseId, resultsSaved: true })
+```
+
+必须使用本任务已经绑定的精确 `tabKey` 和有效 `leaseId`。服务拒绝关闭其它任务的页、有草稿、状态过期或存在未确认／正在生成回答的页；扩展执行前还会核对浏览器会话、文档、网址及内容，并重新读取页面状态。`resultsSaved:true` 是调用方确认必要结果已经保存，不代表服务自动下载或归档。
+
+成功返回 `closed:true`，当前标签页清单立即移除该页，历史 run、已缓存正文和已验证文件仍保留。若没有未完成 run，关闭会自动释放任务占用；若存在未确认／正在生成的 run，任务会转为 `orphaned` 并保留告警。关闭结果不确定时先查询状态，再以原 tabKey 重查；不能用新的数字 tab ID 猜测目标。
+
+CLI 使用同样的 `tabs` 方法及 UTF-8 JSON 参数文件。升级时需重启本机服务、重新加载 MCP 工具定义，并在运行 `npm run setup` 后从 Chrome 扩展管理页重新加载扩展；只热更新页面观察器不能加载后台的关闭命令。
 
 ## 原图验证
 
@@ -182,12 +240,13 @@ setup 生成 runtime/extension、固定扩展 ID、本机认证配置，不代�
 
 已有实例的源码可以独立纳入本仓库，当前安装不会自动迁移。迁移运行实例时需保留其 runtime 配置和状态；环境变量 CHATGPT_BRIDGE_RUNTIME 可指定现有 runtime 目录。Chrome 扩展仍从加载时的目录运行，重新加载前应保留该目录。每个实例的认证配置需与其本地服务一致。
 
-扩展 0.1.2 的 manifest 只注册 content.js 启动脚本，contentVersion:5 在首次上报前，请求后台用 scripting API 为当前 tab 加载 adapter.js（当前 v42）。显式 refresh_observers 已先加载新 adapter 时直接使用它，避免旧后台未识别 load_adapter 协议导致整个观察器退出。初始化失败返回 bootstrapError，页面保持不可提交。Chrome 会缓存 manifest 静态脚本，覆盖磁盘文件并热更新现有页面不会更新这份缓存；更新 content/manifest/background 后需要在 Chrome 重新加载扩展。后续仅修改 adapter 可运行 npm run setup 与 CLI refresh_observers，新的页面也会动态加载当前版本。固定加载消息只接受本扩展在 ChatGPT 顶层页面的请求，忽略调用方提供的 tabId/脚本，只加载自带 adapter.js，不重装其他 tab。
+扩展 0.1.3 的 manifest 只注册 content.js 启动脚本，contentVersion:5 在首次上报前，请求后台用 scripting API 为当前 tab 加载 adapter.js（当前 v43）。显式 refresh_observers 已先加载新 adapter 时直接使用它，避免旧后台未识别 load_adapter 协议导致整个观察器退出。初始化失败返回 bootstrapError，页面保持不可提交。Chrome 会缓存 manifest 静态脚本，覆盖磁盘文件并热更新现有页面不会更新这份缓存；更新 content/manifest/background 后需要在 Chrome 重新加载扩展。后续仅修改 adapter 可运行 npm run setup 与 CLI refresh_observers，新的页面也会动态加载当前版本。固定加载消息只接受本扩展在 ChatGPT 顶层页面的请求，忽略调用方提供的 tabId/脚本，只加载自带 adapter.js，不重装其他 tab。发送触发的会话列表拦截状态会保存到本次浏览器会话，service worker 重启不会提前解除剩余 30 秒。
 
-连接诊断读取 status/tabs/CLI health 的 connections：connection 表示扩展到本地服务的连接，currentTabIds 是当前 Chrome 清单及后续观察发现的页面，unobservedTabIds 表示尚未上报首份快照，freshTabCount 表示状态可用的页面数。旧 tab 的 disconnected/stale 不代表整个桥接断开。默认 status({refresh:true}) 按当前浏览器清单最多并发探测四页，包含从未成功上报的新 tab，并跳过已关闭页面及断连旧 profile；显式 tabKey 仍只探测目标。observationErrors 保留页面通道错误，bootstrapError 保留初始化的具体原因。连接存在但页面观察失败时，不应笼统要求重新登录 ChatGPT。
+连接诊断读取 status/tabs/CLI health 的 connections：connection 表示扩展到本地服务的连接，currentTabIds 是当前 Chrome 清单及后续观察发现的页面，unobservedTabIds 表示尚未上报首份快照，freshTabCount 表示状态可用的页面数。旧 tab 的 disconnected/stale 不代表整个桥接断开。`status` 和 `tabs` 默认只返回当前 browser session 的 inventory 页面及其 run；历史 tab 不再混入默认结果。默认 status({refresh:true}) 按当前浏览器清单最多并发探测四页，包含从未成功上报的新 tab，并跳过已关闭页面及断连旧 profile；显式指定已过期 tabKey 时只返回 closed 标记，不再探测。observationErrors 保留页面通道错误，bootstrapError 保留初始化的具体原因。连接存在但页面观察失败时，不应笼统要求重新登录 ChatGPT。
 
 ## 验证范围与限制
 
+- 2026-09-11 扩展 0.1.3：改为仅在桥接发送前启动 30 秒会话列表拦截窗口，窗口内再次发送重置截止时间；桥接断开不提前解除。状态使用 session storage 和 alarm 恢复，service worker 重启不会丢失剩余窗口。规则只匹配 XHR/fetch，不匹配发送消息的单数 conversation 路径。
 - 2026-09-11 扩展 0.1.2 / content v5：现场扩展 WebSocket 正常连接，但新 tab 没有消息接收器；增加初始化错误上报后确认后台没有确认 load_adapter 请求。显式热更新已预载 adapter 时直接安装观察器，恢复两个现有页面。90 项完整测试通过，包括新页面加入当前清单、首次上报失败、定向查询旧记录时不污染当前连接错误等回归。
 - 用户重新加载 0.1.2 后，新建一个独立空白诊断页，在未先热更新的条件下首次收到 adapterVersion:42 / contentVersion:5；随后状态为 idle、composerReady:true、stale:false，模型菜单实测勾选“最新”、推理强度“高”。此次只验证连接、启动和模型读取，没有提交图片提示词。浏览器 UI 工具读取该页超时，因此未自动关闭这一个诊断页；不影响桥接器已验证的页面读取。
 - 2026-09-10 adapter v42 / 扩展 0.1.1：真实模型菜单包含“最新”、GPT-5.6 Sol 和 GPT-5.5。修复“最新”名称被过滤的问题，并在独立空白页验证“最新 → GPT-5.5 → GPT-5.6 Sol → 最新”，每次切换均 confirmed:true，分别读回模型名称、推理强度“高”和名称来源。完整测试 86 项通过，覆盖首次上报等待新 adapter、重复启动去重、失败重试及加载消息的 tab／来源限制。

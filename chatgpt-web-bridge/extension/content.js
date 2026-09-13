@@ -16,18 +16,18 @@
   } catch (error) {
     globalThis.chatGPTBridgeContentInstalled = false;
     chrome.runtime.sendMessage({ type: 'snapshot', snapshot: { url: location.href, documentId,
-      contentVersion: 5, adapterVersion: null, activity: 'unknown', composerReady: false,
+      contentVersion: 6, adapterVersion: null, activity: 'unknown', composerReady: false,
       bootstrapError: error.message,
       observationError: `Adapter bootstrap failed: ${error.message}`,
       contentSignature: 'adapter_bootstrap_failed' } }).catch(() => {});
     return;
   }
-  globalThis.chatGPTBridgeContentVersion = 5;
+  globalThis.chatGPTBridgeContentVersion = 6;
   const adapter = globalThis.ChatGPTBridgeAdapter;
   let timer, lastSignature;
   function emit(force = false) {
     try {
-      const state = { ...adapter.snapshot(), documentId, contentVersion: 5 };
+      const state = { ...adapter.snapshot(), documentId, contentVersion: 6 };
       const signature = JSON.stringify(state);
       if (force || signature !== lastSignature) {
         lastSignature = signature;
@@ -49,11 +49,14 @@
       if (message.documentId && message.documentId !== documentId) throw new Error('Page document changed; refresh status before acting');
       let result;
       switch (message.command) {
-        case 'probe': result = { ...adapter.snapshot(), documentId, contentVersion: 5 }; break;
+        case 'probe': result = { ...adapter.snapshot(), documentId, contentVersion: 6 }; break;
         case 'models': result = await adapter.models(); break;
         case 'new_chat': result = await adapter.newChat(); break;
         case 'select_model': result = await adapter.selectModel(message.label); break;
-        case 'submit': result = await adapter.submit(message.prompt, message.expectedModel); break;
+        case 'submit': result = await adapter.submit(message.prompt, message.expectedModel, message.attachments, message.expiresAt, async () => {
+          const ready = await chrome.runtime.sendMessage({ type: 'before_submit', runId: message.runId });
+          if (!ready?.ok) throw new Error(ready?.error || 'Background did not confirm upload submission');
+        }); break;
         case 'read': result = adapter.read(message.assistantId); break;
         case 'image_chunk': result = await adapter.imageChunk(message.assistantId, message.index, message.offset); break;
         case 'stop': result = await adapter.stopGeneration(message.userMessageId, message.prompt); break;

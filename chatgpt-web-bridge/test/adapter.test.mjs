@@ -38,6 +38,117 @@ function page(extra = '', setup = () => {}) {
   return { dom, document: dom.window.document, adapter: dom.window.ChatGPTBridgeAdapter };
 }
 
+function uploadPage({ fail = false, changed = false, paste = false } = {}) {
+  const fixture = page('', window => {
+    window.DataTransfer = class {
+      files = [];
+      items = { add: file => this.files.push(file) };
+    };
+    window.ClipboardEvent = class extends window.Event {
+      constructor(type, options) { super(type, options); this.clipboardData = options.clipboardData; }
+    };
+  });
+  const { dom, document } = fixture, form = document.querySelector('form');
+  const send = document.querySelector('[data-testid="send-button"]');
+  let clicks = 0, received = [];
+  const addFiles = files => {
+    received = [...files]; send.disabled = true;
+    for (const file of files) {
+      const card = document.createElement('div'); card.dataset.testid = 'attachment';
+      const filename = document.createElement('span'); filename.textContent = file.name; card.append(filename);
+      card.insertAdjacentHTML('beforeend', '<span role="progressbar"></span><button type="button" aria-label="Remove file">×</button>');
+      form.append(card);
+    }
+    dom.window.setTimeout(() => {
+      if (fail) form.insertAdjacentHTML('beforeend', '<div role="alert">File upload failed</div>');
+      else {
+        form.querySelectorAll('[role="progressbar"]').forEach(n => n.remove()); send.disabled = false;
+        if (changed) document.querySelector('textarea').value = 'human draft';
+      }
+    }, 150);
+  };
+  if (paste) document.querySelector('textarea').addEventListener('paste', event => addFiles(event.clipboardData.files));
+  else {
+    form.insertAdjacentHTML('beforeend', '<input type="file" multiple hidden>');
+    const input = form.querySelector('input');
+    Object.defineProperty(input, 'files', { writable: true, value: [] });
+    input.addEventListener('change', () => { addFiles(input.files); input.files = []; });
+  }
+  send.onclick = () => {
+    clicks++;
+    assert.equal(form.querySelectorAll('[role="progressbar"]').length, 0);
+    const user = document.createElement('div'); user.dataset.messageAuthorRole = 'user'; user.dataset.messageId = 'uploaded-user';
+    const prompt = document.createElement('div'); prompt.className = 'whitespace-pre-wrap'; prompt.textContent = document.querySelector('textarea').value;
+    const tile = document.createElement('div'); tile.dataset.testid = 'attachment'; tile.textContent = received.map(file => file.name).join(' ');
+    user.append(tile, prompt); document.querySelector('main').append(user);
+    form.querySelectorAll('[data-testid="attachment"]').forEach(n => n.remove()); document.querySelector('textarea').value = '';
+  };
+  return { ...fixture, clicks: () => clicks, received: () => received };
+}
+const uploadFiles = [
+  { name: '参考.png', type: 'image/png', size: 3, data: Buffer.from([0, 255, 1]).toString('base64') },
+  { name: '说明.pdf', type: 'application/pdf', size: 4, data: Buffer.from('%PDF').toString('base64') },
+];
+
+test('mixed image/file upload waits for UI readiness and binds text separately from attachment tiles', async () => {
+  const f = uploadPage();
+  try {
+    const result = await f.adapter.submit('请分析附件', 'Thinking', uploadFiles);
+    assert.equal(result.accepted, true); assert.equal(result.userMessageId, 'uploaded-user'); assert.equal(f.clicks(), 1);
+    assert.deepEqual(f.received().map(file => [file.name, file.type, file.size]), uploadFiles.map(file => [file.name, file.type, file.size]));
+    const reader = new f.dom.window.FileReader();
+    const bytes = new Promise(resolve => { reader.onload = () => resolve(Buffer.from(reader.result)); });
+    reader.readAsArrayBuffer(f.received()[0]); assert.deepEqual(await bytes, Buffer.from([0, 255, 1]));
+    assert.equal(f.adapter.snapshot().lastUserText, '请分析附件');
+  } finally { f.dom.window.close(); }
+});
+
+test('attachment-only paste works when there is no file input', async () => {
+  const f = uploadPage({ paste: true });
+  try {
+    assert.equal((await f.adapter.submit('', 'Thinking', [uploadFiles[1]])).accepted, true);
+    assert.equal(f.clicks(), 1); assert.equal(f.adapter.snapshot().lastUserText, '');
+  } finally { f.dom.window.close(); }
+});
+
+test('upload failure or a concurrent human edit leaves attachments and draft without sending', async () => {
+  for (const options of [{ fail: true }, { changed: true }]) {
+    const f = uploadPage(options);
+    try {
+      const result = await f.adapter.submit('read', 'Thinking', uploadFiles);
+      assert.equal(result.notSubmitted, true); assert.equal(f.clicks(), 0);
+      assert.match(result.error, options.fail ? /upload failed/i : /Draft changed/);
+      assert.equal(f.adapter.snapshot().attachmentCount, 2);
+      assert.equal(f.document.querySelector('textarea').value, options.fail ? 'read' : 'human draft');
+    } finally { f.dom.window.close(); }
+  }
+});
+
+test('existing attachment-only drafts block both send and new chat; expired commands never click', async () => {
+  const f = uploadPage();
+  try {
+    f.document.querySelector('form').insertAdjacentHTML('beforeend', '<div data-testid="attachment">own-file.pdf<button type="button" aria-label="Remove file">×</button></div>');
+    assert.equal((await f.adapter.submit('read')).notSubmitted, true);
+    await assert.rejects(f.adapter.newChat(), /draft/);
+    f.document.querySelector('[data-testid="attachment"]').remove();
+    const result = await f.adapter.submit('read', 'Thinking', [], Date.now() - 1);
+    assert.equal(result.notSubmitted, true); assert.match(result.error, /expired/); assert.equal(f.clicks(), 0);
+  } finally { f.dom.window.close(); }
+});
+
+test('unconfirmed uploads time out without sending a text-only message', async () => {
+  const f = uploadPage();
+  try {
+    // Simulate a site that accepts the event but never renders attachment cards.
+    f.document.querySelector('input').replaceWith(f.document.querySelector('input').cloneNode());
+    Object.defineProperty(f.document.querySelector('input'), 'files', { writable: true, value: [] });
+    let now = Date.now(); f.dom.window.Date.now = () => now += 10000;
+    const result = await f.adapter.submit('read', 'Thinking', uploadFiles);
+    assert.equal(result.notSubmitted, true); assert.match(result.error, /not confirmed/);
+    assert.equal(f.clicks(), 0); assert.equal(f.document.querySelector('textarea').value, 'read');
+  } finally { f.dom.window.close(); }
+});
+
 test('unversioned composer selectors identify Latest without inventing a backend version', () => {
   const { dom, adapter, document } = page();
   document.querySelector('header button').remove();
@@ -93,10 +204,10 @@ test('model menus can be opened from an effort pill, read by checked name and se
       document.body.insertAdjacentHTML('beforeend', '<div role="menu"><button role="menuitem" id="choose">选择模型</button></div>');
       document.querySelector('#choose').onclick = () => {
         const menu = document.querySelector('[role="menu"]'); menu.replaceChildren();
-        for (const name of ['最新', 'GPT-5.5', 'GPT-5.6 Sol']) {
+        for (const name of ['最新', 'GPT-5.5', 'GPT-5.6 Sol', 'GPT-6 Pro']) {
           const option = document.createElement('button'); option.textContent = name;
           option.setAttribute('role', 'menuitemradio'); option.setAttribute('aria-checked', String(name === selected));
-          option.onclick = () => { selected = name; button.textContent = name === '最新' ? '高' : name === 'GPT-5.5' ? '5.5\n高' : '5.6\n高'; close(); };
+          option.onclick = () => { selected = name; button.textContent = name === '最新' ? '高' : name === 'GPT-6 Pro' ? '6\nPro' : name === 'GPT-5.5' ? '5.5\n高' : '5.6\n高'; close(); };
           menu.append(option);
         }
       };
@@ -111,6 +222,11 @@ test('model menus can be opened from an effort pill, read by checked name and se
     const changed = await adapter.selectModel('GPT-5.5');
     assert.equal(changed.confirmed, true); assert.equal(changed.model.name, 'GPT-5.5');
     assert.equal(changed.model.reasoningEffort, '高'); assert.equal(changed.model.nameIsCached, false);
+    const pro = await adapter.selectModel('GPT-6 Pro');
+    assert.equal(pro.confirmed, true); assert.equal(pro.model.name, 'GPT-6 Pro');
+    assert.equal(pro.model.label, '6\nPro'); assert.equal(pro.model.reasoningEffort, null);
+    assert.equal(pro.verification, 'visible_menu_selection');
+    assert.equal((await adapter.models()).current.name, 'GPT-6 Pro');
     const latest = await adapter.selectModel('最新');
     assert.equal(latest.confirmed, true); assert.equal(latest.model.name, '最新');
     assert.equal(latest.model.label, '高'); assert.equal(latest.model.reasoningEffort, '高');
@@ -130,6 +246,33 @@ test('explicit version labels are recognized beyond a hard-coded model release l
   assert.equal(adapter.snapshot().model.name, 'GPT-6.1');
   assert.equal(adapter.snapshot().model.nameIsCached, false);
   dom.window.close();
+});
+
+test('integer versions and Pro suffixes are recognized in composer and header controls', () => {
+  for (const inHeader of [false, true]) {
+    const { dom, adapter, document } = page();
+    try {
+      document.querySelector('header button').remove();
+      const button = document.createElement('button');
+      button.setAttribute('aria-haspopup', 'menu');
+      if (inHeader) button.setAttribute('data-testid', 'model-switcher-dropdown-button');
+      document.querySelector(inHeader ? 'header' : 'form').append(button);
+      for (const [label, name, effort] of [
+        ['6 PRO', 'GPT-6 PRO', null], ['6\nPro', 'GPT-6 Pro', null],
+        ['GPT-6 Pro', 'GPT-6 Pro', null], ['6\n即时', 'GPT-6', null],
+        ['6\n高', 'GPT-6', '高'], ['GPT-6 Pro\nHeavy', 'GPT-6 Pro', 'Heavy'],
+        ['6\nPro\nHigh', 'GPT-6 Pro', 'High'], ['5.5 Pro\n高', 'GPT-5.5 Pro', '高'],
+        ['5.6 Sol\nMedium', 'GPT-5.6 Sol', 'Medium'],
+      ]) {
+        button.textContent = label;
+        const model = adapter.snapshot().model;
+        assert.equal(model.label, label); assert.equal(model.name, name, label);
+        assert.equal(model.reasoningEffort, effort, label);
+        assert.equal(model.nameSource, 'model_control'); assert.equal(model.nameIsCached, false);
+        assert.equal(model.actualBackendModel, null);
+      }
+    } finally { dom.window.close(); }
+  }
 });
 
 test('image-only assistant sections replace placeholders and remain readable by turn identity', async () => {

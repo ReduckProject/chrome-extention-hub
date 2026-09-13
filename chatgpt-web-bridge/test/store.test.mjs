@@ -19,6 +19,26 @@ function fixture(options = {}) {
   return { store, snap, advance: ms => { time += ms; } };
 }
 
+test('attachment requests need upload acceptance and preserve exact identity across retries', async () => {
+  const { store, snap, advance } = fixture();
+  const tabKey = snap(1), attachments = [{ path: 'fixture.pdf', name: 'fixture.pdf', type: 'application/pdf', size: 1, sha256: 'a'.repeat(64) }];
+  const params = { tabKey, attachments, requestId: 'file-only-retry' };
+  const { run } = await store.reserve(params);
+  assert.equal((await store.reserve(params)).existing, true);
+  await assert.rejects(store.reserve({ ...params, attachments: [{ ...attachments[0], sha256: 'b'.repeat(64) }] }), /different input/);
+  const response = { userCount: 1, lastUserText: '', lastUserId: 'u-file', assistantCount: 1, lastAssistantId: 'a-file', finalActions: true };
+  snap(1, response); advance(2600); snap(1, response);
+  assert.equal(run.accepted, false, 'An empty user message alone cannot confirm an upload');
+  store.submissionResult(run.id, { accepted: true, userMessageId: 'u-file' });
+  assert.equal(run.phase, 'completed'); assert.equal(run.resultAssistantId, 'a-file');
+});
+
+test('an attachment-only draft is never treated as an empty composer', async () => {
+  const { store, snap } = fixture(); const tabKey = snap(1, { attachmentCount: 1 });
+  await assert.rejects(store.reserve({ tabKey, prompt: 'read', requestId: 'existing-file-draft' }), /existing attachments/);
+  assert.equal(Object.keys(store.data.runs).length, 0);
+});
+
 test('missing placeholder is reported and the matching image turn completes the original run', async () => {
   const { store, snap, advance } = fixture();
   const tabKey = snap(1);

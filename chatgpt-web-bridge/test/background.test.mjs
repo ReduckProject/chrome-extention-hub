@@ -5,7 +5,7 @@ import vm from 'node:vm';
 import { randomUUID } from 'node:crypto';
 const source = await fs.readFile(new URL('../extension/background.js', import.meta.url), 'utf8');
 function fixture() {
-  const storage = { local: {}, session: {} }, clicks = [], created = [], sockets = [], timers = [], scripts = [];
+  const storage = { local: {}, session: {} }, clicks = [], created = [], removed = [], sockets = [], timers = [], scripts = [], ruleUpdates = [];
   const event = () => ({ listeners: [], addListener(callback) { this.listeners.push(callback); } });
   const area = name => ({
     get: async key => key === null ? { ...storage[name] } : { [key]: storage[name][key] },
@@ -29,19 +29,85 @@ function fixture() {
       tabs: {
         get: async id => ({ id, url: id === 999 ? 'https://example.org/' : `https://chatgpt.com/c/${id}` }),
         query: async () => [], create: async options => { const tab = { id: created.length + 1, url: options.url }; created.push(tab); return tab; },
+        remove: async id => { removed.push(id); },
         sendMessage: async (id, message) => {
           if (message.command === 'submit') { clicks.push({ id, message }); return { result: { accepted: true } }; }
-          return { result: { documentId: `doc-${id}`, url: `https://chatgpt.com/c/${id}`, activity: 'idle' } };
+          return { result: { documentId: `doc-${id}`, url: `https://chatgpt.com/c/${id}`, activity: 'idle', composerReady: true, draftLength: 0, contentSignature: 'initial' } };
         }, onUpdated: event(), onRemoved: event(),
       },
       downloads: { onCreated: event(), onChanged: event(), search: async () => [] },
+      declarativeNetRequest: { updateDynamicRules: async rules => { ruleUpdates.push(rules); } },
       runtime: { id: 'fixture-extension', onMessage: event(), onStartup: event(), onInstalled: event() },
       alarms: { onAlarm: event(), create() {} },
     },
   });
   vm.runInContext(source, context);
-  return { context, clicks, created, sockets, timers, storage, scripts, exec: code => vm.runInContext(code, context) };
+  return { context, clicks, created, removed, sockets, timers, storage, scripts, ruleUpdates, exec: code => vm.runInContext(code, context) };
 }
+
+function closeTab(f, overrides = {}) {
+  return f.exec(`getIdentity().then(ids => execute({id:'close-one',command:'close_tab',expiresAt:Date.now()+5000,
+    params:{...ids,tabId:1,documentId:'doc-1',url:'https://chatgpt.com/c/1',contentSignature:'initial',resultsSaved:true,...${JSON.stringify(overrides)}}}))`);
+}
+
+test('post-upload protection requires an active receipt for the sending tab', async () => {
+  const f = fixture(); await new Promise(resolve => setImmediate(resolve));
+  const listener = f.context.chrome.runtime.onMessage.listeners[0];
+  const request = (runId, tabId = 1) => new Promise(resolve => listener({ type: 'before_submit', runId },
+    { id: 'fixture-extension', frameId: 0, tab: { id: tabId, url: 'https://chatgpt.com/' } }, resolve));
+  f.storage.local['receipt:upload'] = { startedAt: Date.now(), tabId: 1, expiresAt: Date.now() + 10000 };
+  assert.equal((await request('missing')).ok, false);
+  assert.equal((await request('upload', 2)).ok, false);
+  const before = f.ruleUpdates.length;
+  assert.equal((await request('upload')).ok, true); assert.ok(f.ruleUpdates.length > before);
+  f.storage.local['receipt:upload'].expiresAt = Date.now() - 1;
+  assert.equal((await request('upload')).ok, false);
+});
+
+test('close removes only the identified idle tab and reports its removal', async () => {
+  const f = fixture();
+  await f.exec('getIdentity()'); await new Promise(resolve => setImmediate(resolve));
+  f.sockets[0].readyState = 1; f.sockets[0].onopen();
+  const result = await closeTab(f);
+  assert.equal(result.closed, true); assert.equal(result.tabId, 1);
+  assert.deepEqual(f.removed, [1]); assert.equal(await f.exec('observations.has(1)'), false);
+  assert.ok(f.sockets[0].sent.some(m => m.type === 'invalidate' && m.closed && m.tabId === 1));
+});
+
+test('close rejects wrong identity, unsaved results and a changed page without removing any tab', async () => {
+  const f = fixture();
+  for (const [params, error] of [
+    [{ profileId: 'another-profile' }, /identity/], [{ browserSessionId: 'old-session' }, /identity/],
+    [{ resultsSaved: false }, /saved results/], [{ documentId: 'old-doc' }, /Page changed/],
+    [{ contentSignature: 'previous-response' }, /Page changed/], [{ url: 'https://chatgpt.com/c/other' }, /Page changed/],
+    [{ tabId: 999 }, /only controls/],
+  ]) await assert.rejects(closeTab(f, params), error);
+  assert.deepEqual(f.removed, []);
+});
+
+test('close rechecks live drafts, generation and navigation even when the service saw an idle page', async () => {
+  const f = fixture(), original = f.context.chrome.tabs.sendMessage;
+  for (const state of [{ draftLength: 5 }, { attachmentCount: 1 }, { activity: 'generating' }, { activity: 'thinking' }, { composerReady: false }]) {
+    f.context.chrome.tabs.sendMessage = async (...args) => {
+      const value = await original(...args); Object.assign(value.result, state); return value;
+    };
+    await assert.rejects(closeTab(f), /idle page with no draft/);
+  }
+  f.context.chrome.tabs.sendMessage = original;
+  const get = f.context.chrome.tabs.get;
+  f.context.chrome.tabs.get = async id => ({ ...await get(id), pendingUrl: 'https://chatgpt.com/c/next' });
+  await assert.rejects(closeTab(f), /navigating/);
+  assert.deepEqual(f.removed, []);
+});
+
+test('expired close and failed Chrome removal do not claim success', async () => {
+  const f = fixture();
+  await assert.rejects(f.exec("execute({command:'close_tab',expiresAt:Date.now()-1,params:{tabId:1}})"), /expired/);
+  f.context.chrome.tabs.remove = async () => { throw new Error('Chrome removal failed'); };
+  await assert.rejects(closeTab(f), /Chrome removal failed/);
+  assert.deepEqual(f.removed, []);
+  assert.equal(await f.exec('observations.has(1)'), true);
+});
 
 test('content bootstrap loads only the fixed adapter into its own ChatGPT tab', async () => {
   const { context, scripts } = fixture();
@@ -85,8 +151,18 @@ test('three tabs are created without relying on active tab selection', async () 
   assert.equal(created.length, 3); assert.equal(result.tabs.length, 3);
 });
 test('WebSocket close schedules reconnection without blocking the worker', async () => {
-  const { exec, sockets, timers } = fixture();
+  const { exec, sockets, timers, ruleUpdates } = fixture();
   await exec('getIdentity()'); await new Promise(resolve => setImmediate(resolve));
   sockets[0].readyState = 1; sockets[0].onopen(); sockets[0].close();
   assert.ok(timers.some(timer => timer.ms === 500));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(ruleUpdates.map(update => update.addRules?.length || 0), [0]);
+  await exec(`execute({id:'send-block',command:'submit',expiresAt:Date.now()+5000,params:{tabId:1,prompt:'test',runId:'run-a'}})`);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(ruleUpdates.map(update => update.addRules?.length || 0), [0, 1]);
+  assert.ok(ruleUpdates[1].addRules[0].condition.regexFilter.includes('/backend-api/conversations'));
+  assert.equal(JSON.stringify(ruleUpdates[1].addRules[0].condition.resourceTypes), '["xmlhttprequest"]');
+  await exec('conversationListBlockUntil = Date.now() - 1');
+  await timers.find(timer => timer.ms === 30000).callback();
+  assert.deepEqual(ruleUpdates.map(update => update.addRules?.length || 0), [0, 1, 0]);
 });

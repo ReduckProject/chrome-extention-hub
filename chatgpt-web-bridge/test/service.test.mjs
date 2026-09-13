@@ -5,8 +5,71 @@ import { performance } from 'node:perf_hooks';
 import WebSocket from 'ws';
 import { BridgeService } from '../src/service.mjs';
 import { call } from '../src/client.mjs';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 const profileId = 'test-chrome-profile-001', sessionId = 'test-browser-session';
 const token = 'test-only-token-for-bridge-'.repeat(2);
+
+test('inline attachments larger than 1 MiB cross HTTP without disk files and deduplicate by decoded content', async t => {
+  const { service, ws, rpc, snapshot, until } = await fixture(t);
+  snapshot(snap(1, { adapterVersion: 45, contentVersion: 6 })); await until(() => service.store.list().length === 1);
+  const data = Buffer.alloc(2 * 1024 * 1024, 157).toString('base64'), commands = [];
+  ws.on('message', bytes => { const message = JSON.parse(bytes); if (message.type === 'command') commands.push(message); });
+  const attachment = { name: 'pasted.png', mimeType: 'image/png', data };
+  const params = { tabKey: service.store.list()[0].key, requestId: 'inline-image', attachments: [attachment] };
+  const sent = await rpc('send', params); await until(() => commands.length === 1);
+  assert.equal(sent.run.phase, 'submitting'); assert.equal(sent.run.attachments[0].size, 2 * 1024 * 1024);
+  assert.equal(sent.run.attachments[0].path, undefined); assert.equal(commands[0].params.attachments[0].data, data);
+  const retry = await rpc('send', { ...params, attachments: [{ name: 'pasted.png', data: `data:image/png;base64,${data}` }] });
+  assert.equal(retry.existing, true); assert.equal(retry.run.id, sent.run.id);
+  await assert.rejects(rpc('send', { ...params, attachments: [{ ...attachment, data: 'AAAA' }] }), /different input/);
+  assert.equal(commands.length, 1);
+  ws.send(JSON.stringify({ type: 'result', id: commands[0].id, result: { accepted: true, userMessageId: 'pasted-user' } }));
+  await until(() => service.store.runView(sent.run.id).accepted);
+  assert.ok(!JSON.stringify(service.store.data).includes(data));
+});
+
+test('attachment send returns a persisted pending run, forwards bytes once and rejects changed retries', async t => {
+  const { service, ws, rpc, snapshot, until } = await fixture(t);
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'bridge-send-'));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const file = path.join(dir, '说明.txt'); await fs.writeFile(file, '文件正文', 'utf8');
+  snapshot(snap(1, { adapterVersion: 45, contentVersion: 6 }));
+  await until(() => service.store.list().length === 1);
+  const tabKey = service.store.list()[0].key, commands = [];
+  ws.on('message', data => { const message = JSON.parse(data); if (message.type === 'command') commands.push(message); });
+  const params = { tabKey, attachments: [{ path: file }], requestId: 'attachment-only' };
+  const sent = await rpc('send', params);
+  assert.equal(sent.run.phase, 'submitting'); assert.equal(sent.run.prompt, '');
+  assert.equal(sent.run.attachments[0].name, '说明.txt'); assert.equal(sent.run.attachments[0].data, undefined);
+  await until(() => commands.length === 1);
+  assert.equal(Buffer.from(commands[0].params.attachments[0].data, 'base64').toString('utf8'), '文件正文');
+  assert.equal(commands[0].params.attachments[0].path, undefined);
+  assert.equal((await rpc('send', params)).existing, true);
+  assert.equal(commands.length, 1);
+  await assert.rejects(rpc('new_chat', { tabKey }), /active|unresolved/);
+  await fs.writeFile(file, 'changed');
+  await assert.rejects(rpc('send', params), /different input/);
+  assert.equal(commands.length, 1);
+  ws.send(JSON.stringify({ type: 'result', id: commands[0].id, result: { accepted: true, userMessageId: 'uploaded-user' } }));
+  await until(() => service.store.runView(sent.run.id).accepted);
+  assert.equal(service.store.runView(sent.run.id).userMessageId, 'uploaded-user');
+  assert.ok(!JSON.stringify(service.store.data).includes(commands[0].params.attachments[0].data));
+});
+
+test('unsupported observers and invalid attachment paths create no run or browser command', async t => {
+  const { service, ws, rpc, snapshot, until } = await fixture(t);
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'bridge-old-upload-'));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const file = path.join(dir, 'file.txt'); await fs.writeFile(file, 'data');
+  snapshot(snap(1)); await until(() => service.store.list().length === 1);
+  let commands = 0; ws.on('message', () => commands++);
+  const params = { tabKey: service.store.list()[0].key, prompt: 'read', requestId: 'old-observer', attachments: [{ path: file }] };
+  await assert.rejects(rpc('send', params), /adapter 45 and content 6/);
+  await assert.rejects(rpc('send', { ...params, attachments: [{ path: 'relative.txt' }] }), /absolute/);
+  assert.equal(Object.keys(service.store.data.runs).length, 0); assert.equal(commands, 0);
+});
 function snap(tabId, overrides = {}) {
   return { tabId, browserSessionId: sessionId, documentId: `doc-${tabId}`, url: `https://chatgpt.com/c/test-${tabId}`,
     activity: 'idle', model: { label: 'Test model' }, composerReady: true, draftLength: 0,
@@ -117,18 +180,15 @@ test('refresh skips closed and disconnected history and includes a recovered fir
   assert.deepEqual((await rpc('status')).connections[0].currentTabIds, [2, 3], 'A newly observed tab joins the next passive refresh');
 });
 
-test('explicit history errors do not contaminate current browser connection diagnostics', async t => {
+test('explicit history status does not probe or contaminate current browser connection diagnostics', async t => {
   const { service, ws, rpc, snapshot, until } = await fixture(t);
   snapshot(snap(1)); await until(() => service.store.list().length === 1);
   const oldKey = service.store.list()[0].key;
   ws.send(JSON.stringify({ type: 'inventory', browserSessionId: sessionId, tabIds: [] }));
   await until(() => service.store.tabView(oldKey).closed);
-  ws.on('message', data => {
-    const message = JSON.parse(data); if (message.type !== 'command') return;
-    ws.send(JSON.stringify({ type: 'result', id: message.id, error: 'No tab with id: 1.' }));
-  });
   const result = await rpc('status', { tabKey: oldKey, refresh: true });
-  assert.equal(result.errors[0].error, 'No tab with id: 1.');
+  assert.equal(result.errors.length, 0);
+  assert.equal(result.tabs[0].closed, true);
   assert.deepEqual(result.connections[0].observationErrors, []);
 });
 
@@ -198,6 +258,118 @@ async function fixture(t) {
   const snapshot = data => ws.send(JSON.stringify({ type: 'snapshot', snapshot: data }));
   return { config, service, ws, rpc, rawRpc, lease, snapshot, until };
 }
+
+test('close enforces ownership and saved results, updates inventory and auto-releases a terminal task', async t => {
+  const { service, ws, rpc, rawRpc, lease, snapshot, until } = await fixture(t);
+  snapshot(snap(1)); snapshot(snap(2)); await until(() => service.store.list().length === 2);
+  const tabKey = `${profileId}:${sessionId}:1`, otherKey = `${profileId}:${sessionId}:2`;
+  await rpc('task', { action: 'bind', profileId, tabKey });
+  const commands = [];
+  ws.on('message', data => {
+    const message = JSON.parse(data); if (message.type !== 'command') return;
+    commands.push(message);
+    ws.send(JSON.stringify({ type: 'result', id: message.id, result: {
+      closed: true, tabId: message.params.tabId, browserSessionId: message.params.browserSessionId,
+    } }));
+  });
+  const params = { action: 'close', tabKey, resultsSaved: true };
+  await assert.rejects(rawRpc('tabs', params), { code: 'TASK_LEASE_REQUIRED' });
+  await assert.rejects(rpc('tabs', { ...params, resultsSaved: false }), /resultsSaved/);
+  await assert.rejects(rpc('tabs', { ...params, tabKey: otherKey }), { code: 'TASK_TAB_MISMATCH' });
+  await assert.rejects(rpc('tabs', { action: 'close', resultsSaved: true }), { code: 'TASK_TAB_MISMATCH' });
+  assert.equal(commands.length, 0);
+  const { run } = await service.store.reserve({ tabKey, requestId: 'saved-before-close', prompt: 'saved answer' });
+  Object.assign(run, { phase: 'completed', taskId: lease.taskId, resultAssistantId: 'saved-response',
+    responseCache: { assistantId: 'saved-response', text: 'Saved answer', complete: true },
+    verifiedDownloads: [{ path: 'saved-original.png', originalVerified: true }], completedAt: Date.now() });
+  const history = structuredClone(run);
+  const result = await rpc('tabs', params);
+  assert.equal(result.closed, true); assert.equal(result.existing, false); assert.equal(result.task.state, 'released');
+  assert.equal(result.task.releaseReason, 'tab_closed');
+  assert.equal(result.task.creationPending, false);
+  assert.equal(commands.length, 1); assert.equal(commands[0].command, 'close_tab');
+  assert.deepEqual(commands[0].params, { tabId: 1, profileId, browserSessionId: sessionId,
+    documentId: 'doc-1', url: 'https://chatgpt.com/c/test-1', contentSignature: 'initial', resultsSaved: true });
+  assert.deepEqual(service.connectionViews()[0].currentTabIds, [2], 'Receipt updates capacity without waiting for onRemoved');
+  assert.equal(service.store.tabView(tabKey).closed, true);
+  assert.equal(service.store.tabView(otherKey).closed, undefined);
+  assert.deepEqual(service.store.data.runs[run.id], history);
+  snapshot(snap(1, { contentSignature: 'late-observer-message' }));
+  snapshot(snap(2, { contentSignature: 'barrier-after-late-message' }));
+  await until(() => service.store.data.tabs[otherKey].contentSignature === 'barrier-after-late-message');
+  assert.equal(service.store.tabView(tabKey).closed, true);
+  assert.deepEqual(service.connectionViews()[0].currentTabIds, [2]);
+  await assert.rejects(rpc('tabs', params), { code: 'TASK_LEASE_REQUIRED' }); assert.equal(commands.length, 1);
+  const cached = await rpc('result', { runId: run.id });
+  assert.equal(cached.resultSource, 'cache'); assert.equal(cached.result.text, 'Saved answer');
+  assert.equal(service.scheduler.view(profileId).activeTasks.length, 0);
+  assert.equal(commands.length, 1);
+  assert.ok(service.store.data.operations.some(op => op.method === 'tabs' && op.action === 'close' &&
+    op.browserCommands.some(cmd => cmd.command === 'close_tab')));
+});
+
+test('failed or unconfirmed close retains the tab and lease; confirmed close auto-releases after an in-flight close', async t => {
+  const { service, ws, rpc, snapshot, until } = await fixture(t);
+  snapshot(snap(1)); await until(() => service.store.list().length === 1);
+  const tabKey = service.store.list()[0].key;
+  await rpc('task', { action: 'bind', profileId, tabKey });
+  const params = { action: 'close', tabKey, resultsSaved: true };
+  let mode = 'error', held;
+  ws.on('message', data => {
+    const message = JSON.parse(data); if (message.type !== 'command') return;
+    if (mode === 'hold') { held = message; return; }
+    ws.send(JSON.stringify({ type: 'result', id: message.id,
+      ...(mode === 'error' ? { error: 'Chrome could not close tab' } : { result: { closed: true, tabId: 99, browserSessionId: sessionId } }) }));
+  });
+  await assert.rejects(rpc('tabs', params), /could not close/);
+  mode = 'unconfirmed';
+  await assert.rejects(rpc('tabs', params), { code: 'TAB_CLOSE_UNCERTAIN' });
+  assert.equal(service.store.tabView(tabKey).closed, undefined);
+  assert.deepEqual(service.connectionViews()[0].currentTabIds, [1]);
+  mode = 'hold';
+  const closing = rpc('tabs', params); await until(() => held);
+  let released = false;
+  const releasing = rpc('task', { action: 'release', profileId, resultsSaved: true }).then(result => { released = true; return result; });
+  await rpc('status'); assert.equal(released, false);
+  ws.send(JSON.stringify({ type: 'result', id: held.id, result: { closed: true, tabId: 1, browserSessionId: sessionId } }));
+  assert.equal((await closing).closed, true);
+  await assert.rejects(releasing, { code: 'TASK_LEASE_REQUIRED' });
+  assert.equal(service.scheduler.view(profileId).activeTasks.length, 0);
+});
+
+test('close never targets an old browser session or unknown current inventory', async t => {
+  const { service, rpc, snapshot, until } = await fixture(t);
+  snapshot(snap(1)); await until(() => service.store.list().length === 1);
+  const tabKey = service.store.list()[0].key;
+  await rpc('task', { action: 'bind', profileId, tabKey });
+  const params = { action: 'close', tabKey, resultsSaved: true };
+  const browser = service.browserStates.get(profileId);
+  browser.browserSessionId = 'new-session-with-reused-tab-id';
+  await assert.rejects(rpc('tabs', params), { code: 'TAB_UNAVAILABLE' });
+  browser.browserSessionId = sessionId; browser.tabIds = null;
+  await assert.rejects(rpc('tabs', params), { code: 'TAB_UNAVAILABLE' });
+  assert.equal(service.pending.size, 0); assert.equal(service.store.tabView(tabKey).closed, undefined);
+});
+
+test('a removal event auto-releases a terminal task after a lost close reply', async t => {
+  const { service, ws, rpc, snapshot, until } = await fixture(t);
+  snapshot(snap(1)); await until(() => service.store.list().length === 1);
+  const tabKey = service.store.list()[0].key;
+  await rpc('task', { action: 'bind', profileId, tabKey });
+  let commands = 0;
+  ws.on('message', data => {
+    const message = JSON.parse(data); if (message.type !== 'command') return;
+    commands++;
+    ws.send(JSON.stringify({ type: 'invalidate', browserSessionId: sessionId, tabId: 1, closed: true }));
+    ws.send(JSON.stringify({ type: 'result', id: message.id, error: 'Closure reply lost' }));
+  });
+  const params = { action: 'close', tabKey, resultsSaved: true };
+  await assert.rejects(rpc('tabs', params), /reply lost/);
+  await assert.rejects(rpc('tabs', params), { code: 'TASK_LEASE_REQUIRED' });
+  assert.equal(commands, 1); assert.equal(service.store.tabView(tabKey).closedConfirmed, true);
+  assert.deepEqual(service.connectionViews()[0].currentTabIds, []);
+  assert.equal(service.scheduler.view(profileId).activeTasks.length, 0);
+});
 
 test('automatic five-minute recovery lets a paused batch continue with its original prompts and lease', async t => {
   const { service, ws, rpc, snapshot, until } = await fixture(t); clearInterval(service.tick);
@@ -563,9 +735,51 @@ test('repeated send request produces one browser command; disconnect preserves u
 test('navigation and browser-session inventory invalidate stale tabs immediately', async t => {
   const { service, ws, rpc, snapshot, until } = await fixture(t);
   snapshot(snap(1)); await until(() => Object.keys(service.store.data.tabs).length === 1);
+  const tabKey = Object.keys(service.store.data.tabs)[0];
   ws.send(JSON.stringify({ type: 'inventory', browserSessionId: 'after-restart', tabIds: [1] }));
   await until(() => service.store.list()[0].closed);
-  assert.equal((await rpc('status')).tabs[0].activity, 'unknown');
+  assert.equal((await rpc('status')).tabs.length, 0);
+  const history = await rpc('status', { tabKey });
+  assert.equal(history.tabs[0].closed, true);
+});
+
+test('status returns only tabs in the current browser inventory and hides their historical runs', async t => {
+  const { service, ws, rpc, snapshot, until } = await fixture(t);
+  snapshot(snap(1)); snapshot(snap(2)); await until(() => service.store.list().length === 2);
+  await until(() => service.browserStates.get(profileId)?.tabIds?.join(',') === '1,2');
+  const currentKey = `${profileId}:${sessionId}:1`, oldKey = `${profileId}:${sessionId}:2`;
+  const currentRun = await service.store.reserve({ tabKey: currentKey, prompt: 'current', requestId: 'current-run' });
+  await service.store.reserve({ tabKey: oldKey, prompt: 'old', requestId: 'old-run' });
+  ws.send(JSON.stringify({ type: 'inventory', browserSessionId: sessionId, tabIds: [1] }));
+  await until(() => service.browserStates.get(profileId)?.tabIds?.join(',') === '1');
+  const result = await rpc('status');
+  assert.deepEqual(result.tabs.map(tab => tab.tabId), [1]);
+  assert.deepEqual(result.runs.map(run => run.id), [currentRun.run.id]);
+  const history = await rpc('status', { tabKey: oldKey });
+  assert.equal(history.tabs.length, 1);
+  assert.equal(history.tabs[0].closed, true);
+});
+
+test('inventory closure releases terminal tasks and orphans unresolved tasks', async t => {
+  const { service, ws, rawRpc, lease, snapshot, until } = await fixture(t);
+  snapshot(snap(1)); snapshot(snap(2)); await until(() => service.store.list().length === 2);
+  const firstKey = `${profileId}:${sessionId}:1`, secondKey = `${profileId}:${sessionId}:2`;
+  await rawRpc('task', { action: 'bind', profileId, leaseId: lease.leaseId, tabKey: firstKey });
+  const second = await rawRpc('task', { action: 'acquire', profileId, taskId: 'inventory-orphan-task' });
+  await rawRpc('task', { action: 'bind', profileId, leaseId: second.leaseId, tabKey: secondKey });
+  service.store.data.runs.finished = { id: 'inventory-finished', tabKey: firstKey, taskId: lease.taskId, phase: 'completed' };
+  service.store.data.runs.pending = { id: 'inventory-pending', tabKey: secondKey, taskId: second.taskId, phase: 'submission_unknown' };
+
+  ws.send(JSON.stringify({ type: 'inventory', browserSessionId: sessionId, tabIds: [] }));
+  await until(() => service.scheduler.view(profileId).activeTasks.length === 0 &&
+    service.scheduler.view(profileId).orphanedTasks.length === 1);
+  const scheduling = service.scheduler.view(profileId);
+  assert.equal(service.store.data.scheduling.tasks[lease.taskId].state, 'released');
+  assert.equal(service.store.data.scheduling.tasks[lease.taskId].releaseReason, 'tab_closed');
+  assert.equal(scheduling.orphanedTasks[0].taskId, second.taskId);
+  assert.deepEqual(scheduling.orphanedTasks[0].unresolvedRunIds, ['inventory-pending']);
+  await assert.rejects(rawRpc('task', { action: 'acquire', profileId, taskId: lease.taskId }), /released/);
+  await assert.rejects(rawRpc('task', { action: 'acquire', profileId, taskId: second.taskId }), /orphaned/);
 });
 
 for (const method of ['download', 'recover_images']) test(`${method} rejects missing images before any save or transfer`, async t => {
@@ -612,6 +826,25 @@ test('result defaults to exact response text and image metadata and preserves a 
   await until(() => service.store.data.tabs[tabKey].conversationId === 'different-chat');
   const cached = await rpc('result', { runId: run.id });
   assert.equal(cached.resultSource, 'cache'); assert.equal(cached.result.text, text); assert.equal(commands.length, 1);
+});
+
+test('completed runs return an untruncated observed text when the tracked tab is unavailable', async t => {
+  const { service, rpc, snapshot, until } = await fixture(t);
+  snapshot(snap(1)); await until(() => Object.keys(service.store.data.tabs).length === 1);
+  const tabKey = Object.keys(service.store.data.tabs)[0];
+  const text = '你已达到 Plus 套餐的图像生成请求上限。上限将在 9小时 后重置，届时可创建更多图像。';
+  const { run } = await service.store.reserve({ tabKey, prompt: 'generate an image', requestId: 'quota-preview-fallback' });
+  Object.assign(run, { phase: 'completed', accepted: true, resultAssistantId: 'quota-answer', resultPreview: text,
+    resultLength: text.length, images: [], completedAt: Date.now() });
+  service.store.data.tabs[tabKey].closed = true;
+
+  const result = await rpc('result', { runId: run.id });
+  assert.equal(result.run.phase, 'completed');
+  assert.equal(result.resultSource, 'run_preview');
+  assert.equal(result.result.text, text);
+  assert.deepEqual(result.result.images, []);
+  assert.equal(result.result.complete, true);
+  assert.match(result.resultError, /original response is not available/);
 });
 
 test('result exposes an associated streaming response and leaves completion false', async t => {

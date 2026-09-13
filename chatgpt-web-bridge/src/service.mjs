@@ -6,6 +6,7 @@ import { StateStore, ACCESS_RETRY_MS } from './store.mjs';
 import { tokenEquals } from './config.mjs';
 import { matchDownloadedFiles, saveTransferredOriginal, verifySavedOriginals } from './downloads.mjs';
 import { TaskScheduler, managedAction, policyError } from './scheduler.mjs';
+import { prepareAttachments, MAX_RPC_BYTES } from './attachments.mjs';
 
 function requireCompleteImageAssets(run, result) {
   const images = result.images ?? run.images ?? [];
@@ -21,6 +22,17 @@ function accessWaitingResult(error, method, params = {}) {
     nextAction: { method: 'access', params: { action: 'wait', profileId: error.details.profileId, timeoutMs: 25000 } },
     continuation: { method, action: params.action, taskId: params.taskId, runId: params.runId, requestId: params.requestId,
       instruction: 'Keep this task running. Wait until accessPause is null, then continue this step with the original parameters. Preserve remaining prompts, leaseId, runId and requestId; do not end the task or resend an uncertain submission.' } };
+}
+
+function completeRunPreview(run, assistantId) {
+  const text = run.resultPreview;
+  // resultPreview is capped for long answers. Only expose it as result.text
+  // when resultLength proves that the observed preview is the full response.
+  if (run.phase !== 'completed' || run.resultAssistantId !== assistantId || typeof text !== 'string' ||
+      !Number.isInteger(run.resultLength) || run.resultLength !== text.length) return null;
+  const observedAt = Number.isFinite(run.completedAt) ? run.completedAt : run.updatedAt;
+  return { assistantId, text, images: run.images || [], assets: [], complete: true,
+    observedAt: Number.isFinite(observedAt) ? new Date(observedAt).toISOString() : new Date().toISOString() };
 }
 
 export class BridgeService {
@@ -47,6 +59,7 @@ export class BridgeService {
 
   async start() {
     await this.store.load();
+    if (this.scheduler.reconcileClosedTasks()) { this.store.changed(); await this.store.save(); }
     await new Promise((resolve, reject) => {
       this.server.once('error', reject);
       this.server.listen(this.config.port, '127.0.0.1', resolve);
@@ -178,6 +191,10 @@ export class BridgeService {
           return;
         }
         if (message.type === 'snapshot') {
+          const key = `${profileId}:${message.snapshot?.browserSessionId || 'legacy'}:${message.snapshot?.tabId}`;
+          // A delayed observer message must not resurrect a removed tab or
+          // consume capacity again. Inventory absence alone is not a tombstone.
+          if (this.store.data.tabs[key]?.closedConfirmed) return;
           this.store.snapshot(profileId, message.snapshot);
           const browser = this.browserStates.get(profileId);
           if (browser && message.snapshot.browserSessionId === browser.browserSessionId) {
@@ -213,8 +230,10 @@ export class BridgeService {
             if (invalid) {
               tab.observationError = message.reason || 'Tab is no longer in the current browser inventory';
               if (message.closed || message.type === 'inventory') tab.closed = true;
+              if (message.closed) tab.closedConfirmed = true;
             }
           }
+          this.scheduler.reconcileClosedTasks(profileId);
           this.store.changed(); this.store.save().catch(error => this.logError(error));
         } else if (message.type === 'result') {
           const pending = this.pending.get(message.id);
@@ -259,11 +278,45 @@ export class BridgeService {
 
   logError(error) { console.error(`[bridge] ${error.message}`); }
 
+  currentTabKeys(profileId = null) {
+    const keys = new Set();
+    for (const [id, browser] of this.browserStates) {
+      if (profileId && id !== profileId) continue;
+      if (!this.clients.has(id) || !Array.isArray(browser?.tabIds)) continue;
+      const tabIds = new Set(browser.tabIds);
+      for (const [key, tab] of Object.entries(this.store.data.tabs)) {
+        if (tab.profileId !== id || tab.closed || !tabIds.has(tab.tabId)) continue;
+        if (browser.browserSessionId && tab.browserSessionId !== browser.browserSessionId) continue;
+        if (!browser.browserSessionId && tab.browserSessionId !== 'legacy') continue;
+        keys.add(key);
+      }
+    }
+    return keys;
+  }
+
+  currentInventoryTargets(profileId = null) {
+    return [...this.clients.keys()].filter(id => !profileId || id === profileId).flatMap(id => {
+      const browser = this.browserStates.get(id);
+      return Array.isArray(browser?.tabIds) ? browser.tabIds.map(tabId => ({ profileId: id, tabId,
+        key: `${id}:${browser.browserSessionId || 'legacy'}:${tabId}` })) : [];
+    });
+  }
+
+  statusTabView(key, currentKeys) {
+    const tab = this.store.data.tabs[key];
+    if (!tab) return null;
+    const view = this.store.tabView(key);
+    if (currentKeys.has(key) || view.closed) return view;
+    // Keep explicitly requested history inspectable, but never present it as
+    // an active page. The underlying record remains available to result reads.
+    return { ...view, closed: true, closedReason: 'not_in_current_browser_inventory',
+      observationError: view.observationError || 'Tab is no longer in the current browser inventory' };
+  }
+
   connectionViews() {
     return [...this.clients.keys()].map(profileId => {
       const browser = this.browserStates.get(profileId);
-      const current = this.store.list().filter(tab => tab.profileId === profileId && !tab.closed &&
-        (!browser?.browserSessionId || tab.browserSessionId === browser.browserSessionId));
+      const current = this.currentTabViews(profileId);
       return { profileId, connection: 'connected', browserSessionId: browser?.browserSessionId,
         connectedAt: browser?.connectedAt, inventoryAt: browser?.inventoryAt,
         currentTabIds: browser?.tabIds, observedTabCount: current.length,
@@ -272,6 +325,10 @@ export class BridgeService {
         observationErrors: [...(browser?.errors || [])].map(([tabId, error]) => ({ tabId, error })),
         scheduling: this.scheduler.view(profileId) };
     });
+  }
+
+  currentTabViews(profileId = null) {
+    return [...this.currentTabKeys(profileId)].map(key => this.store.tabView(key));
   }
 
   command(profileId, command, params = {}, timeoutMs = 5000, id = randomUUID()) {
@@ -317,7 +374,7 @@ export class BridgeService {
 
   async dispatch(method, params = {}, caller = null) {
     const tracked = ['send', 'new_chat', 'models', 'select_model', 'download', 'recover_images', 'stop'].includes(method) ||
-      (method === 'tabs' && params.action === 'new') || (method === 'result' && (params.includeAssets || params.loadImages)) ||
+      (method === 'tabs' && ['new', 'close'].includes(params.action)) || (method === 'result' && (params.includeAssets || params.loadImages)) ||
       (method === 'access' && ['pause', 'resume'].includes(params.action)) || (method === 'task' && params.action !== 'status');
     if (!tracked) return this.perform(method, params);
     const run = this.store.data.runs[params.runId];
@@ -354,8 +411,9 @@ export class BridgeService {
     if (method === 'task') {
       if (!profileId) throw new Error('Choose a profileId explicitly');
       const update = () => this.withLock(`allocation:${profileId}`, async () => {
+        const schedulingChanged = this.scheduler.reconcileClosedTasks(profileId);
         const result = this.scheduler.task(profileId, params);
-        if (params.action && params.action !== 'status') { this.store.changed(); await this.store.save(); }
+        if (schedulingChanged || (params.action && params.action !== 'status')) { this.store.changed(); await this.store.save(); }
         return result;
       });
       // Finishing a lease waits only for that task's in-flight page action.
@@ -373,7 +431,7 @@ export class BridgeService {
         if (method !== 'stop') this.store.assertAccessAllowed(profileId);
         await this.withLock(`allocation:${profileId}`, async () => {
           task = this.scheduler.authorize(profileId, method, params, tabKey);
-          if (method === 'tabs') {
+          if (method === 'tabs' && params.action === 'new') {
             const browser = this.browserStates.get(profileId);
             if (!browser?.tabIds) throw policyError('INVENTORY_UNKNOWN', 'Current Chrome inventory is unknown; do not create a tab');
             if ((params.count ?? 1) !== 1) throw new Error('A task may create one tab and then reuse it; count must be 1');
@@ -394,7 +452,7 @@ export class BridgeService {
           ...(error.code === 'ACCESS_PAUSED' ? accessWaitingResult(error, method, params) : {}) };
       }
       const result = await this.execute(method, params, task);
-      if (method === 'tabs') {
+      if (method === 'tabs' && params.action === 'new') {
         await this.withLock(`allocation:${profileId}`, async () => {
           const created = result.tabs?.[0];
           if (!Number.isInteger(created?.tabId)) throw policyError('TAB_CREATION_UNCERTAIN', 'Tab creation returned no confirmed tab; inspect inventory before retrying');
@@ -426,6 +484,33 @@ export class BridgeService {
         return { requestedProfiles: profiles, observationRefreshRequested: true };
       }
       case 'tabs': {
+        if (params.action === 'close') return this.withLock(params.tabKey, async () => {
+          const tab = this.store.tabView(params.tabKey);
+          this.scheduler.authorize(tab.profileId, method, params, params.tabKey);
+          if (tab.closed) return { closed: true, existing: true, tabKey: tab.key, task: this.scheduler.viewTask(task) };
+          const browser = this.browserStates.get(tab.profileId);
+          if (browser?.browserSessionId !== tab.browserSessionId || !browser.tabIds?.includes(tab.tabId)) {
+            throw policyError('TAB_UNAVAILABLE', 'Target is not in the current browser session and inventory');
+          }
+          const result = await this.command(tab.profileId, 'close_tab', {
+            tabId: tab.tabId, profileId: tab.profileId, browserSessionId: tab.browserSessionId,
+            documentId: tab.documentId, url: tab.url, contentSignature: tab.contentSignature, resultsSaved: true,
+          });
+          if (result?.closed !== true || result.tabId !== tab.tabId || result.browserSessionId !== tab.browserSessionId) {
+            throw policyError('TAB_CLOSE_UNCERTAIN', 'Tab closure was not confirmed; inspect status before retrying the same tabKey');
+          }
+          // Commit the receipt even if onRemoved has not arrived yet. Keep run
+          // records, saved files and the lease until the caller releases it.
+          Object.assign(this.store.data.tabs[tab.key], { closed: true, closedConfirmed: true, observationError: 'Tab closed' });
+          const current = this.browserStates.get(tab.profileId);
+          if (current?.browserSessionId === tab.browserSessionId) {
+            current.tabIds = current.tabIds?.filter(id => id !== tab.tabId) ?? null;
+            current.errors.delete(tab.tabId);
+          }
+          this.scheduler.reconcileClosedTasks(tab.profileId);
+          this.store.changed(); await this.store.save();
+          return { closed: true, existing: false, tabKey: tab.key, task: this.scheduler.viewTask(task) };
+        });
         if (params.action === 'new') {
           const count = params.count ?? 1;
           if (!Number.isInteger(count) || count < 1 || count > 3) throw new Error('count must be 1, 2, or 3');
@@ -433,23 +518,18 @@ export class BridgeService {
           if (!profileId) throw new Error('Choose a connected profileId explicitly');
           return this.command(profileId, 'new_chats', { count }, 8000);
         }
-        return { profiles: [...this.clients.keys()], connections: this.connectionViews(), tabs: this.store.list(), revision: this.store.data.revision };
+        if (params.action && params.action !== 'list') throw new Error('Unknown tabs action');
+        return { profiles: [...this.clients.keys()], connections: this.connectionViews(), tabs: this.currentTabViews(), revision: this.store.data.revision };
       }
       case 'status': {
         if (params.diagnostics && !params.tabKey) throw new Error('Diagnostics require one exact tabKey');
-        const keys = params.tabKey ? [params.tabKey] : Object.keys(this.store.data.tabs);
         const errors = [];
         if (params.refresh) {
           // Current browser inventory also includes pages whose first snapshot
           // failed. Never refresh closed history or disconnected old profiles.
-          const targets = params.tabKey ? [this.store.data.tabs[params.tabKey] || { key: params.tabKey }] :
-            [...this.clients.keys()].flatMap(profileId => {
-              const browser = this.browserStates.get(profileId);
-              return browser?.tabIds ? browser.tabIds.map(tabId => ({ profileId, tabId,
-                key: `${profileId}:${browser.browserSessionId}:${tabId}` })) :
-                this.store.list().filter(tab => tab.profileId === profileId && !tab.closed &&
-                  (!browser?.browserSessionId || tab.browserSessionId === browser.browserSessionId));
-            });
+          const requested = params.tabKey && this.store.data.tabs[params.tabKey];
+          const requestedCurrent = requested && this.currentTabKeys(requested.profileId).has(params.tabKey);
+          const targets = params.tabKey ? (requestedCurrent ? [requested] : []) : this.currentInventoryTargets();
           let next = 0;
           await Promise.all(Array.from({ length: Math.min(4, targets.length) }, async () => {
             while (next < targets.length) {
@@ -469,14 +549,19 @@ export class BridgeService {
           }));
         }
         this.store.reconcile();
+        const currentKeys = this.currentTabKeys();
+        const keys = params.tabKey ? (this.store.data.tabs[params.tabKey] ? [params.tabKey] : []) : [...currentKeys];
         let diagnostics;
         if (params.diagnostics) {
           const tab = this.store.data.tabs[params.tabKey];
           if (!tab) throw new Error('Unknown tab');
+          if (!currentKeys.has(params.tabKey)) throw policyError('TAB_NOT_FOUND', 'Tab is not in the current browser inventory', { tabKey: params.tabKey, closed: true });
           diagnostics = await this.command(tab.profileId, 'read', { tabId: tab.tabId, documentId: tab.documentId,
             assistantId: { operation: 'diagnostics' } }, 5000);
         }
-        return { revision: this.store.data.revision, connections: this.connectionViews(), tabs: (params.tabKey ? keys : Object.keys(this.store.data.tabs)).filter(k => this.store.data.tabs[k]).map(key => this.store.tabView(key)), runs: Object.values(this.store.data.runs).filter(r => !params.tabKey || r.tabKey === params.tabKey).map(r => this.store.runView(r.id)), errors,
+        return { revision: this.store.data.revision, connections: this.connectionViews(), tabs: keys.filter(k => this.store.data.tabs[k]).map(key =>
+            params.tabKey ? this.statusTabView(key, currentKeys) : this.store.tabView(key)), runs: Object.values(this.store.data.runs)
+            .filter(r => keys.includes(r.tabKey)).map(r => this.store.runView(r.id)), errors,
           ...(diagnostics ? { diagnostics, recentOperations: this.store.data.operations.filter(op => op.tabKey === params.tabKey ||
             op.profileId === this.store.data.tabs[params.tabKey]?.profileId).slice(-30) } : {}) };
       }
@@ -517,9 +602,14 @@ export class BridgeService {
       }
       case 'send': return this.withLock(params.tabKey, async () => {
         const profileId = this.store.data.tabs[params.tabKey]?.profileId;
+        const { metadata, payload } = await prepareAttachments(params.attachments);
+        if (metadata.length && !this.store.data.requests[params.requestId]) {
+          const tab = this.store.tabView(params.tabKey);
+          if (!(tab.adapterVersion >= 45 && tab.contentVersion >= 6)) throw new Error('Attachments require adapter 45 and content 6; update setup and reload the extension and target page');
+        }
         const { run, existing } = await this.withLock(`allocation:${profileId}`, async () => {
           if (!this.store.data.requests[params.requestId]) this.scheduler.authorize(profileId, 'send', params, params.tabKey);
-          const reserved = await this.store.reserve(params);
+          const reserved = await this.store.reserve({ ...params, attachments: metadata });
           if (!reserved.existing) {
             this.scheduler.submitted(task, reserved.run);
             this.store.changed(); await this.store.save();
@@ -528,11 +618,18 @@ export class BridgeService {
         });
         if (existing) return { existing: true, run: this.store.runView(run.id) };
         const tab = this.store.data.tabs[run.tabKey];
-        try {
-          const result = await this.command(tab.profileId, 'submit', { tabId: tab.tabId, documentId: tab.documentId, prompt: run.prompt, runId: run.id, expectedModel: params.expectedModel || run.selectedAtSend?.label }, 7000, run.id);
-          this.store.submissionResult(run.id, result);
-        } catch (error) { this.store.submissionResult(run.id, null, error.message); }
-        await this.store.save();
+        const submit = async () => {
+          try {
+            const result = await this.command(tab.profileId, 'submit', { tabId: tab.tabId, documentId: tab.documentId, prompt: run.prompt, runId: run.id,
+              ...(payload.length ? { attachments: payload } : {}), expectedModel: params.expectedModel || run.selectedAtSend?.label }, payload.length ? 100000 : 7000, run.id);
+            this.store.submissionResult(run.id, result);
+          } catch (error) { this.store.submissionResult(run.id, null, error.message); }
+          await this.store.save();
+        };
+        // Uploads can outlast an RPC. The persisted unresolved run retains tab
+        // ownership; callers poll its ID instead of holding the MCP connection.
+        if (payload.length) submit().catch(error => this.logError(error));
+        else await submit();
         return { existing: false, run: this.store.runView(run.id) };
       });
       case 'result': {
@@ -565,8 +662,10 @@ export class BridgeService {
           } catch (error) { resultError = error.message; }
         }
         const cached = this.store.data.runs[run.id].responseCache;
-        return { run, result: cached?.assistantId === assistantId ? cached : null,
-          resultSource: cached?.assistantId === assistantId ? 'cache' : null, resultError };
+        const cachedResult = cached?.assistantId === assistantId ? cached : null;
+        const previewResult = cachedResult ? null : completeRunPreview(run, assistantId);
+        return { run, result: cachedResult || previewResult,
+          resultSource: cachedResult ? 'cache' : previewResult ? 'run_preview' : null, resultError };
       }
       case 'recover_images': {
         const run = this.store.runView(params.runId);
@@ -657,7 +756,7 @@ export class BridgeService {
       const chunks = []; let length = 0;
       for await (const chunk of req) {
         length += chunk.length;
-        if (length > 1024 * 1024) throw new Error('Request too large');
+        if (length > MAX_RPC_BYTES) throw new Error('Request too large');
         chunks.push(chunk);
       }
       const request = JSON.parse(Buffer.concat(chunks).toString('utf8'));

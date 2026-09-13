@@ -4,7 +4,7 @@ const terminal = new Set(['completed', 'error', 'stopped']);
 const workflowStarts = new Set(['tabs', 'new_chat', 'models', 'select_model', 'send']);
 export const managedAction = (method, params) =>
   ['new_chat', 'models', 'select_model', 'send', 'download', 'recover_images', 'stop'].includes(method) ||
-  (method === 'tabs' && params.action === 'new') ||
+  (method === 'tabs' && ['new', 'close'].includes(params.action)) ||
   (method === 'result' && (params.loadImages === true || params.includeAssets === true));
 
 export function policyError(code, message, details = {}) {
@@ -36,7 +36,11 @@ export class TaskScheduler {
       Object.values(this.store.data.runs).filter(r => r.profileId === id).reduce((latest, r) => Math.max(latest, r.createdAt), 0) || null };
   }
   activeTasks(profileId) { return Object.values(this.data.tasks).filter(t => t.profileId === profileId && t.state === 'active'); }
-  currentTabs(profileId) { return this.store.list().filter(t => t.profileId === profileId && !t.closed && t.connection === 'connected'); }
+  currentTabs(profileId) {
+    const tabIds = this.inventory(profileId);
+    if (!Array.isArray(tabIds)) return [];
+    return this.store.list().filter(t => t.profileId === profileId && !t.closed && t.connection === 'connected' && tabIds.includes(t.tabId));
+  }
   owner(profileId, tabKey, exceptTaskId) {
     const tab = this.store.data.tabs[tabKey];
     return this.activeTasks(profileId).find(t => t.taskId !== exceptTaskId && (t.tabKey === tabKey ||
@@ -52,7 +56,7 @@ export class TaskScheduler {
         (r.tabKey === tabKey || (tab.conversationId && r.profileId === tab.profileId && r.conversationId === tab.conversationId))));
   }
   reusable(tab, taskId) {
-    return !tab.freshness.stale && tab.activity === 'idle' && tab.composerReady && !tab.draftLength &&
+    return !tab.freshness.stale && tab.activity === 'idle' && tab.composerReady && !tab.draftLength && !tab.attachmentCount &&
       !this.busy(tab.key) && !this.owner(tab.profileId, tab.key, taskId) &&
       !this.pendingOwner(tab.profileId, tab.tabId);
   }
@@ -85,6 +89,36 @@ export class TaskScheduler {
       completed ? completed + this.policy.postCompletionCooldownMs : 0);
     return { retryAt, retryAfterMs: Math.max(0, retryAt - this.store.now()) };
   }
+  unresolvedRuns(task) {
+    return Object.values(this.store.data.runs).filter(run => run.taskId === task.taskId && !terminal.has(run.phase));
+  }
+  reconcileClosedTasks(profileId = null) {
+    let changed = false;
+    const now = this.store.now();
+    for (const task of Object.values(this.data.tasks)) {
+      if (!['active', 'orphaned'].includes(task.state) || (profileId && task.profileId !== profileId)) continue;
+      const tab = task.tabKey && this.store.data.tabs[task.tabKey];
+      if (!tab?.closed) continue;
+      const unresolvedRunIds = this.unresolvedRuns(task).map(run => run.id);
+      if (task.creationPending || unresolvedRunIds.length) {
+        const reason = task.creationPending ? 'tab_closed_during_creation' : 'tab_closed_with_unresolved_run';
+        const same = task.state === 'orphaned' && task.orphanReason === reason &&
+          JSON.stringify(task.unresolvedRunIds || []) === JSON.stringify(unresolvedRunIds) && !task.leaseId;
+        if (same) continue;
+        task.state = 'orphaned'; task.orphanedAt ||= now; task.orphanReason = reason;
+        task.unresolvedRunIds = unresolvedRunIds;
+        delete task.leaseId;
+        changed = true;
+        continue;
+      }
+      const same = task.state === 'released' && task.releaseReason === 'tab_closed' && !task.leaseId;
+      if (same) continue;
+      task.state = 'released'; task.releasedAt ||= now; task.releaseReason = 'tab_closed';
+      delete task.leaseId; delete task.orphanedAt; delete task.orphanReason; delete task.unresolvedRunIds;
+      changed = true;
+    }
+    return changed;
+  }
   viewTask(task, includeLease = false) {
     if (!task) return null;
     return { taskId: task.taskId, profileId: task.profileId, state: task.state, tabKey: task.tabKey,
@@ -93,11 +127,15 @@ export class TaskScheduler {
       polls: task.polls || 0, nextPollAt: task.nextPollAt,
       creationPending: !!task.creationPending,
       allocation: task.state === 'active' ? (task.tabKey ? 'tab' : 'new_tab_slot') : null,
+      ...(task.releaseReason ? { releaseReason: task.releaseReason } : {}),
+      ...(task.orphanReason ? { orphanedAt: task.orphanedAt, orphanReason: task.orphanReason,
+        unresolvedRunIds: task.unresolvedRunIds || [] } : {}),
       ...(includeLease && task.state === 'active' ? { leaseId: task.leaseId } : {}) };
   }
   view(profileId) {
     const p = this.profile(profileId);
     return { profileId, lockScope: 'tab', policy: this.policy, activeTasks: this.activeTasks(profileId).map(t => this.viewTask(t)),
+      orphanedTasks: Object.values(this.data.tasks).filter(t => t.profileId === profileId && t.state === 'orphaned').map(t => this.viewTask(t)),
       queue: p.queue.map(id => this.viewTask(this.data.tasks[id])), ...this.capacity(profileId), ...this.cooldown(profileId) };
   }
   prune(profileId) {
@@ -189,7 +227,7 @@ export class TaskScheduler {
       const unresolved = Object.values(this.store.data.runs).filter(r => r.taskId === task.taskId && !terminal.has(r.phase));
       const tab = task.tabKey && this.store.data.tabs[task.tabKey];
       if (task.creationPending || unresolved.length || (tab && !tab.closed &&
-          (this.store.tabView(task.tabKey).freshness.stale || tab.draftLength || ['generating', 'thinking', 'finalizing', 'awaiting_user'].includes(tab.activity)))) {
+          (this.store.tabView(task.tabKey).freshness.stale || tab.draftLength || tab.attachmentCount || ['generating', 'thinking', 'finalizing', 'awaiting_user'].includes(tab.activity)))) {
         throw policyError('TASK_UNRESOLVED', 'Task has an unresolved generation, draft or tab creation; preserve ownership and inspect it', { runIds: unresolved.map(r => r.id) });
       }
       task.state = 'released'; task.releasedAt = this.store.now();
@@ -213,6 +251,23 @@ export class TaskScheduler {
   authorize(profileId, method, params, tabKey) {
     const task = this.requireLease(profileId, params.leaseId);
     if (task.creationPending) throw policyError('TAB_CREATION_UNCERTAIN', 'Inspect inventory and bind the created tab; do not repeat tab creation');
+    if (method === 'tabs' && params.action === 'close') {
+      const tab = this.store.data.tabs[tabKey];
+      if (!tab || tab.profileId !== profileId || task.tabKey !== tabKey) {
+        throw policyError('TASK_TAB_MISMATCH', 'Close requires the exact tabKey already bound to your active task');
+      }
+      if (params.resultsSaved !== true) throw new Error('Close requires resultsSaved:true after required results and archives are handled');
+      if (this.owner(profileId, tabKey, task.taskId)) throw policyError('TAB_OCCUPIED', 'Another task owns this conversation');
+      if (this.busy(tabKey)) throw policyError('TAB_BUSY', 'This tab has an active or unresolved generation; preserve it');
+      if (!tab.closed) {
+        const current = this.store.tabView(tabKey);
+        if (current.freshness.stale || current.activity !== 'idle' || !current.composerReady || current.draftLength !== 0 || current.attachmentCount) {
+          throw policyError('TAB_UNAVAILABLE', 'Close requires a freshly observed idle page with no draft');
+        }
+      }
+      task.lastTouchedAt = this.store.now();
+      return task;
+    }
     if (method === 'tabs' && task.tabKey) throw policyError('TASK_TAB_MISMATCH', 'Reuse this task\'s existing tab instead of opening another');
     if (tabKey && task.tabKey && tabKey !== task.tabKey) throw policyError('TASK_TAB_MISMATCH', 'This task owns a different tab');
     if (tabKey && this.owner(profileId, tabKey, task.taskId)) throw policyError('TAB_OCCUPIED', 'Another task owns this tab or conversation through result saving');

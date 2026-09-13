@@ -1,5 +1,5 @@
 (() => {
-  const adapterVersion = 43;
+  const adapterVersion = 45;
   if (globalThis.ChatGPTBridgeAdapter?.version === adapterVersion) return;
   globalThis.ChatGPTBridgeAdapter?.dispose?.();
   const doc = document;
@@ -40,8 +40,27 @@
     return text(node);
   };
   const buttons = root => root ? all('button,[role="button"]', root) : [];
+  const attachmentControls = () => buttons(controls()).filter(node =>
+    /^(remove|delete)(?:\s+(?:attachment|file|image))?(?:\s|$)|^(移除|删除)(附件|文件|图片|图像)?/i.test(label(node)));
+  const attachmentCards = () => {
+    const root = controls();
+    if (!root) return [];
+    const cards = all('[data-testid="attachment"],[data-testid^="attachment-"],[data-testid="file-thumbnail"]', root);
+    return cards.length ? cards.filter(n => !cards.some(other => other !== n && other.contains(n))) :
+      attachmentControls().map(button => button.parentElement);
+  };
+  const attachmentCount = () => Math.max(attachmentCards().length, attachmentControls().length,
+    ...[...(controls()?.querySelectorAll('input[type="file"]') || [])].map(node => node.files?.length || 0));
   const userText = node => {
-    let output = text(node);
+    // Attachment tiles are siblings of the prompt, and their filenames must
+    // not be included in run matching (including attachment-only messages).
+    const prompt = node?.querySelector('.whitespace-pre-wrap');
+    let output = text(prompt || node);
+    if (!prompt && node?.querySelector('img,[data-testid="attachment"],[data-testid="file-thumbnail"]')) {
+      const copy = node.cloneNode(true);
+      copy.querySelectorAll('img,[data-testid="attachment"],[data-testid="file-thumbnail"]').forEach(n => n.remove());
+      output = text(copy);
+    }
     // Long user messages include a visible expand/collapse button. Its label
     // belongs to the UI, not to the submitted prompt used for run identity.
     for (const control of buttons(node).reverse()) {
@@ -56,7 +75,7 @@
   const send = () => all('[data-testid="send-button"]').find(n => !n.disabled) ||
     buttons(controls()).find(n => /^(send( prompt| message)?|发送(消息|提示)?)$/i.test(label(n)) && !n.disabled);
   const effortLabels = /^(低|中|高|极高|轻度|标准|扩展|重度|Low|Medium|High|Extra high|Light|Standard|Extended|Heavy)$/i;
-  const modelLabel = /^(Latest|最新|Instant|Thinking|Pro|Auto|即时|思考|专业|自动)$|^(?:GPT-)?\d+\.\d+\b|^o[1-9]\b/i;
+  const modelLabel = /^(Latest|最新|Instant|Thinking|Pro|Auto|即时|思考|专业|自动)$|^(?:GPT-)?\d+(?:\.\d+)?\b|^o[1-9]\b/i;
   function modelPickers() {
     return [...doc.querySelectorAll('button,[role="button"]')].filter(n => {
       if (n.closest('article,[data-turn],[data-message-author-role],aside,nav')) return false;
@@ -70,9 +89,10 @@
   const picker = () => modelPickers().find(visible);
   const modelName = value => (/^(最新|Latest)$/i.test(normalize(value)) ? normalize(value) : null) ||
     value?.match(/\b(?:GPT-\d+(?:\.\d+)?(?:\s+(?:Pro|Sol|Terra|Luna|Astra))?|o[1-9](?:-mini)?)(?![\w-])/i)?.[0] ||
-    (value?.match(/^(\d+\.\d+)(?=\s|$)/)?.[1] ? `GPT-${value.match(/^(\d+\.\d+)/)[1]}` : null);
+    (value?.match(/^(\d+(?:\.\d+)?(?:\s+(?:Pro|Sol|Terra|Luna|Astra))?)(?=\s|$)/i)?.[1]
+      ? `GPT-${value.match(/^(\d+(?:\.\d+)?(?:\s+(?:Pro|Sol|Terra|Luna|Astra))?)(?=\s|$)/i)[1].replace(/\s+/g, ' ')}` : null);
   function reasoningEffort(value) {
-    const effort = normalize(value).replace(/^(?:(?:GPT-)?\d+\.\d+(?:[ \t]+(?:Pro|Sol|Terra|Luna|Astra))?|o[1-9](?:-mini)?)\s+/i, '');
+    const effort = normalize(value).replace(/^(?:(?:GPT-)?\d+(?:\.\d+)?(?:\s+(?:Pro|Sol|Terra|Luna|Astra))?|o[1-9](?:-mini)?)\s+/i, '');
     return effortLabels.test(effort) ? effort : null;
   }
   let lastModelSelection;
@@ -213,7 +233,7 @@
       attentionType: access?.type || null,
       surface: imageViewer() ? 'image_viewer' : 'conversation',
       composerReady: !!input && !input.disabled && input.getAttribute('aria-disabled') !== 'true' && !imageViewer(),
-      draftLength: draft(input).length, userCount: users.length, assistantCount: assistants.length,
+      draftLength: draft(input).length, attachmentCount: attachmentCount(), userCount: users.length, assistantCount: assistants.length,
       lastUserId: messageId(lastUser), lastUserText: userText(lastUser), lastAssistantId: lastId,
       lastAssistantPreview: output.slice(-400), lastAssistantLength: output.length,
       images, finalActions, responseStreams: responseStreams(),
@@ -255,11 +275,11 @@
   async function newChat() {
     await closeEmptyViewer();
     const before = assertIdle();
-    if (before.draftLength) throw new Error('Existing draft was left intact');
+    if (before.draftLength || before.attachmentCount) throw new Error('Existing draft was left intact');
     const blank = () => {
       const state = snapshot();
       return new URL(state.url).pathname === '/' && state.activity === 'idle' && state.composerReady &&
-        state.draftLength === 0 && state.userCount === 0 && state.assistantCount === 0 && state;
+        state.draftLength === 0 && state.attachmentCount === 0 && state.userCount === 0 && state.assistantCount === 0 && state;
     };
     let after = blank(), openedSidebar = false, sidebarRestored = null;
     try {
@@ -348,24 +368,102 @@
       confirmed: !!after.label && (selectedByMenu || after.label === exactLabel),
       verification: selectedByMenu ? 'visible_menu_selection' : 'visible_picker_label' };
   }
-  async function submit(prompt, expectedModel) {
+  function decodeAttachments(attachments) {
+    if (!Array.isArray(attachments) || attachments.length > 10) throw new Error('Invalid attachment list');
+    let total = 0;
+    return attachments.map(item => {
+      if (!item || typeof item.name !== 'string' || !item.name || /[/\\\0]/.test(item.name) ||
+          typeof item.type !== 'string' || typeof item.data !== 'string' || !Number.isInteger(item.size) || item.size < 0 ||
+          item.data.length > 28 * 1024 * 1024 || item.data.length % 4 || /[^A-Za-z0-9+/=]/.test(item.data)) throw new Error('Invalid attachment payload');
+      total += item.size;
+      if (total > 20 * 1024 * 1024) throw new Error('Attachments exceed 20 MiB');
+      const binary = atob(item.data);
+      if (binary.length !== item.size) throw new Error('Attachment size mismatch');
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      return new File([bytes], item.name, { type: item.type });
+    });
+  }
+  async function uploadAttachments(files, input, checkPage) {
+    const transfer = new DataTransfer();
+    for (const file of files) transfer.items.add(file);
+    const accepts = (node, file) => !node.accept || node.accept.split(',').some(value => {
+      const rule = value.trim().toLowerCase();
+      return rule === '*/*' || rule === file.type || (rule.endsWith('/*') && file.type.startsWith(rule.slice(0, -1))) ||
+        (rule.startsWith('.') && file.name.toLowerCase().endsWith(rule));
+    });
+    const inputs = [...doc.querySelectorAll('input[type="file"]')].filter(node => !node.disabled &&
+      !node.closest('article,[data-turn],[role="dialog"],aside,nav') && (node.multiple || files.length === 1) && files.every(file => accepts(node, file)));
+    const scoped = inputs.filter(node => controls()?.contains(node));
+    const candidates = scoped.length ? scoped : inputs;
+    if (candidates.length === 1) {
+      candidates[0].files = transfer.files;
+      candidates[0].dispatchEvent(new Event('change', { bubbles: true }));
+    } else {
+      input.dispatchEvent(new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: transfer }));
+    }
+    let stableSince = null;
+    const deadline = Date.now() + 90000;
+    while (Date.now() < deadline) {
+      checkPage();
+      const root = controls(), cards = attachmentCards();
+      const failure = all('[role="alert"],[data-testid="upload-error"]').map(text).find(value =>
+        /upload.*(fail|error|limit)|file.*(unsupported|too large)|上传.*(失败|错误|上限)|文件.*(不支持|过大|太大)/i.test(value));
+      if (failure) throw new Error('Attachment upload failed: ' + failure.slice(0, 300));
+      const pending = all('[role="progressbar"],[aria-busy="true"],.animate-spin', root).length ||
+        cards.some(card => /uploading|processing|正在上传|上传中|处理中/i.test(text(card)));
+      const names = all('[title],[aria-label]', root).flatMap(n => [n.getAttribute('title'), n.getAttribute('aria-label')]);
+      const nonImagesPresent = files.filter(file => !file.type.startsWith('image/')).every(file =>
+        names.includes(file.name) || all('*', root).some(n => text(n) === file.name));
+      const images = cards.flatMap(card => all('img', card));
+      const imagesReady = images.every(img => img.complete && img.naturalWidth > 0);
+      const ready = cards.length === files.length && nonImagesPresent && imagesReady && !pending && !!send();
+      if (cards.length > files.length) throw new Error('Unexpected extra attachments; draft was left intact');
+      stableSince = ready ? stableSince ?? Date.now() : null;
+      if (stableSince !== null && Date.now() - stableSince >= 800) return;
+      await pause(100);
+    }
+    throw new Error('Attachment upload was not confirmed within 90 seconds; draft was left intact');
+  }
+  async function submit(prompt = '', expectedModel, attachments = [], expiresAt = Infinity, beforeSend = async () => {}) {
     const before = assertIdle(), input = editor();
     if (expectedModel && before.model.label !== expectedModel) return { notSubmitted: true, error: 'Model changed before submission' };
+    if (before.attachmentCount) return { notSubmitted: true, error: 'Existing attachments were left intact' };
     if (before.draftLength && draft(input) !== normalize(prompt)) return { notSubmitted: true, error: 'Existing draft was left intact' };
+    let files;
+    try { files = decodeAttachments(attachments); }
+    catch (error) { return { notSubmitted: true, error: error.message }; }
+    if (!normalize(prompt) && !files.length) return { notSubmitted: true, error: 'A prompt or attachment is required' };
     input.focus();
     if (before.draftLength) {
       // Recover an identical unsent draft without replacing or appending text.
     } else if (input.tagName === 'TEXTAREA') {
       Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(input, prompt);
       input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: prompt }));
-    } else {
+    } else if (prompt) {
       const range = doc.createRange(); range.selectNodeContents(input);
       const selection = getSelection(); selection.removeAllRanges(); selection.addRange(range);
       if (!doc.execCommand('insertText', false, prompt)) return { notSubmitted: true, error: 'Editor did not accept text; inspect draft' };
     }
     if (draft(input) !== normalize(prompt)) return { notSubmitted: true, error: 'Draft readback differs; no send click was made' };
+    const checkPage = () => {
+      assertAccessAllowed();
+      if (Date.now() >= expiresAt) throw new Error('Submission expired; draft was left intact');
+      if (editor() !== input || location.href !== before.url || messages('user').length !== before.userCount || stop()) throw new Error('Page changed during upload; no send click was made');
+      if (draft(input) !== normalize(prompt)) throw new Error('Draft changed during upload; no send click was made');
+      if (expectedModel && snapshot().model.label !== expectedModel) throw new Error('Model changed before submission');
+    };
+    try { checkPage(); if (files.length) await uploadAttachments(files, input, checkPage); checkPage(); }
+    catch (error) { return { notSubmitted: true, error: error.message }; }
     const button = await until(send);
     if (!button) return { notSubmitted: true, error: 'Send button unavailable; draft remains in the page' };
+    try {
+      if (files.length) await beforeSend();
+      checkPage();
+      if (attachmentCards().length !== files.length) throw new Error('Attachments changed before submission; draft was left intact');
+      if (send() !== button) throw new Error('Send control changed before submission; draft was left intact');
+    }
+    catch (error) { return { notSubmitted: true, error: error.message }; }
     button.click();
     const accepted = await until(() => {
       const state = snapshot();

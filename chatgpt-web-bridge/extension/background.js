@@ -6,6 +6,71 @@ let armedDownload = null;
 const allowed = url => { try { const u = new URL(url); return u.protocol === 'https:' && u.hostname === 'chatgpt.com'; } catch { return false; } };
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 const send = value => { if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(value)); };
+const conversationListRuleId = 1001;
+const conversationListRule = {
+  id: conversationListRuleId,
+  priority: 1,
+  action: { type: 'block' },
+  condition: {
+    regexFilter: '^https://chatgpt\\.com/backend-api/conversations(?:\\?.*)?$',
+    resourceTypes: ['xmlhttprequest'],
+  },
+};
+let conversationListBlocked = false;
+const conversationListBlockMs = 30000;
+const conversationListBlockUntilKey = 'conversationListBlockUntil';
+let conversationListBlockUntil = 0, conversationListExpiryTimer;
+let conversationListRuleTask = Promise.resolve();
+function setConversationListBlocking(blocked, { force = false } = {}) {
+  const apply = async () => {
+    if (!chrome.declarativeNetRequest?.updateDynamicRules || (!force && blocked === conversationListBlocked)) return;
+    if (!blocked && conversationListBlockUntil > Date.now()) return;
+    await chrome.declarativeNetRequest.updateDynamicRules({
+      removeRuleIds: [conversationListRuleId],
+      addRules: blocked ? [conversationListRule] : [],
+    });
+    conversationListBlocked = blocked;
+  };
+  conversationListRuleTask = conversationListRuleTask.then(apply, apply).catch(() => {});
+  return conversationListRuleTask;
+}
+function scheduleConversationListExpiry() {
+  clearTimeout(conversationListExpiryTimer);
+  const delayMs = Math.max(0, conversationListBlockUntil - Date.now());
+  conversationListExpiryTimer = setTimeout(() => expireConversationListBlock().catch(() => {}), delayMs);
+  chrome.alarms.create('conversation-list-block-expiry', { when: conversationListBlockUntil });
+}
+async function expireConversationListBlock() {
+  if (!conversationListBlockUntil || conversationListBlockUntil > Date.now()) {
+    if (conversationListBlockUntil) scheduleConversationListExpiry();
+    return;
+  }
+  conversationListBlockUntil = 0;
+  await chrome.storage.session.set({ [conversationListBlockUntilKey]: 0 });
+  if (conversationListBlockUntil > Date.now()) {
+    scheduleConversationListExpiry();
+    return;
+  }
+  await setConversationListBlocking(false);
+}
+async function blockConversationListAfterSend() {
+  conversationListBlockUntil = Date.now() + conversationListBlockMs;
+  await chrome.storage.session.set({ [conversationListBlockUntilKey]: conversationListBlockUntil });
+  scheduleConversationListExpiry();
+  await setConversationListBlocking(true);
+}
+const conversationListStateTask = (async () => {
+  const stored = await chrome.storage.session.get(conversationListBlockUntilKey);
+  conversationListBlockUntil = Number(stored[conversationListBlockUntilKey]) || 0;
+  if (conversationListBlockUntil > Date.now()) {
+    await setConversationListBlocking(true, { force: true });
+    scheduleConversationListExpiry();
+  } else {
+    conversationListBlockUntil = 0;
+    await chrome.storage.session.set({ [conversationListBlockUntilKey]: 0 });
+    await setConversationListBlocking(false, { force: true });
+  }
+})().catch(() => {});
 async function getIdentity() {
   if (identity) return identity;
   if (identityTask) return identityTask;
@@ -82,14 +147,38 @@ async function execute(message) {
   const run = async () => {
     if (Date.now() >= expiresAt) throw new Error('Command expired while waiting for the tab');
     await page(params.tabId);
+    if (command === 'close_tab') {
+      const ids = await getIdentity();
+      if (params.profileId !== ids.profileId || params.browserSessionId !== ids.browserSessionId ||
+          !params.documentId || !params.contentSignature || params.resultsSaved !== true) {
+        throw new Error('Close requires current browser/document identity and saved results');
+      }
+      const state = await content(params.tabId, 'probe', { documentId: params.documentId });
+      await relay(await page(params.tabId), state);
+      if (state.documentId !== params.documentId || state.url !== params.url || state.contentSignature !== params.contentSignature) {
+        throw new Error('Page changed before close; inspect and save its current results first');
+      }
+      if (state.activity !== 'idle' || !state.composerReady || state.draftLength !== 0 || state.attachmentCount) {
+        throw new Error('Close requires an idle page with no draft');
+      }
+      if (Date.now() >= expiresAt) throw new Error('Command expired before closing the tab');
+      const current = await page(params.tabId);
+      if (current.url !== params.url || current.pendingUrl) throw new Error('Page is navigating; no tab was closed');
+      await chrome.tabs.remove(params.tabId);
+      observations.delete(params.tabId);
+      send({ type: 'invalidate', ...ids, tabId: params.tabId, closed: true, reason: 'Tab closed' });
+      return { closed: true, tabId: params.tabId, ...ids };
+    }
     // The receipt is written before touching the send button. A lost reply never licenses another click.
     const receiptKey = `receipt:${id}`;
     if (command === 'submit') {
       const prior = (await chrome.storage.local.get(receiptKey))[receiptKey];
       if (prior) return prior.result || { accepted: false, uncertain: true, duplicateCommand: true };
-      await chrome.storage.local.set({ [receiptKey]: { startedAt: Date.now(), runId: params.runId, tabId: params.tabId } });
+      await chrome.storage.local.set({ [receiptKey]: { startedAt: Date.now(), runId: params.runId, tabId: params.tabId, expiresAt } });
+      await conversationListStateTask;
+      await blockConversationListAfterSend();
     }
-    const result = await content(params.tabId, command, params);
+    const result = await content(params.tabId, command, { ...params, expiresAt });
     if (command === 'submit') await chrome.storage.local.set({ [receiptKey]: { finishedAt: Date.now(), result } });
     await probe(params.tabId).catch(() => {});
     return result;
@@ -179,6 +268,18 @@ async function restoreDownloads() {
 }
 chrome.runtime.onMessage.addListener((message, sender, respond) => {
   if (sender.id !== chrome.runtime.id) return false;
+  if (message.type === 'before_submit' && sender.tab && sender.frameId === 0 && allowed(sender.url || sender.tab.url)) {
+    (async () => {
+      const key = `receipt:${message.runId}`, receipt = (await chrome.storage.local.get(key))[key];
+      if (!receipt?.startedAt || receipt.finishedAt || receipt.tabId !== sender.tab.id || !(receipt.expiresAt > Date.now())) throw new Error('No active submission receipt for this tab');
+      // Uploads may exceed the initial 30-second window. Restart protection
+      // immediately before the actual send click, without bypassing tab locks.
+      await conversationListStateTask;
+      await blockConversationListAfterSend();
+      return { ok: true };
+    })().then(respond, error => respond({ ok: false, error: error.message }));
+    return true;
+  }
   if (message.type === 'load_adapter' && sender.tab && sender.frameId === 0 && allowed(sender.url || sender.tab.url)) {
     // The requesting content script can load only our fixed adapter file into
     // its own top-level ChatGPT document, never caller-supplied code or tab IDs.
@@ -191,7 +292,7 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
     relay(sender.tab, message.snapshot).then(() => respond({ ok: true }), () => respond({ ok: false })); return true;
   }
   if (message.type === 'popup_status' && !sender.tab) {
-    respond({ connected: socket?.readyState === WebSocket.OPEN, extensionId: chrome.runtime.id, tabs: [...observations.values()].map(s => ({ tabId: s.tabId, title: s.title, model: s.model, activity: s.activity, observedAt: s.observedAt })) }); return false;
+    respond({ connected: socket?.readyState === WebSocket.OPEN, conversationListBlocked: conversationListBlocked && conversationListBlockUntil > Date.now(), conversationListBlockedUntil: conversationListBlockUntil || null, extensionId: chrome.runtime.id, tabs: [...observations.values()].map(s => ({ tabId: s.tabId, title: s.title, model: s.model, activity: s.activity, observedAt: s.observedAt })) }); return false;
   }
   return false;
 });
@@ -204,7 +305,10 @@ chrome.tabs.onRemoved.addListener(tabId => {
   observations.delete(tabId);
   getIdentity().then(ids => send({ type: 'invalidate', ...ids, tabId, closed: true, reason: 'Tab closed' }));
 });
-chrome.alarms.onAlarm.addListener(alarm => { if (alarm.name === 'bridge-reconnect') connect(); });
+chrome.alarms.onAlarm.addListener(alarm => {
+  if (alarm.name === 'bridge-reconnect') connect();
+  if (alarm.name === 'conversation-list-block-expiry') expireConversationListBlock().catch(() => {});
+});
 chrome.runtime.onStartup.addListener(connect);
 chrome.runtime.onInstalled.addListener(() => { connect(); inventory({ inject: true }).catch(() => {}); });
 chrome.alarms.create('bridge-reconnect', { periodInMinutes: 0.5 });

@@ -163,13 +163,13 @@ export class StateStore extends EventEmitter {
 
   list() { return Object.keys(this.data.tabs).map(key => this.tabView(key)); }
 
-  async reserve({ tabKey, prompt, requestId, kind, expectedModel }) {
+  async reserve({ tabKey, prompt = '', requestId, kind, expectedModel, attachments = [] }) {
     // Preserve retries of requests created when the default kind was image.
     kind ??= this.data.runs[this.data.requests[requestId]?.runId]?.kind ?? 'text';
     if (!['image', 'text'].includes(kind)) throw new Error('kind must be image or text');
-    if (typeof prompt !== 'string' || !prompt.trim() || prompt.length > 50000) throw new Error('Prompt must contain 1–50000 characters');
+    if (typeof prompt !== 'string' || (!prompt.trim() && !attachments.length) || prompt.length > 50000) throw new Error('Prompt must contain 1–50000 characters, or include attachments');
     if (typeof requestId !== 'string' || requestId.length < 4 || requestId.length > 150) throw new Error('A stable requestId of 4–150 characters is required');
-    const digest = hash(JSON.stringify({ tabKey, prompt, kind, expectedModel }));
+    const digest = hash(JSON.stringify({ tabKey, prompt, kind, expectedModel, ...(attachments.length ? { attachments } : {}) }));
     const prior = this.data.requests[requestId];
     if (prior) {
       if (prior.digest !== digest) throw new Error('requestId was already used with different input');
@@ -179,6 +179,7 @@ export class StateStore extends EventEmitter {
     const tab = this.tabView(tabKey);
     this.assertAccessAllowed(tab.profileId);
     if (tab.freshness.stale || !tab.composerReady || tab.activity !== 'idle') throw new Error('Target tab is not freshly observed and idle');
+    if (tab.attachmentCount) throw new Error('Target tab contains existing attachments; they were left intact');
     if (tab.draftLength > 0) {
       const recoverable = Object.values(this.data.runs).some(run =>
         run.tabKey === tabKey && run.documentIdAtSend === tab.documentId &&
@@ -195,6 +196,7 @@ export class StateStore extends EventEmitter {
     if (busy) throw new Error(`An unresolved run already owns this tab/conversation: ${busy.id}`);
     const run = {
       id: randomUUID(), requestId, tabKey, profileId: tab.profileId, kind, prompt,
+      ...(attachments.length ? { attachments } : {}),
       phase: 'submitting', createdAt: this.now(), updatedAt: this.now(),
       conversationId: tab.conversationId, selectedAtSend: tab.model,
       documentIdAtSend: tab.documentId,
@@ -275,7 +277,9 @@ export class StateStore extends EventEmitter {
         delete run.attentionType; delete run.attention;
         if (['awaiting_user', 'rate_limited'].includes(run.phase)) run.phase = run.accepted ? 'submitted' : 'submission_unknown';
       }
-      const userConfirmed = tab.userCount > run.baseline.userCount && textMatches;
+      // Attachment sends need the adapter's post-upload acceptance receipt;
+      // matching text alone cannot identify an uploaded message after timeout.
+      const userConfirmed = tab.userCount > run.baseline.userCount && textMatches && !run.attachments?.length;
       if (!run.accepted && userConfirmed) run.accepted = true;
       if (!run.accepted) {
         if (JSON.stringify(run) !== before) { run.updatedAt = this.now(); changed = true; }

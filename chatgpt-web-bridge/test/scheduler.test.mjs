@@ -110,6 +110,34 @@ test('restart retains parallel leases, queue and pacing; v1 ownership migrates w
   assert.equal(next.view(profile).lockScope, 'tab');
 });
 
+test('closed terminal tabs release tasks while unresolved runs become orphaned', () => {
+  const { store, scheduler, acquire, snapshot } = fixture();
+  const releasedTab = snapshot(1), orphanedTab = snapshot(2);
+  const released = acquire('closed-terminal-task', { tabKey: releasedTab });
+  const orphaned = acquire('closed-unresolved-task', { tabKey: orphanedTab });
+  store.data.runs.finished = { id: 'finished', tabKey: releasedTab, taskId: released.taskId, phase: 'completed' };
+  store.data.runs.pending = { id: 'pending', tabKey: orphanedTab, taskId: orphaned.taskId, phase: 'submission_unknown' };
+  store.data.tabs[releasedTab].closed = true; store.data.tabs[orphanedTab].closed = true;
+
+  assert.equal(scheduler.reconcileClosedTasks(), true);
+  const view = scheduler.view(profile);
+  assert.equal(view.activeTasks.length, 0);
+  assert.deepEqual(view.orphanedTasks.map(task => task.taskId), [orphaned.taskId]);
+  assert.equal(scheduler.data.tasks[released.taskId].state, 'released');
+  assert.equal(scheduler.data.tasks[released.taskId].releaseReason, 'tab_closed');
+  assert.equal(scheduler.data.tasks[orphaned.taskId].state, 'orphaned');
+  assert.deepEqual(scheduler.data.tasks[orphaned.taskId].unresolvedRunIds, ['pending']);
+  assert.throws(() => acquire(released.taskId), /released/);
+  assert.throws(() => acquire(orphaned.taskId), /orphaned/);
+  assert.throws(() => scheduler.requireLease(profile, released.leaseId), { code: 'TASK_LEASE_REQUIRED' });
+  assert.throws(() => scheduler.requireLease(profile, orphaned.leaseId), { code: 'TASK_LEASE_REQUIRED' });
+
+  store.data.runs.pending.phase = 'completed'; store.data.runs.pending.completedAt = store.now();
+  assert.equal(scheduler.reconcileClosedTasks(), true);
+  assert.equal(scheduler.data.tasks[orphaned.taskId].state, 'released');
+  assert.equal(scheduler.data.tasks[orphaned.taskId].releaseReason, 'tab_closed');
+});
+
 test('legacy adoption preserves uncertain outcomes and blocks only its tab after abandonment', async () => {
   const { store, scheduler, acquire, snapshot, advance, setInventory } = fixture();
   const tabKey = snapshot(1);
@@ -151,4 +179,38 @@ test('aliases of the same conversation cannot be owned by separate tasks', () =>
   const tabKey = snapshot(1), otherKey = snapshot(2, { url: 'https://chatgpt.com/c/chat-1' });
   acquire('conversation-owner', { tabKey });
   assert.throws(() => acquire('alias-tab-owner', { tabKey: otherKey }), { code: 'TAB_UNAVAILABLE' });
+});
+
+test('close requires an existing owned tab, saved results and a fresh idle page', () => {
+  const { scheduler, acquire, snapshot, advance } = fixture();
+  const tabKey = snapshot(1), second = snapshot(2);
+  const owner = acquire('close-page-owner', { tabKey }), other = acquire('other-page-owner', { tabKey: second });
+  const close = (params = {}, key = tabKey) => scheduler.authorize(profile, 'tabs',
+    { action: 'close', leaseId: owner.leaseId, resultsSaved: true, ...params }, key);
+  assert.equal(close().tabKey, tabKey);
+  assert.throws(() => close({ leaseId: undefined }), { code: 'TASK_LEASE_REQUIRED' });
+  assert.throws(() => close({ leaseId: other.leaseId }), { code: 'TASK_TAB_MISMATCH' });
+  assert.throws(() => close({}, 'unknown-tab'), { code: 'TASK_TAB_MISMATCH' });
+  assert.throws(() => close({ resultsSaved: false }), /resultsSaved/);
+  for (const overrides of [{ draftLength: 1 }, { composerReady: false }, { frozen: true }, { discarded: true }, { activity: 'unknown' }]) {
+    snapshot(1, overrides); assert.throws(() => close(), { code: 'TAB_UNAVAILABLE' });
+  }
+  snapshot(1); advance(30001); assert.throws(() => close(), { code: 'TAB_UNAVAILABLE' });
+});
+
+test('closed terminal tabs no longer retain a lease after reconciliation', () => {
+  const { store, scheduler, acquire, snapshot } = fixture();
+  const tabKey = snapshot(1), owner = acquire('close-run-owner', { tabKey });
+  const close = () => scheduler.authorize(profile, 'tabs', { action: 'close', leaseId: owner.leaseId, resultsSaved: true }, tabKey);
+  for (const phase of ['submitting', 'submission_unknown', 'submitted', 'generating', 'thinking', 'finalizing', 'awaiting_user']) {
+    store.data.runs.pending = { id: 'pending', tabKey, phase, taskId: owner.taskId };
+    assert.throws(close, { code: 'TAB_BUSY' });
+  }
+  Object.assign(store.data.runs.pending, { phase: 'completed', completedAt: store.now() });
+  close(); // Closing does not generate website traffic, so no completion cooldown is needed.
+  store.data.tabs[tabKey].closed = true;
+  assert.equal(scheduler.reconcileClosedTasks(), true);
+  assert.equal(scheduler.data.tasks[owner.taskId].state, 'released');
+  assert.throws(close, { code: 'TASK_LEASE_REQUIRED' });
+  assert.equal(store.data.runs.pending.phase, 'completed');
 });
