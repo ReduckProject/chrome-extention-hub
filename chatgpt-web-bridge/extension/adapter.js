@@ -1,5 +1,8 @@
 (() => {
-  const adapterVersion = 45;
+  const adapterVersion = 51;
+  const SEND_READY_TIMEOUT_MS = 30000;
+  const SUBMIT_ACK_TIMEOUT_MS = 30000;
+  const ATTACHMENT_SUBMIT_ACK_TIMEOUT_MS = 15000;
   if (globalThis.ChatGPTBridgeAdapter?.version === adapterVersion) return;
   globalThis.ChatGPTBridgeAdapter?.dispose?.();
   const doc = document;
@@ -70,10 +73,15 @@
     return output;
   };
   const turnRoot = node => node?.closest('[data-turn="assistant"],article') || node;
-  const stop = () => all('[data-testid="stop-button"]').find(n => !n.disabled) ||
-    buttons(controls()).find(n => /^(stop( generating| response| streaming)?|停止(生成|回答|输出)?)$/i.test(label(n)) && !n.disabled);
-  const send = () => all('[data-testid="send-button"]').find(n => !n.disabled) ||
-    buttons(controls()).find(n => /^(send( prompt| message)?|发送(消息|提示)?)$/i.test(label(n)) && !n.disabled);
+  const enabled = node => !node.disabled && node.getAttribute('aria-disabled') !== 'true';
+  const stop = () => {
+    const stopLabels = /^(stop(?: generating| response| streaming| answering)?|停止(?:生成|回答|输出)?)$/i;
+    const native = all('[data-testid="stop-button"],[data-testid="composer-stop-button"],[data-testid="composer-submit-button"]')
+      .find(n => enabled(n) && (n.getAttribute('data-testid') !== 'composer-submit-button' || stopLabels.test(label(n))));
+    return native || buttons(controls()).find(n => stopLabels.test(label(n)) && enabled(n));
+  };
+  const send = () => all('[data-testid="send-button"]').find(enabled) ||
+    buttons(controls()).find(n => /^(send( prompt| message)?|发送(消息|提示)?)$/i.test(label(n)) && enabled(n));
   const effortLabels = /^(低|中|高|极高|轻度|标准|扩展|重度|Low|Medium|High|Extra high|Light|Standard|Extended|Heavy)$/i;
   const modelLabel = /^(Latest|最新|Instant|Thinking|Pro|Auto|即时|思考|专业|自动)$|^(?:GPT-)?\d+(?:\.\d+)?\b|^o[1-9]\b/i;
   function modelPickers() {
@@ -189,6 +197,17 @@
     const node = accessNoticeNode();
     return node ? { type: 'rate_limit', message: text(node).slice(0, 500) } : null;
   }
+  const isImageQuotaText = value => /(?:图片|图像)\s*生成\s*(?:次数|请求)?\s*(?:已用完|用完|上限|限额)|(?:图片|图像)\s*(?:额度|配额).{0,30}(?:已用完|用完|上限|限额)|(?:image\s+generation|image\s+generations?).{0,80}(?:limit|quota|exhausted|used\s+up|run\s+out)|image\s+(?:quota|limit).{0,40}(?:exhausted|used\s+up|reset|again)|(?:run\s+out|used\s+up|exhausted).{0,80}image/i.test(value);
+  function imageQuotaNotice() {
+    const nodes = all('[data-testid="image-gen-rate-limit-tombstone"],[role="dialog"],[role="alertdialog"],[role="alert"],[role="status"],[data-testid="conversation-error"]')
+      .filter(n => n.matches('[data-testid="image-gen-rate-limit-tombstone"]') ||
+        !n.closest('[data-message-author-role],article,[data-turn],form,[data-testid="composer"]'));
+    const quota = nodes.find(n => {
+      const value = text(n);
+      return isImageQuotaText(value);
+    });
+    return quota ? text(quota).slice(0, 500) : null;
+  }
   async function dismissRateLimit() {
     const node = accessNoticeNode();
     if (!node) return { dismissed: false, noticeVisible: false };
@@ -215,10 +234,23 @@
     const error = alerts.map(text).find(t => /error|something went wrong|failed|unable|出错|失败|出了.*问题|无法/i.test(t));
     const access = accessNotice();
     const attention = access?.message || all('[role="dialog"],[role="alertdialog"]').map(text).find(t => /sign in|log in|verify|captcha|limit|upgrade|登录|验证|上限|限额|升级/i.test(t));
+    const imageQuotaText = imageQuotaNotice() || (isImageQuotaText(output) ? output.slice(0, 2000) : null);
+    // Completion is driven by page-owned controls, never by assistant prose. In the current
+    // image renderer the composer may have no Stop button at all; the assistant turn then owns
+    // a native progressbar while the image is being rendered. This is the same page state the
+    // user sees, and remains valid when the response transport has already ended.
+    const progressbar = all('[role="progressbar"]', last || doc.createElement('div'))[0] || null;
+    const generationPlaceholder = !!progressbar;
+    const generationControl = {
+      source: busy ? 'stop_button' : progressbar ? 'progressbar' : null,
+      stopButton: busy ? { testId: busy.getAttribute('data-testid'), label: label(busy) } : null,
+      progressbar: progressbar ? { label: label(progressbar), value: progressbar.getAttribute('aria-valuenow'), max: progressbar.getAttribute('aria-valuemax') } : null,
+    };
     let activity = 'unknown';
     if (attention) activity = 'needs_attention';
     else if (error) activity = 'error';
     else if (busy) activity = thinking ? 'thinking' : 'generating';
+    else if (progressbar) activity = 'generating';
     else if (thinking || statusNodes.some(n => n.getAttribute('aria-busy') === 'true')) activity = 'thinking';
     else if (input && !input.disabled && input.getAttribute('aria-disabled') !== 'true') activity = 'idle';
     const lastId = messageId(last);
@@ -231,14 +263,15 @@
       url: location.href, title: doc.title, activity, model,
       attention: (attention || error || '').slice(0, 500) || null,
       attentionType: access?.type || null,
+      imageQuotaText,
       surface: imageViewer() ? 'image_viewer' : 'conversation',
       composerReady: !!input && !input.disabled && input.getAttribute('aria-disabled') !== 'true' && !imageViewer(),
       draftLength: draft(input).length, attachmentCount: attachmentCount(), userCount: users.length, assistantCount: assistants.length,
       lastUserId: messageId(lastUser), lastUserText: userText(lastUser), lastAssistantId: lastId,
-      lastAssistantPreview: output.slice(-400), lastAssistantLength: output.length,
-      images, finalActions, responseStreams: responseStreams(),
-      responseSignature: fingerprint(JSON.stringify([output, activity, finalActions, users.length, lastId])),
-      contentSignature: fingerprint(JSON.stringify([output, images, activity, finalActions, users.length, lastId])),
+      lastAssistantPreview: output.slice(-400), lastAssistantLength: output.length, generationPlaceholder,
+      generationControl, images, finalActions, responseStreams: responseStreams(),
+      responseSignature: fingerprint(JSON.stringify([output, activity, generationPlaceholder, finalActions, users.length, lastId])),
+      contentSignature: fingerprint(JSON.stringify([output, images, activity, generationPlaceholder, finalActions, users.length, lastId])),
       adapterVersion,
     };
   }
@@ -247,6 +280,25 @@
     const deadline = Date.now() + timeoutMs;
     do { const value = test(); if (value) return value; await pause(80); } while (Date.now() < deadline);
     return null;
+  }
+  const isRateLimitError = error => /^ChatGPT access is rate limited:/i.test(String(error?.message || error));
+  function clearOwnedDraft(input, expectedPrompt, before) {
+    if (!input || draft(input) !== normalize(expectedPrompt) || editor() !== input ||
+        location.href !== before.url || messages('user').length !== before.userCount || attachmentCount() || stop()) return false;
+    try {
+      input.focus();
+      if (input.tagName === 'TEXTAREA') {
+        Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(input, '');
+      } else {
+        const range = doc.createRange(); range.selectNodeContents(input);
+        const selection = getSelection(); selection.removeAllRanges(); selection.addRange(range);
+        let deleted = false;
+        try { deleted = typeof doc.execCommand === 'function' && doc.execCommand('delete'); } catch {}
+        if (!deleted && draft(input) === normalize(expectedPrompt)) input.replaceChildren();
+      }
+      input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward', data: null }));
+      return draft(input) === '';
+    } catch { return false; }
   }
   function assertIdle() {
     const state = snapshot();
@@ -434,6 +486,15 @@
     try { files = decodeAttachments(attachments); }
     catch (error) { return { notSubmitted: true, error: error.message }; }
     if (!normalize(prompt) && !files.length) return { notSubmitted: true, error: 'A prompt or attachment is required' };
+    const ownedDraft = !before.draftLength && !files.length;
+    const failure = error => {
+      const notice = accessNotice();
+      const message = notice ? 'ChatGPT access is rate limited: ' + notice.message : String(error?.message || error);
+      const result = { notSubmitted: true, preClick: true, error: message };
+      if (notice || isRateLimitError(error)) result.accessPaused = true;
+      if (ownedDraft && clearOwnedDraft(input, prompt, before)) result.draftCleared = true;
+      return result;
+    };
     input.focus();
     if (before.draftLength) {
       // Recover an identical unsent draft without replacing or appending text.
@@ -443,9 +504,9 @@
     } else if (prompt) {
       const range = doc.createRange(); range.selectNodeContents(input);
       const selection = getSelection(); selection.removeAllRanges(); selection.addRange(range);
-      if (!doc.execCommand('insertText', false, prompt)) return { notSubmitted: true, error: 'Editor did not accept text; inspect draft' };
+      if (!doc.execCommand('insertText', false, prompt)) return failure(new Error('Editor did not accept text; inspect draft'));
     }
-    if (draft(input) !== normalize(prompt)) return { notSubmitted: true, error: 'Draft readback differs; no send click was made' };
+    if (draft(input) !== normalize(prompt)) return failure(new Error('Draft readback differs; no send click was made'));
     const checkPage = () => {
       assertAccessAllowed();
       if (Date.now() >= expiresAt) throw new Error('Submission expired; draft was left intact');
@@ -454,21 +515,25 @@
       if (expectedModel && snapshot().model.label !== expectedModel) throw new Error('Model changed before submission');
     };
     try { checkPage(); if (files.length) await uploadAttachments(files, input, checkPage); checkPage(); }
-    catch (error) { return { notSubmitted: true, error: error.message }; }
-    const button = await until(send);
-    if (!button) return { notSubmitted: true, error: 'Send button unavailable; draft remains in the page' };
+    catch (error) { return failure(error); }
+    const button = await until(send, files.length ? 15000 : SEND_READY_TIMEOUT_MS);
+    if (!button) return failure(new Error('Send button unavailable before submission'));
     try {
-      if (files.length) await beforeSend();
+      await beforeSend();
       checkPage();
       if (attachmentCards().length !== files.length) throw new Error('Attachments changed before submission; draft was left intact');
       if (send() !== button) throw new Error('Send control changed before submission; draft was left intact');
     }
-    catch (error) { return { notSubmitted: true, error: error.message }; }
+    catch (error) { return failure(error); }
     button.click();
+    // Attachment uploads can be accepted by the site before the new user
+    // message is inserted into the DOM. Give that post-click acknowledgement
+    // a longer, attachment-specific window instead of returning uncertain
+    // while ChatGPT is still committing the uploaded message.
     const accepted = await until(() => {
       const state = snapshot();
       return state.userCount > before.userCount && state.lastUserText === normalize(prompt) && state;
-    }, 2200);
+    }, files.length ? ATTACHMENT_SUBMIT_ACK_TIMEOUT_MS : SUBMIT_ACK_TIMEOUT_MS);
     return accepted ? { accepted: true, userMessageId: accepted.lastUserId, conversationId: new URL(accepted.url).pathname.match(/\/c\/([^/]+)/)?.[1] || null } : { accepted: false, uncertain: true };
   }
   async function stopGeneration(expectedUserId, expectedPrompt) {

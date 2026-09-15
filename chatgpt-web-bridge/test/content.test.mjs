@@ -24,7 +24,7 @@ function fixture() {
   });
   return { context, snapshots, listeners, run: () => vm.runInContext(source, context),
     loaded(ok = true) {
-      if (ok) context.ChatGPTBridgeAdapter = { snapshot: () => ({ adapterVersion: 42, model: { name: '最新', reasoningEffort: '高' } }) };
+      if (ok) context.ChatGPTBridgeAdapter = { version: 50, snapshot: () => ({ adapterVersion: 50, model: { name: '最新', reasoningEffort: '高' } }) };
       finishLoad({ ok });
     }, counts: () => ({ loadCount, oldReads }),
   };
@@ -36,10 +36,10 @@ test('the first snapshot waits for the current adapter and duplicate bootstrap i
   assert.deepEqual(f.counts(), { loadCount: 1, oldReads: 0 });
   assert.equal(f.snapshots.length, 0); assert.equal(f.listeners.length, 0);
   f.loaded(); await pending;
-  assert.equal(f.snapshots.length, 1); assert.equal(f.snapshots[0].adapterVersion, 42);
+  assert.equal(f.snapshots.length, 1); assert.equal(f.snapshots[0].adapterVersion, 50);
   assert.equal(f.snapshots[0].contentVersion, 6); assert.equal(f.listeners.length, 1);
   const probed = await new Promise(resolve => f.listeners[0]({ type: 'command', command: 'probe' }, { id: 'fixture-extension' }, resolve));
-  assert.equal(probed.result.adapterVersion, 42); assert.equal(probed.result.contentVersion, 6);
+  assert.equal(probed.result.adapterVersion, 50); assert.equal(probed.result.contentVersion, 6);
   await f.run(); assert.equal(f.listeners.length, 1); assert.equal(f.counts().loadCount, 1);
 });
 
@@ -50,21 +50,30 @@ test('a failed adapter load reports the bootstrap error without publishing the o
   assert.equal(f.snapshots[0].adapterVersion, null); assert.equal(f.snapshots[0].composerReady, false);
   assert.match(f.snapshots[0].bootstrapError, /Background did not acknowledge/);
   const retried = f.run(); f.loaded(); await retried;
-  assert.equal(f.snapshots[1].adapterVersion, 42); assert.equal(f.listeners.length, 1);
+  assert.equal(f.snapshots[1].adapterVersion, 50); assert.equal(f.listeners.length, 1);
 });
 
 test('explicitly preloaded current adapter recovers observations without a new worker protocol', async () => {
   const f = fixture();
-  f.context.ChatGPTBridgeAdapter = { version: 42, snapshot: () => ({ adapterVersion: 42, activity: 'idle' }) };
+  f.context.ChatGPTBridgeAdapter = { version: 50, snapshot: () => ({ adapterVersion: 50, activity: 'idle' }) };
   await f.run();
   assert.equal(f.counts().loadCount, 0); assert.equal(f.snapshots.length, 1);
-  assert.equal(f.snapshots[0].adapterVersion, 42); assert.equal(f.snapshots[0].contentVersion, 6);
+  assert.equal(f.snapshots[0].adapterVersion, 50); assert.equal(f.snapshots[0].contentVersion, 6);
   assert.equal(f.snapshots[0].observationError, undefined); assert.equal(f.listeners.length, 1);
+});
+
+test('a preloaded older adapter is replaced before the first observation', async () => {
+  const f = fixture();
+  f.context.ChatGPTBridgeAdapter = { version: 48, snapshot: () => ({ adapterVersion: 48 }) };
+  const pending = f.run();
+  assert.equal(f.counts().loadCount, 1);
+  f.loaded(); await pending;
+  assert.equal(f.snapshots[0].adapterVersion, 50); assert.equal(f.counts().oldReads, 0);
 });
 
 test('submit forwards attachment payload and expiry and confirms the background before clicking', async () => {
   const f = fixture(); let forwarded, beforeSend;
-  f.context.ChatGPTBridgeAdapter = { version: 45, snapshot: () => ({ adapterVersion: 45 }),
+  f.context.ChatGPTBridgeAdapter = { version: 50, snapshot: () => ({ adapterVersion: 50 }),
     async submit(...args) { forwarded = args.slice(0, 4); await args[4](); return { accepted: true }; } };
   const send = f.context.chrome.runtime.sendMessage;
   f.context.chrome.runtime.sendMessage = message => {

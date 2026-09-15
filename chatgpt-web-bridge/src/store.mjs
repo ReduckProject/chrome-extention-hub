@@ -3,6 +3,7 @@ import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { conversationId, isChatGPT } from './config.mjs';
+import { parseImageGenerationQuota } from './image-quota.mjs';
 
 const terminal = new Set(['completed', 'stopped', 'error']);
 export const ACCESS_RETRY_MS = 300000;
@@ -87,8 +88,14 @@ export class StateStore extends EventEmitter {
     const signatureChanged = !previous || previous.contentSignature !== incoming.contentSignature || previous.documentId !== incoming.documentId;
     const responseChanged = !previous || previous.documentId !== incoming.documentId ||
       (previous.responseSignature ?? previous.contentSignature) !== (incoming.responseSignature ?? incoming.contentSignature);
+    const sameAssistant = previous?.documentId === incoming.documentId && previous.lastAssistantId === incoming.lastAssistantId;
+    const imageQuotaText = incoming.imageQuotaText || (sameAssistant ? previous.imageQuotaText : null);
+    const quotaObservedAt = sameAssistant
+      ? previous?.lastResponseChangeAt ?? previous?.imageQuota?.observedAt ?? now
+      : now;
+    const imageQuota = parseImageGenerationQuota([imageQuotaText, incoming.lastAssistantPreview].filter(Boolean).join('\n'), quotaObservedAt);
     this.data.tabs[key] = {
-      ...incoming, key, profileId, conversationId: conversationId(incoming.url),
+      ...incoming, ...(imageQuotaText ? { imageQuotaText } : {}), ...(imageQuota ? { imageQuota } : {}), key, profileId, conversationId: conversationId(incoming.url),
       receivedAt: now, restartPending: false,
       lastContentChangeAt: signatureChanged ? now : previous.lastContentChangeAt,
       lastResponseChangeAt: responseChanged ? now : previous.lastResponseChangeAt ?? previous.lastContentChangeAt,
@@ -183,9 +190,10 @@ export class StateStore extends EventEmitter {
     if (tab.draftLength > 0) {
       const recoverable = Object.values(this.data.runs).some(run =>
         run.tabKey === tabKey && run.documentIdAtSend === tab.documentId &&
-        run.phase === 'error' && run.accepted === false && run.prompt === prompt &&
+        !run.attachments?.length && run.phase === 'error' && run.accepted === false && run.prompt === prompt &&
         run.baseline.userCount === tab.userCount &&
-        run.error === 'Draft readback differs; no send click was made');
+        (run.preClickFailure === true || run.error === 'Draft readback differs; no send click was made' ||
+          run.error === 'Send button unavailable; draft remains in the page'));
       // The adapter additionally compares the complete editor text. Only a
       // recorded pre-click failure may reach that check with a nonempty draft.
       if (!recoverable) throw new Error('Target tab contains an existing draft; use a new chat');
@@ -219,12 +227,26 @@ export class StateStore extends EventEmitter {
     if (error) {
       // A transport timeout does not mean that the page rejected the prompt.
       run.phase = 'submission_unknown'; run.submissionError = String(error);
+      delete run.retryablePreClick; delete run.preClickFailure;
     } else if (result?.accepted) {
       run.accepted = true; run.phase = 'submitted';
       if (result.conversationId) run.conversationId = result.conversationId;
       if (result.userMessageId) run.userMessageId = result.userMessageId;
+      delete run.retryablePreClick; delete run.preClickFailure;
+      delete run.attentionType; delete run.attention; delete run.error; delete run.submissionError;
+    } else if (result?.accessPaused && result.notSubmitted) {
+      const message = result.error || 'ChatGPT access is rate limited';
+      this.pauseAccess(run.profileId, { message, sourceTabKey: run.tabKey, basis: 'page_action' });
+      run.accepted = false; run.phase = 'rate_limited'; run.attention = message; run.attentionType = 'rate_limit';
+      run.preClickFailure = result.preClick !== false;
+      if (!run.attachments?.length && run.preClickFailure) run.retryablePreClick = true;
+      else delete run.retryablePreClick;
+      if (result.draftCleared) run.draftClearedAt = this.now();
+      delete run.error; delete run.submissionError;
     } else if (result?.notSubmitted) {
       run.phase = 'error'; run.error = result.error || 'Submission was rejected before clicking';
+      run.preClickFailure = result.preClick === true;
+      delete run.retryablePreClick; delete run.attentionType; delete run.attention; delete run.submissionError;
     } else run.phase = 'submission_unknown';
     this.changed();
     this.reconcile();
@@ -238,15 +260,42 @@ export class StateStore extends EventEmitter {
       const view = this.tabView(run.tabKey);
       if (view.freshness.stale) continue;
       if (terminal.has(run.phase)) {
-        // Media can finish loading after the response ended. Never reopen the
-        // run or bind images from a later response or a different document.
-        if (run.phase === 'completed' && tab.documentId === run.documentIdAtSend &&
-            tab.conversationId === run.conversationId && tab.lastAssistantId === run.resultAssistantId &&
-            (!run.userMessageId || tab.lastUserId === run.userMessageId)) {
-          const images = (tab.images || []).filter(image => !run.baseline.imageKeys.includes(image.key));
-          if (JSON.stringify(images) !== JSON.stringify(run.images)) { run.images = images; run.updatedAt = this.now(); changed = true; }
+        const sameResponse = run.phase === 'completed' && tab.documentId === run.documentIdAtSend &&
+          tab.conversationId === run.conversationId && tab.lastAssistantId === run.resultAssistantId &&
+          (!run.userMessageId || tab.lastUserId === run.userMessageId);
+        // A previous adapter could have marked a progress placeholder as
+        // completed after the HTTP response ended. Reopen only that exact
+        // response when a fresh adapter explicitly identifies it as live
+        // generation. This does not change the normal lazy-image behavior.
+        if (sameResponse && tab.generationPlaceholder === true) {
+          run.phase = tab.activity === 'thinking' ? 'thinking' : 'generating';
+          run.observedGeneration = true;
+          run.updatedAt = this.now();
+          delete run.completedAt; delete run.completionReason; delete run.completionEvidence;
+          delete run.resultAssistantId;
+          run.observationIssue = 'response_still_generating';
+          changed = true;
+        } else {
+          // Media can finish loading after the response ended. Never reopen
+          // the run or bind images from a later response or another document.
+          if (sameResponse) {
+            const images = (tab.images || []).filter(image => !run.baseline.imageKeys.includes(image.key));
+            if (JSON.stringify(images) !== JSON.stringify(run.images)) {
+              run.images = images; run.updatedAt = this.now(); changed = true;
+            }
+            const imageQuota = tab.imageQuota || parseImageGenerationQuota([tab.imageQuotaText, tab.lastAssistantPreview].filter(Boolean).join('\n'),
+              tab.lastResponseChangeAt ?? tab.receivedAt ?? run.completedAt);
+            const quotaImproved = imageQuota && (!run.imageQuota ||
+              (!run.imageQuota.resetAt && imageQuota.resetAt) ||
+              (run.imageQuota.source !== 'absolute_text' && imageQuota.source === 'absolute_text'));
+            if (quotaImproved) {
+              run.imageQuota = imageQuota;
+              if (run.responseCache) run.responseCache = { ...run.responseCache, imageQuota };
+              run.updatedAt = this.now(); changed = true;
+            }
+          }
+          continue;
         }
-        continue;
       }
       const before = JSON.stringify(run);
       if (tab.documentId !== run.documentIdAtSend) {
@@ -273,13 +322,36 @@ export class StateStore extends EventEmitter {
         if (JSON.stringify(run) !== before) { run.updatedAt = this.now(); changed = true; }
         continue;
       }
+      if (run.retryablePreClick && !run.accepted && this.accessPause(run.profileId)) {
+        run.phase = 'rate_limited'; run.attentionType = 'rate_limit';
+        run.attention ||= this.accessPause(run.profileId).message;
+        if (JSON.stringify(run) !== before) { run.updatedAt = this.now(); changed = true; }
+        continue;
+      }
       if (run.attentionType === 'rate_limit') {
         delete run.attentionType; delete run.attention;
+        if (run.retryablePreClick && !run.accepted) {
+          if (JSON.stringify(run) !== before) { run.updatedAt = this.now(); changed = true; }
+          continue;
+        }
         if (['awaiting_user', 'rate_limited'].includes(run.phase)) run.phase = run.accepted ? 'submitted' : 'submission_unknown';
       }
-      // Attachment sends need the adapter's post-upload acceptance receipt;
-      // matching text alone cannot identify an uploaded message after timeout.
-      const userConfirmed = tab.userCount > run.baseline.userCount && textMatches && !run.attachments?.length;
+      // A slow attachment upload can outlive the adapter's post-click receipt.
+      // Recover only when the same document shows exactly one matching new
+      // user turn plus a completed response: either a successful stream
+      // created after this run or an idle response with final controls. Text
+      // alone is still insufficient for an attachment retry.
+      const newAssistant = tab.assistantCount > run.baseline.assistantCount ||
+        (tab.lastAssistantId && tab.lastAssistantId !== run.baseline.lastAssistantId);
+      const stream = finishedResponseStream(run, tab);
+      const attachmentResponseConfirmed = run.attachments?.length &&
+        tab.userCount === run.baseline.userCount + 1 && textMatches && newAssistant &&
+        tab.activity === 'idle' && tab.finalActions;
+      const attachmentUserConfirmed = run.attachments?.length &&
+        tab.userCount === run.baseline.userCount + 1 && textMatches &&
+        (stream?.status === 200 || attachmentResponseConfirmed);
+      const userConfirmed = tab.userCount > run.baseline.userCount && textMatches &&
+        (!run.attachments?.length || attachmentUserConfirmed);
       if (!run.accepted && userConfirmed) run.accepted = true;
       if (!run.accepted) {
         if (JSON.stringify(run) !== before) { run.updatedAt = this.now(); changed = true; }
@@ -294,24 +366,26 @@ export class StateStore extends EventEmitter {
       delete run.observationIssue;
       if (!run.userMessageId && tab.lastUserId) run.userMessageId = tab.lastUserId;
       if (!run.conversationId && tab.conversationId && userConfirmed) run.conversationId = tab.conversationId;
-      const newAssistant = tab.assistantCount > run.baseline.assistantCount ||
-        (tab.lastAssistantId && tab.lastAssistantId !== run.baseline.lastAssistantId);
       if (newAssistant && tab.lastAssistantId) {
         run.responseAssistantId = tab.lastAssistantId;
         run.resultPreview = tab.lastAssistantPreview; run.resultLength = tab.lastAssistantLength;
         run.images = (tab.images || []).filter(image => !run.baseline.imageKeys.includes(image.key));
+        const imageQuota = tab.imageQuota || parseImageGenerationQuota([tab.imageQuotaText, tab.lastAssistantPreview].filter(Boolean).join('\n'), tab.receivedAt);
+        if (imageQuota) run.imageQuota = imageQuota;
       }
-      const stream = finishedResponseStream(run, tab);
       const completionEvidence = stream ? { source: 'response_stream_end', requestKey: stream.key,
         startedAt: stream.startedAt, endedAt: stream.endedAt } : tab.finalActions ? { source: 'response_actions' } : null;
       const stableSince = Math.max(tab.lastResponseChangeAt ?? tab.lastContentChangeAt, stream?.endedAt || 0);
-      if (tab.activity === 'generating' || tab.activity === 'thinking') {
-        run.observedGeneration = true; run.phase = tab.activity;
+      const pageGenerationActive = tab.generationPlaceholder === true || tab.activity === 'generating' || tab.activity === 'thinking';
+      if (pageGenerationActive) {
+        run.observedGeneration = true;
+        run.phase = tab.generationPlaceholder === true ? 'generating' : tab.activity;
+        if (tab.generationPlaceholder === true) run.observationIssue = 'response_still_generating';
       } else if (tab.activity === 'needs_attention') {
         run.phase = 'awaiting_user'; run.attention = tab.attention;
       } else if (tab.activity === 'error') {
         run.phase = 'error'; run.error = tab.attention || 'Page reported an error';
-      } else if (newAssistant && tab.lastAssistantId && tab.activity === 'idle' && completionEvidence &&
+      } else if (newAssistant && tab.lastAssistantId && tab.activity === 'idle' && !tab.generationPlaceholder && completionEvidence &&
           this.now() - stableSince >= 2500) {
         run.phase = 'completed'; run.completedAt = this.now(); run.completionReason = 'response_finished';
         run.completionEvidence = completionEvidence;
@@ -335,7 +409,9 @@ export class StateStore extends EventEmitter {
     if (!run) throw new Error(`Unknown run: ${id}`);
     const tab = this.data.tabs[run.tabKey] ? this.tabView(run.tabKey) : null;
     const { responseCache, ...publicRun } = run;
-    return { ...publicRun, observation: tab ? { connection: tab.connection, freshness: tab.freshness, activity: tab.activity, model: tab.model, accessPause: tab.accessPause } : null };
+    return { ...publicRun, observation: tab ? { connection: tab.connection, freshness: tab.freshness,
+      activity: tab.activity, generationPlaceholder: tab.generationPlaceholder === true,
+      model: tab.model, accessPause: tab.accessPause } : null };
   }
 
   async wait({ runId, afterRevision = this.data.revision, timeoutMs = 20000 }) {

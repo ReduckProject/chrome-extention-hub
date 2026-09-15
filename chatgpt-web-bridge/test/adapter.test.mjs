@@ -38,7 +38,7 @@ function page(extra = '', setup = () => {}) {
   return { dom, document: dom.window.document, adapter: dom.window.ChatGPTBridgeAdapter };
 }
 
-function uploadPage({ fail = false, changed = false, paste = false } = {}) {
+function uploadPage({ fail = false, changed = false, paste = false, acceptDelay = 0 } = {}) {
   const fixture = page('', window => {
     window.DataTransfer = class {
       files = [];
@@ -77,11 +77,14 @@ function uploadPage({ fail = false, changed = false, paste = false } = {}) {
   send.onclick = () => {
     clicks++;
     assert.equal(form.querySelectorAll('[role="progressbar"]').length, 0);
-    const user = document.createElement('div'); user.dataset.messageAuthorRole = 'user'; user.dataset.messageId = 'uploaded-user';
-    const prompt = document.createElement('div'); prompt.className = 'whitespace-pre-wrap'; prompt.textContent = document.querySelector('textarea').value;
-    const tile = document.createElement('div'); tile.dataset.testid = 'attachment'; tile.textContent = received.map(file => file.name).join(' ');
-    user.append(tile, prompt); document.querySelector('main').append(user);
-    form.querySelectorAll('[data-testid="attachment"]').forEach(n => n.remove()); document.querySelector('textarea').value = '';
+    const publish = () => {
+      const user = document.createElement('div'); user.dataset.messageAuthorRole = 'user'; user.dataset.messageId = 'uploaded-user';
+      const prompt = document.createElement('div'); prompt.className = 'whitespace-pre-wrap'; prompt.textContent = document.querySelector('textarea').value;
+      const tile = document.createElement('div'); tile.dataset.testid = 'attachment'; tile.textContent = received.map(file => file.name).join(' ');
+      user.append(tile, prompt); document.querySelector('main').append(user);
+      form.querySelectorAll('[data-testid="attachment"]').forEach(n => n.remove()); document.querySelector('textarea').value = '';
+    };
+    if (acceptDelay) dom.window.setTimeout(publish, acceptDelay); else publish();
   };
   return { ...fixture, clicks: () => clicks, received: () => received };
 }
@@ -108,6 +111,14 @@ test('attachment-only paste works when there is no file input', async () => {
   try {
     assert.equal((await f.adapter.submit('', 'Thinking', [uploadFiles[1]])).accepted, true);
     assert.equal(f.clicks(), 1); assert.equal(f.adapter.snapshot().lastUserText, '');
+  } finally { f.dom.window.close(); }
+});
+
+test('attachment submission waits for delayed post-click message acknowledgement', async () => {
+  const f = uploadPage({ acceptDelay: 3000 });
+  try {
+    const result = await f.adapter.submit('请分析附件', 'Thinking', [uploadFiles[0]]);
+    assert.equal(result.accepted, true); assert.equal(result.userMessageId, 'uploaded-user'); assert.equal(f.clicks(), 1);
   } finally { f.dom.window.close(); }
 });
 
@@ -308,12 +319,46 @@ test('static Thinking label and prose mentioning Stop do not count as active gen
   assert.equal(status.model.label, 'Thinking'); assert.equal(status.model.actualBackendModel, null);
   assert.equal(status.activity, 'idle'); assert.equal(status.finalActions, true); dom.window.close();
 });
+test('native image progress control remains active after the response stream ends', () => {
+  const { dom, adapter } = page('<article><div data-message-author-role="assistant" data-message-id="a">正在思考<br>正在生成更详细的图片，请稍等。<br>29%<div role="progressbar" aria-label="图像生成进度" aria-valuenow="29" aria-valuemin="0" aria-valuemax="100"></div></div><button aria-label="Copy response">Copy</button></article>');
+  const status = adapter.snapshot();
+  assert.equal(status.generationPlaceholder, true);
+  assert.equal(status.activity, 'generating');
+  assert.equal(status.generationControl.source, 'progressbar');
+  assert.equal(status.generationControl.progressbar.value, '29');
+  assert.equal(status.finalActions, true);
+  dom.window.close();
+});
+test('progress-looking assistant prose alone does not count as active generation', () => {
+  const { dom, adapter } = page('<article><div data-message-author-role="assistant" data-message-id="a">正在思考<br>正在生成更详细的图片，请稍等。<br>29%</div><button aria-label="Copy response">Copy</button></article>');
+  const status = adapter.snapshot();
+  assert.equal(status.generationPlaceholder, false);
+  assert.equal(status.activity, 'idle');
+  assert.equal(status.generationControl.source, null);
+  dom.window.close();
+});
 test('visible stop control reports generation; hidden stale controls do not', () => {
   const { dom, adapter, document } = page();
   const stop = document.createElement('button'); stop.dataset.testid = 'stop-button'; stop.textContent = 'Stop';
   document.querySelector('form').append(stop);
   assert.equal(adapter.snapshot().activity, 'generating');
   stop.hidden = true; assert.equal(adapter.snapshot().activity, 'idle'); dom.window.close();
+});
+test('new composer stop controls report generation without reading assistant prose', () => {
+  for (const shape of [
+    ['composer-stop-button', null],
+    ['composer-submit-button', 'Stop answering'],
+  ]) {
+    const { dom, adapter, document } = page();
+    const send = document.querySelector('[data-testid="send-button"]');
+    send.dataset.testid = shape[0];
+    if (shape[1]) send.setAttribute('aria-label', shape[1]);
+    assert.equal(adapter.snapshot().activity, 'generating', shape.join(':'));
+    if (shape[0] === 'composer-stop-button') send.removeAttribute('data-testid');
+    else send.setAttribute('aria-label', 'Start Voice');
+    assert.equal(adapter.snapshot().activity, 'idle', shape.join(':'));
+    dom.window.close();
+  }
 });
 test('scoped active reasoning status and authentication dialog are distinguished', () => {
   const { dom, adapter, document } = page('<article><div data-message-author-role="assistant"><div role="status">Thinking…</div></div></article>');
@@ -415,6 +460,49 @@ test('a confirmed send returns the identity of the user message', async () => {
   };
   const result = await adapter.submit('A calm blue lake', 'Thinking');
   assert.equal(result.accepted, true); assert.equal(result.userMessageId, 'test-user'); assert.equal(clicks, 1); dom.window.close();
+});
+test('text-only send clears its owned draft when the send control stays unavailable', async () => {
+  const { dom, adapter, document } = page();
+  const input = document.querySelector('textarea'), button = document.querySelector('[data-testid="send-button"]');
+  button.setAttribute('aria-disabled', 'true');
+  let now = 0; dom.window.Date.now = () => now += 10000;
+  try {
+    const result = await adapter.submit('button unavailable', 'Thinking');
+    assert.equal(result.error, 'Send button unavailable before submission');
+    assert.equal(result.preClick, true); assert.equal(result.draftCleared, true);
+    assert.equal(input.value, '');
+  } finally { dom.window.close(); }
+});
+test('a rate limit appearing after text injection clears only the owned draft and reports a pre-click pause', async () => {
+  const { dom, adapter, document } = page();
+  let clicks = 0, shown = false;
+  const input = document.querySelector('textarea');
+  input.addEventListener('input', () => {
+    if (shown || !input.value) return;
+    shown = true; document.body.insertAdjacentHTML('beforeend', '<div role="dialog">Too many requests. Please try again in a few minutes.</div>');
+  });
+  document.querySelector('[data-testid="send-button"]').onclick = () => { clicks++; };
+  try {
+    const result = await adapter.submit('rate-limit race', 'Thinking');
+    assert.equal(result.notSubmitted, true); assert.equal(result.preClick, true);
+    assert.equal(result.accessPaused, true); assert.equal(result.draftCleared, true);
+    assert.equal(input.value, ''); assert.equal(clicks, 0);
+  } finally { dom.window.close(); }
+});
+test('text-only submission waits for a delayed user-message acknowledgement', async () => {
+  const { dom, adapter, document } = page(); let clicks = 0;
+  const input = document.querySelector('textarea'), prompt = 'delayed text acknowledgement';
+  document.querySelector('[data-testid="send-button"]').onclick = () => {
+    clicks++;
+    dom.window.setTimeout(() => {
+      const user = document.createElement('div'); user.dataset.messageAuthorRole = 'user'; user.dataset.messageId = 'delayed-user';
+      user.textContent = input.value; document.querySelector('main').append(user); input.value = '';
+    }, 3000);
+  };
+  try {
+    const result = await adapter.submit(prompt, 'Thinking');
+    assert.equal(result.accepted, true); assert.equal(result.userMessageId, 'delayed-user'); assert.equal(clicks, 1);
+  } finally { dom.window.close(); }
 });
 test('result reads requested assistant identity instead of whichever message is last', async () => {
   const { dom, adapter } = page('<div data-message-author-role="assistant" data-message-id="old">old answer</div><div data-message-author-role="assistant" data-message-id="new">new answer</div>');
@@ -557,6 +645,26 @@ test('English rate-limit alerts are recognized without classifying quoted assist
     assert.equal(adapter.snapshot().attentionType, 'rate_limit');
     document.querySelector('#notice').hidden = true;
     assert.equal(adapter.snapshot().attentionType, null);
+  } finally { dom.window.close(); }
+});
+
+test('image quota notices outside the assistant turn are preserved for absolute reset-time parsing', () => {
+  const { dom, adapter, document } = page('<article><div data-message-author-role="assistant" data-message-id="quota-answer">上限将在 4小时 后重置。</div></article>');
+  try {
+    const notice = '图像额度已用完。请在明天 02:04后重试。';
+    document.body.insertAdjacentHTML('beforeend', `<div role="alert">${notice}</div>`);
+    const state = adapter.snapshot();
+    assert.equal(state.imageQuotaText, notice);
+    assert.match(state.lastAssistantPreview, /4小时/);
+  } finally { dom.window.close(); }
+});
+
+test('image quota tombstones inside the assistant turn preserve the exact reset-time notice', () => {
+  const { dom, adapter } = page('<section data-turn="assistant"><div data-testid="image-gen-rate-limit-tombstone"><h3>图像额度已用完</h3><p>你现在的图片生成次数已用完。请在明天 02:23后重试。</p><span>升级至 Pro</span></div><div data-message-author-role="assistant" data-message-id="quota-answer">你已达到 Plus 套餐的图像生成请求上限。</div></section>');
+  try {
+    const state = adapter.snapshot();
+    assert.match(state.imageQuotaText, /图像额度已用完/);
+    assert.match(state.imageQuotaText, /明天 02:23后重试/);
   } finally { dom.window.close(); }
 });
 

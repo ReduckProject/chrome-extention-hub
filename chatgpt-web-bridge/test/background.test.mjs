@@ -62,6 +62,8 @@ test('post-upload protection requires an active receipt for the sending tab', as
   assert.equal((await request('upload')).ok, true); assert.ok(f.ruleUpdates.length > before);
   f.storage.local['receipt:upload'].expiresAt = Date.now() - 1;
   assert.equal((await request('upload')).ok, false);
+  f.storage.local['receipt:retry-command'] = { startedAt: Date.now(), runId: 'retry-run', tabId: 1, expiresAt: Date.now() + 10000 };
+  assert.equal((await request('retry-run')).ok, true, 'A retry command may use a different command id than its run id');
 });
 
 test('close removes only the identified idle tab and reports its removal', async () => {

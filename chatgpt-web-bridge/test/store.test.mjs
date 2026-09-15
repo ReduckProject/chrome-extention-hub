@@ -26,11 +26,54 @@ test('attachment requests need upload acceptance and preserve exact identity acr
   const { run } = await store.reserve(params);
   assert.equal((await store.reserve(params)).existing, true);
   await assert.rejects(store.reserve({ ...params, attachments: [{ ...attachments[0], sha256: 'b'.repeat(64) }] }), /different input/);
-  const response = { userCount: 1, lastUserText: '', lastUserId: 'u-file', assistantCount: 1, lastAssistantId: 'a-file', finalActions: true };
+  const response = { userCount: 1, lastUserText: '', lastUserId: 'u-file', assistantCount: 1, lastAssistantId: 'a-file', activity: 'generating', finalActions: false };
   snap(1, response); advance(2600); snap(1, response);
   assert.equal(run.accepted, false, 'An empty user message alone cannot confirm an upload');
   store.submissionResult(run.id, { accepted: true, userMessageId: 'u-file' });
+  snap(1, { ...response, activity: 'idle', finalActions: true,
+    responseStreams: [{ key: 'file-upload-stream', startedAt: run.createdAt + 1, endedAt: run.createdAt + 2, status: 200 }] });
   assert.equal(run.phase, 'completed'); assert.equal(run.resultAssistantId, 'a-file');
+});
+
+test('a completed attachment turn can recover after the response timing receipt is lost', async () => {
+  const { store, snap, advance } = fixture();
+  const attachments = [{ path: 'fixture.png', name: 'fixture.png', type: 'image/png', size: 1, sha256: 'd'.repeat(64) }];
+  const { run } = await store.reserve({ tabKey: snap(1), prompt: '反推提示词', requestId: 'attachment-controls-recovery', attachments });
+
+  advance(3000);
+  snap(1, {
+    userCount: 1,
+    lastUserText: run.prompt,
+    lastUserId: 'u-controls',
+    assistantCount: 1,
+    lastAssistantId: 'a-controls',
+    activity: 'idle',
+    finalActions: true,
+    responseSignature: 'controls-answer',
+    responseStreams: [],
+  });
+
+  assert.equal(run.accepted, true);
+  assert.equal(run.phase, 'finalizing');
+  advance(2600);
+  store.reconcile();
+  assert.equal(run.phase, 'completed');
+  assert.equal(run.resultAssistantId, 'a-controls');
+  assert.equal(run.conversationId, 'chat-1');
+});
+
+test('a slow attachment response can recover after the submission receipt is lost', async () => {
+  const { store, snap, advance } = fixture();
+  const tabKey = snap(1), attachments = [{ path: 'fixture.png', name: 'fixture.png', type: 'image/png', size: 1, sha256: 'c'.repeat(64) }];
+  const { run } = await store.reserve({ tabKey, prompt: '反推提示词', requestId: 'slow-attachment-recovery', attachments });
+  const answer = { userCount: 1, lastUserText: run.prompt, lastUserId: 'u-slow', assistantCount: 1,
+    lastAssistantId: 'a-slow', finalActions: true, responseSignature: 'slow-answer',
+    responseStreams: [{ key: 'slow-upload-stream', startedAt: run.createdAt + 10, endedAt: run.createdAt + 20, status: 200 }] };
+  advance(3000); snap(1, answer);
+  assert.equal(run.accepted, true); assert.equal(run.phase, 'finalizing');
+  advance(2600); store.reconcile();
+  assert.equal(run.phase, 'completed'); assert.equal(run.resultAssistantId, 'a-slow');
+  assert.equal(run.conversationId, 'chat-1');
 });
 
 test('an attachment-only draft is never treated as an empty composer', async () => {
@@ -131,6 +174,22 @@ test('a visible access limit pauses every tab in its profile and preserves idemp
   assert.equal(store.accessPause(profile), null);
   assert.equal(store.data.runs[run.id].accepted, false, 'Expiry must never resend an uncertain request');
   assert.equal(store.accessPause('different-profile'), null);
+});
+
+test('a pre-click rate-limit run remains queued for service retry after access recovery', async () => {
+  const { store, snap, advance } = fixture();
+  const tabKey = snap(1), { run } = await store.reserve({ tabKey, prompt: 'recover this text', requestId: 'pre-click-rate-limit' });
+  const error = 'ChatGPT access is rate limited: Too many requests';
+  store.submissionResult(run.id, { notSubmitted: true, preClick: true, accessPaused: true, draftCleared: true, error });
+  assert.equal(run.phase, 'rate_limited'); assert.equal(run.retryablePreClick, true); assert.equal(run.accepted, false);
+  snap(1, { activity: 'needs_attention', attentionType: 'rate_limit', attention: 'Too many requests' });
+  advance(300001);
+  snap(1, { activity: 'idle', attentionType: null, attention: null, draftLength: 0 });
+  assert.equal(store.accessPause(profile).noticeVisible, false);
+  assert.equal(store.resumeAccess(profile).resumed, true);
+  assert.equal(run.phase, 'rate_limited');
+  assert.equal(run.retryablePreClick, true);
+  assert.equal(run.attentionType, undefined);
 });
 
 test('a persistent visible restriction outlasts the local backoff and survives a service restart', async () => {
@@ -242,6 +301,40 @@ test('no completion for an older assistant, absent end evidence or later user me
   advance(3000); store.reconcile(); assert.notEqual(run.phase, 'completed');
   assert.equal(run.observationIssue, 'latest_user_message_does_not_match');
 });
+test('a live generation placeholder cannot complete on stream-end evidence', async () => {
+  const { store, snap, advance } = fixture(); const tabKey = snap(1);
+  const { run } = await store.reserve({ tabKey, prompt: 'draw a pear', requestId: 'live-placeholder' });
+  store.submissionResult(run.id, { accepted: true, userMessageId: 'placeholder-user' });
+  const placeholder = {
+    userCount: 1, lastUserId: 'placeholder-user', lastUserText: run.prompt,
+    assistantCount: 1, lastAssistantId: 'placeholder-answer',
+    lastAssistantPreview: '正在思考\n正在生成更详细的图片，请稍等。\n29%',
+    activity: 'idle', generationPlaceholder: true, finalActions: true,
+    responseStreams: [{ key: 'placeholder-stream', startedAt: run.createdAt + 1, endedAt: run.createdAt + 2, status: 200 }],
+  };
+  snap(1, placeholder); advance(10000); store.reconcile();
+  assert.equal(run.phase, 'generating');
+  assert.equal(run.observationIssue, 'response_still_generating');
+  assert.equal(run.resultAssistantId, undefined);
+});
+test('a completed placeholder run reopens when a fresh page observation proves it is still generating', async () => {
+  const { store, snap, advance } = fixture(); const tabKey = snap(1);
+  const { run } = await store.reserve({ tabKey, prompt: 'draw a pear', requestId: 'recover-placeholder' });
+  store.submissionResult(run.id, { accepted: true, userMessageId: 'recover-user' });
+  const finished = {
+    userCount: 1, lastUserId: 'recover-user', lastUserText: run.prompt,
+    assistantCount: 1, lastAssistantId: 'recover-answer', finalActions: true,
+    contentSignature: 'finished-answer', responseSignature: 'finished-answer',
+  };
+  snap(1, finished); advance(2600); store.reconcile();
+  assert.equal(run.phase, 'completed');
+  assert.equal(run.resultAssistantId, 'recover-answer');
+  snap(1, { ...finished, activity: 'idle', generationPlaceholder: true,
+    lastAssistantPreview: '正在生成更详细的图片，请稍等。\n42%', contentSignature: 'live-placeholder' });
+  assert.equal(run.phase, 'generating');
+  assert.equal(run.observationIssue, 'response_still_generating');
+  assert.equal(run.resultAssistantId, undefined);
+});
 test('another tab showing the same conversation cannot submit concurrently', async () => {
   const { store, snap } = fixture(); const first = snap(1), second = snap(2, { url: 'https://chatgpt.com/c/chat-1' });
   await store.reserve({ tabKey: first, prompt: 'one', requestId: 'first-request' });
@@ -319,6 +412,50 @@ test('stream evidence must belong to this submission and cannot finish a still-b
   advance(2600); store.reconcile(); assert.equal(run.phase, 'completed');
 });
 
+test('completed image-quota responses retain the parsed reset time on the run', async () => {
+  const { store, snap, advance } = fixture(); const tabKey = snap(1);
+  const { run } = await store.reserve({ tabKey, prompt: 'generate an image', requestId: 'image-quota-reset-time', kind: 'image' });
+  const preview = '你已达到 Plus 套餐的图像生成请求上限。上限将在 4小时 后重置，届时可创建更多图像。';
+  snap(1, { userCount: 1, lastUserId: 'quota-user', lastUserText: run.prompt, assistantCount: 1,
+    lastAssistantId: 'quota-answer', lastAssistantPreview: preview, lastAssistantLength: preview.length,
+    finalActions: true, responseSignature: 'quota-answer' });
+  advance(2600); store.reconcile();
+
+  assert.equal(run.phase, 'completed');
+  assert.equal(run.imageQuota.type, 'image_generation');
+  assert.equal(run.imageQuota.source, 'relative_text');
+  assert.equal(run.imageQuota.resetAfterMs, 4 * 60 * 60 * 1000);
+  assert.equal(Date.parse(run.imageQuota.resetAt), Date.parse(run.imageQuota.observedAt) + run.imageQuota.resetAfterMs,
+    'resetAt is exposed as an absolute ISO timestamp');
+  const resetAt = run.imageQuota.resetAt;
+  advance(10000); snap(1, { userCount: 1, lastUserId: 'quota-user', lastUserText: run.prompt, assistantCount: 1,
+    lastAssistantId: 'quota-answer', lastAssistantPreview: preview, lastAssistantLength: preview.length,
+    finalActions: true, responseSignature: 'quota-answer-refresh' });
+  assert.equal(store.data.tabs[tabKey].imageQuota.resetAt, resetAt, 'relative reset times do not drift on later observations');
+});
+
+test('completed runs backfill quota reset time when the full response arrives after completion', async () => {
+  const { store, snap, advance } = fixture(); const tabKey = snap(1);
+  const { run } = await store.reserve({ tabKey, prompt: 'generate an image', requestId: 'late-image-quota-reset-time', kind: 'image' });
+  const prefix = '你已达到 Plus 套餐的图像生成请求';
+  const full = `${prefix}上限。上限将在 12小时 后重置，届时可创建更多图像。`;
+  const response = { userCount: 1, lastUserId: 'late-quota-user', lastUserText: run.prompt, assistantCount: 1,
+    lastAssistantId: 'late-quota-answer', lastAssistantPreview: prefix, lastAssistantLength: prefix.length,
+    finalActions: true, responseSignature: 'late-quota-prefix' };
+  snap(1, response); advance(2600); store.reconcile();
+  assert.equal(run.phase, 'completed');
+  assert.equal(run.imageQuota, undefined, 'the incomplete preview has no reset time yet');
+  run.responseCache = { assistantId: run.resultAssistantId, text: prefix, images: [], assets: [] };
+
+  snap(1, { ...response, imageQuotaText: full, lastAssistantPreview: full, lastAssistantLength: full.length,
+    responseSignature: 'late-quota-full' });
+
+  assert.equal(run.imageQuota.source, 'relative_text');
+  assert.equal(run.imageQuota.resetAfterMs, 12 * 60 * 60 * 1000);
+  assert.equal(run.responseCache.imageQuota.resetAt, run.imageQuota.resetAt, 'cached results receive the backfilled quota');
+  assert.equal(run.phase, 'completed', 'backfilling quota metadata does not reopen the run');
+});
+
 for (const kind of ['text', 'image']) test(`${kind} intent completes a text-only refusal and notifies a waiting caller`, async () => {
   const { store, snap, advance } = fixture(); const tabKey = snap(1);
   const { run } = await store.reserve({ tabKey, prompt: 'requested output', requestId: `refusal-${kind}`, kind });
@@ -372,6 +509,25 @@ test('an identical draft can recover only a recorded pre-click readback failure 
   await assert.rejects(store.reserve({ tabKey, prompt: run.prompt, requestId: 'draft-reloaded' }), /existing draft/);
   snap(1, { draftLength: 13 });
   const retry = await store.reserve({ tabKey, prompt: run.prompt, requestId: 'draft-recovery' });
+  assert.equal(retry.existing, false); assert.notEqual(retry.run.id, run.id);
+});
+
+test('a residual draft can reuse only a recorded pre-click failure with the exact prompt', async () => {
+  const { store, snap } = fixture(); const tabKey = snap(1);
+  const { run } = await store.reserve({ tabKey, prompt: 'owned residual draft', requestId: 'residual-original' });
+  store.submissionResult(run.id, { notSubmitted: true, preClick: true, error: 'Send control changed before submission' });
+  snap(1, { draftLength: run.prompt.length });
+  await assert.rejects(store.reserve({ tabKey, prompt: 'different draft', requestId: 'residual-different' }), /existing draft/);
+  const retry = await store.reserve({ tabKey, prompt: run.prompt, requestId: 'residual-retry' });
+  assert.equal(retry.existing, false); assert.notEqual(retry.run.id, run.id);
+});
+
+test('a legacy send-button failure can reuse its exact residual text draft', async () => {
+  const { store, snap } = fixture(); const tabKey = snap(1);
+  const { run } = await store.reserve({ tabKey, prompt: 'legacy residual prompt', kind: 'image', requestId: 'legacy-residual-original' });
+  store.submissionResult(run.id, { notSubmitted: true, error: 'Send button unavailable; draft remains in the page' });
+  snap(1, { draftLength: run.prompt.length });
+  const retry = await store.reserve({ tabKey, prompt: run.prompt, requestId: 'legacy-residual-retry' });
   assert.equal(retry.existing, false); assert.notEqual(retry.run.id, run.id);
 });
 

@@ -270,7 +270,15 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
   if (sender.id !== chrome.runtime.id) return false;
   if (message.type === 'before_submit' && sender.tab && sender.frameId === 0 && allowed(sender.url || sender.tab.url)) {
     (async () => {
-      const key = `receipt:${message.runId}`, receipt = (await chrome.storage.local.get(key))[key];
+      const key = `receipt:${message.runId}`, stored = await chrome.storage.local.get(key);
+      let receipt = stored[key];
+      if (!receipt || receipt.finishedAt || receipt.tabId !== sender.tab.id || !(receipt.expiresAt > Date.now())) {
+        const candidates = Object.entries(await chrome.storage.local.get(null))
+          .filter(([name, value]) => name.startsWith('receipt:') && value?.runId === message.runId &&
+            value.tabId === sender.tab.id && value.startedAt && !value.finishedAt && value.expiresAt > Date.now())
+          .sort(([, first], [, second]) => second.startedAt - first.startedAt);
+        receipt = candidates[0]?.[1];
+      }
       if (!receipt?.startedAt || receipt.finishedAt || receipt.tabId !== sender.tab.id || !(receipt.expiresAt > Date.now())) throw new Error('No active submission receipt for this tab');
       // Uploads may exceed the initial 30-second window. Restart protection
       // immediately before the actual send click, without bypassing tab locks.

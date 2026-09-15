@@ -13,7 +13,7 @@ const token = 'test-only-token-for-bridge-'.repeat(2);
 
 test('inline attachments larger than 1 MiB cross HTTP without disk files and deduplicate by decoded content', async t => {
   const { service, ws, rpc, snapshot, until } = await fixture(t);
-  snapshot(snap(1, { adapterVersion: 45, contentVersion: 6 })); await until(() => service.store.list().length === 1);
+  snapshot(snap(1, { adapterVersion: 46, contentVersion: 6 })); await until(() => service.store.list().length === 1);
   const data = Buffer.alloc(2 * 1024 * 1024, 157).toString('base64'), commands = [];
   ws.on('message', bytes => { const message = JSON.parse(bytes); if (message.type === 'command') commands.push(message); });
   const attachment = { name: 'pasted.png', mimeType: 'image/png', data };
@@ -35,7 +35,7 @@ test('attachment send returns a persisted pending run, forwards bytes once and r
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'bridge-send-'));
   t.after(() => fs.rm(dir, { recursive: true, force: true }));
   const file = path.join(dir, '说明.txt'); await fs.writeFile(file, '文件正文', 'utf8');
-  snapshot(snap(1, { adapterVersion: 45, contentVersion: 6 }));
+  snapshot(snap(1, { adapterVersion: 46, contentVersion: 6 }));
   await until(() => service.store.list().length === 1);
   const tabKey = service.store.list()[0].key, commands = [];
   ws.on('message', data => { const message = JSON.parse(data); if (message.type === 'command') commands.push(message); });
@@ -66,7 +66,7 @@ test('unsupported observers and invalid attachment paths create no run or browse
   snapshot(snap(1)); await until(() => service.store.list().length === 1);
   let commands = 0; ws.on('message', () => commands++);
   const params = { tabKey: service.store.list()[0].key, prompt: 'read', requestId: 'old-observer', attachments: [{ path: file }] };
-  await assert.rejects(rpc('send', params), /adapter 45 and content 6/);
+  await assert.rejects(rpc('send', params), /adapter 46 and content 6/);
   await assert.rejects(rpc('send', { ...params, attachments: [{ path: 'relative.txt' }] }), /absolute/);
   assert.equal(Object.keys(service.store.data.runs).length, 0); assert.equal(commands, 0);
 });
@@ -132,6 +132,24 @@ test('new document observations never broadcast reinjection to all tabs', async 
   await rpc('refresh_observers');
   await until(() => received.length === 1);
   assert.equal(received[0].type, 'welcome', 'Explicit observer updates remain available');
+});
+
+test('new_chat probes a stale but still connected tab before rejecting the follow-up action', async t => {
+  const { service, ws, rpc, snapshot, until } = await fixture(t); clearInterval(service.tick);
+  let now = 1000000; service.store.now = () => now;
+  snapshot(snap(1)); await until(() => service.store.list().length === 1);
+  const tabKey = service.store.list()[0].key, commands = [];
+  ws.on('message', data => {
+    const message = JSON.parse(data); if (message.type !== 'command') return;
+    commands.push(message.command);
+    if (message.command === 'probe') snapshot(snap(1));
+    ws.send(JSON.stringify({ type: 'result', id: message.id, result: { confirmed: true } }));
+  });
+  now += 31000;
+  const result = await rpc('new_chat', { tabKey });
+  assert.equal(result.confirmed, true);
+  assert.deepEqual(commands, ['probe', 'read']);
+  assert.equal(service.store.tabView(tabKey).freshness.stale, false);
 });
 
 test('connected extension inventory reports a page even when its first observer never starts', async t => {
@@ -405,6 +423,99 @@ test('automatic five-minute recovery lets a paused batch continue with its origi
   await rpc('send', { tabKey, prompt: prompts[1], requestId: 'paused-batch-second' });
   assert.deepEqual(commands.filter(c => c.command === 'submit').map(c => c.params.prompt), prompts);
   assert.equal(Object.keys(service.store.data.requests).length, 2);
+});
+
+test('automatic access recovery retries a recorded pure-text pre-click run once with its original run ID', async t => {
+  const { service, ws, snapshot, until } = await fixture(t); clearInterval(service.tick);
+  let now = 1000000, notice = true; service.store.now = () => now;
+  snapshot(snap(1)); await until(() => service.store.list().length === 1);
+  const tabKey = service.store.list()[0].key;
+  const { run } = await service.store.reserve({ tabKey, prompt: 'recover after limit', kind: 'image', requestId: 'auto-retry-pre-click' });
+  const error = 'ChatGPT access is rate limited: Too many requests';
+  service.store.submissionResult(run.id, { notSubmitted: true, preClick: true, accessPaused: true, draftCleared: true, error });
+  snapshot(snap(1, { activity: 'needs_attention', attentionType: 'rate_limit', attention: 'Too many requests' }));
+  const commands = [];
+  ws.on('message', data => {
+    const message = JSON.parse(data); if (message.type !== 'command') return;
+    commands.push(message);
+    if (message.command === 'read' && message.params.assistantId?.operation === 'dismiss_rate_limit') {
+      notice = false; snapshot(snap(1));
+    } else if (message.command === 'probe') {
+      snapshot(snap(1, notice ? { activity: 'needs_attention', attentionType: 'rate_limit', attention: 'Too many requests' } : {}));
+    } else if (message.command === 'submit') snapshot(snap(1));
+    const result = message.command === 'submit' ? { accepted: true, userMessageId: 'recovered-user' } :
+      message.command === 'read' ? { dismissed: true, noticeVisible: false } : { observed: true };
+    ws.send(JSON.stringify({ type: 'result', id: message.id, result }));
+  });
+  now += 300001;
+  const recovered = await service.recoverAccess(profileId);
+  assert.equal(recovered.resumed, true); assert.equal(recovered.retried, 1);
+  assert.equal(run.phase, 'submitted'); assert.equal(run.accepted, true); assert.equal(run.userMessageId, 'recovered-user');
+  const retryCommand = commands.find(command => command.command === 'submit');
+  assert.equal(typeof retryCommand.params.runId, 'string');
+  assert.notEqual(retryCommand.params.runId, run.id);
+  assert.equal(retryCommand.params.prompt, run.prompt);
+  await service.refreshRecoverableSubmissions();
+  assert.equal(commands.filter(command => command.command === 'submit').length, 1);
+});
+
+test('automatic recovery retries one legacy residual text draft without a second attempt', async t => {
+  const { service, ws, snapshot, until } = await fixture(t); clearInterval(service.tick);
+  let now = 1000000; service.store.now = () => now;
+  snapshot(snap(1)); await until(() => service.store.list().length === 1);
+  const tabKey = service.store.list()[0].key;
+  const { run } = await service.store.reserve({ tabKey, prompt: 'legacy prompt', kind: 'image', requestId: 'legacy-auto-retry' });
+  service.store.submissionResult(run.id, { notSubmitted: true, error: 'Send button unavailable; draft remains in the page' });
+  snapshot(snap(1, { draftLength: run.prompt.length }));
+  const commands = [];
+  ws.on('message', data => {
+    const message = JSON.parse(data); if (message.type !== 'command') return;
+    commands.push(message);
+    if (message.command === 'submit') snapshot(snap(1));
+    ws.send(JSON.stringify({ type: 'result', id: message.id, result: { accepted: true, userMessageId: 'legacy-recovered-user' } }));
+  });
+  await service.refreshRecoverableSubmissions();
+  assert.equal(run.phase, 'submitted'); assert.equal(run.userMessageId, 'legacy-recovered-user');
+  assert.equal(run.legacyRecoveryAttempted, true);
+  const retryCommand = commands.find(command => command.command === 'submit');
+  assert.equal(retryCommand.command, 'submit');
+  assert.equal(typeof retryCommand.params.runId, 'string');
+  assert.notEqual(retryCommand.params.runId, run.id);
+  await service.refreshRecoverableSubmissions();
+  assert.equal(commands.length, 1);
+});
+
+test('legacy recovery can retry one receipt-only pre-click failure without replaying an uncertain send', async t => {
+  const { service, ws, snapshot, until } = await fixture(t); clearInterval(service.tick);
+  let now = 1000000; service.store.now = () => now;
+  snapshot(snap(1)); await until(() => service.store.list().length === 1);
+  const tabKey = service.store.list()[0].key;
+  const { run } = await service.store.reserve({ tabKey, prompt: 'receipt retry prompt', requestId: 'legacy-receipt-retry' });
+  service.store.submissionResult(run.id, { notSubmitted: true, preClick: true, error: 'Send button unavailable; draft remains in the page' });
+  snapshot(snap(1, { draftLength: run.prompt.length }));
+  let attempts = 0;
+  ws.on('message', data => {
+    const message = JSON.parse(data); if (message.type !== 'command') return;
+    if (message.command === 'submit') {
+      attempts++;
+      if (attempts === 1) {
+        ws.send(JSON.stringify({ type: 'result', id: message.id, result: { notSubmitted: true, preClick: true,
+          error: 'No active submission receipt for this tab' } }));
+        return;
+      }
+      snapshot(snap(1));
+      ws.send(JSON.stringify({ type: 'result', id: message.id, result: { accepted: true, userMessageId: 'receipt-recovered-user' } }));
+      return;
+    }
+    ws.send(JSON.stringify({ type: 'result', id: message.id, result: { observed: true } }));
+  });
+  await service.refreshRecoverableSubmissions();
+  assert.equal(attempts, 1); assert.equal(run.phase, 'error');
+  await service.refreshRecoverableSubmissions();
+  assert.equal(attempts, 2);
+  assert.equal(run.phase, 'submitted'); assert.equal(run.userMessageId, 'receipt-recovered-user');
+  await service.refreshRecoverableSubmissions();
+  assert.equal(attempts, 2);
 });
 
 test('a persistent notice schedules another five minutes instead of retrying each tick', async t => {
@@ -844,7 +955,57 @@ test('completed runs return an untruncated observed text when the tracked tab is
   assert.equal(result.result.text, text);
   assert.deepEqual(result.result.images, []);
   assert.equal(result.result.complete, true);
+  assert.equal(result.result.imageQuota.type, 'image_generation');
+  assert.equal(result.result.imageQuota.source, 'relative_text');
+  assert.equal(result.result.imageQuota.resetAfterMs, 9 * 60 * 60 * 1000);
   assert.match(result.resultError, /original response is not available/);
+});
+
+test('live image-quota results expose the absolute reset time parsed from the response', async t => {
+  const { service, ws, rpc, snapshot, until } = await fixture(t);
+  snapshot(snap(1)); await until(() => Object.keys(service.store.data.tabs).length === 1);
+  const tabKey = Object.keys(service.store.data.tabs)[0];
+  const { run } = await service.store.reserve({ tabKey, prompt: 'generate an image', requestId: 'live-quota-reset-time' });
+  const completedAt = Date.parse('2026-09-14T14:26:06.584Z');
+  Object.assign(run, { phase: 'completed', accepted: true, resultAssistantId: 'live-quota-answer', completedAt });
+  const text = '图像额度已用完。请在明天 02:04后重试。';
+  ws.on('message', data => {
+    const message = JSON.parse(data); if (message.type !== 'command') return;
+    ws.send(JSON.stringify({ type: 'result', id: message.id, result: { assistantId: run.resultAssistantId, text, images: [], assets: [] } }));
+  });
+
+  const result = await rpc('result', { runId: run.id });
+  assert.equal(result.resultSource, 'live');
+  assert.equal(result.result.imageQuota.source, 'absolute_text');
+  const expectedReset = new Date(completedAt); expectedReset.setDate(expectedReset.getDate() + 1); expectedReset.setHours(2, 4, 0, 0);
+  assert.equal(result.result.imageQuota.resetAt, expectedReset.toISOString());
+  assert.equal(service.store.data.runs[run.id].imageQuota.resetAt, result.result.imageQuota.resetAt);
+});
+
+test('live results keep an absolute tab quota over relative assistant prose', async t => {
+  const { service, ws, rpc, snapshot, until } = await fixture(t);
+  snapshot(snap(1)); await until(() => Object.keys(service.store.data.tabs).length === 1);
+  const tabKey = Object.keys(service.store.data.tabs)[0];
+  const { run } = await service.store.reserve({ tabKey, prompt: 'generate an image', requestId: 'live-quota-prefer-absolute' });
+  const completedAt = Date.parse('2026-09-15T06:40:00.000Z');
+  const absoluteQuota = {
+    type: 'image_generation', exhausted: true, resetAt: '2026-09-15T18:23:00.000Z',
+    resetAtLocal: '2026-09-16 02:23', resetAtOffset: '2026-09-16T02:23:00.000+08:00',
+    resetAfterMs: 12 * 60 * 60 * 1000, precision: 'minute', source: 'absolute_text',
+    matchedText: '明天 02:23', observedAt: '2026-09-15T06:40:00.000Z', timeZone: 'Asia/Shanghai',
+  };
+  Object.assign(run, { phase: 'completed', accepted: true, resultAssistantId: 'absolute-quota-answer', completedAt, imageQuota: absoluteQuota });
+  const text = '你已达到 Plus 套餐的图像生成请求上限。上限将在 12小时 后重置，届时可创建更多图像。';
+  ws.on('message', data => {
+    const message = JSON.parse(data); if (message.type !== 'command') return;
+    ws.send(JSON.stringify({ type: 'result', id: message.id, result: { assistantId: run.resultAssistantId, text, images: [], assets: [] } }));
+  });
+
+  const result = await rpc('result', { runId: run.id });
+  assert.equal(result.resultSource, 'live');
+  assert.equal(result.result.imageQuota.source, 'absolute_text');
+  assert.equal(result.result.imageQuota.resetAt, absoluteQuota.resetAt);
+  assert.equal(service.store.data.runs[run.id].imageQuota.resetAt, absoluteQuota.resetAt);
 });
 
 test('result exposes an associated streaming response and leaves completion false', async t => {

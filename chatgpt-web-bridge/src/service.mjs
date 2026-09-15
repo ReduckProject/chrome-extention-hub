@@ -7,6 +7,14 @@ import { tokenEquals } from './config.mjs';
 import { matchDownloadedFiles, saveTransferredOriginal, verifySavedOriginals } from './downloads.mjs';
 import { TaskScheduler, managedAction, policyError } from './scheduler.mjs';
 import { prepareAttachments, MAX_RPC_BYTES } from './attachments.mjs';
+import { parseImageGenerationQuota } from './image-quota.mjs';
+
+const TEXT_SUBMIT_TIMEOUT_MS = 65000;
+const LEGACY_PRECLICK_ERROR = 'Send button unavailable; draft remains in the page';
+const LEGACY_RECEIPT_ERROR = 'No active submission receipt for this tab';
+const legacyPreClickRun = run => run?.phase === 'error' && run.accepted === false && !run.attachments?.length &&
+  ((run.error === LEGACY_PRECLICK_ERROR && run.legacyRecoveryAttempted !== true) ||
+    (run.error === LEGACY_RECEIPT_ERROR && run.legacyRecoveryAttempted === true && run.recoveryAttempts < 2));
 
 function requireCompleteImageAssets(run, result) {
   const images = result.images ?? run.images ?? [];
@@ -31,7 +39,9 @@ function completeRunPreview(run, assistantId) {
   if (run.phase !== 'completed' || run.resultAssistantId !== assistantId || typeof text !== 'string' ||
       !Number.isInteger(run.resultLength) || run.resultLength !== text.length) return null;
   const observedAt = Number.isFinite(run.completedAt) ? run.completedAt : run.updatedAt;
+  const imageQuota = run.imageQuota || parseImageGenerationQuota(text, observedAt);
   return { assistantId, text, images: run.images || [], assets: [], complete: true,
+    ...(imageQuota ? { imageQuota } : {}),
     observedAt: Number.isFinite(observedAt) ? new Date(observedAt).toISOString() : new Date().toISOString() };
 }
 
@@ -47,6 +57,7 @@ export class BridgeService {
     this.operationContext = new AsyncLocalStorage();
     this.runProbes = new Map();
     this.accessRetries = new Map();
+    this.submissionRetries = new Map();
     this.wss = new WebSocketServer({ noServer: true, maxPayload: 2 * 1024 * 1024 });
     this.server = http.createServer((req, res) => this.http(req, res));
     this.server.on('upgrade', (req, socket, head) => {
@@ -68,6 +79,7 @@ export class BridgeService {
       if (this.store.reconcile()) this.store.save().catch(error => this.logError(error));
       this.refreshRunningTabs().catch(error => this.logError(error));
       this.refreshAccessPauses().catch(error => this.logError(error));
+      this.refreshRecoverableSubmissions().catch(error => this.logError(error));
     }, 1000);
     this.tick.unref();
     return this.server.address().port;
@@ -125,6 +137,74 @@ export class BridgeService {
     await Promise.all(jobs);
   }
 
+  retryRateLimitedSubmissions(profileId) {
+    const prior = this.submissionRetries.get(profileId);
+    if (prior) return prior;
+    const job = this.withLock(`submission-retry:${profileId}`, async () => {
+      if (this.stopping || this.store.accessPause(profileId)) return { retried: 0 };
+      const browser = this.browserStates.get(profileId);
+      const runs = Object.values(this.store.data.runs)
+        .filter(run => run.profileId === profileId && !run.attachments?.length &&
+          ((run.phase === 'rate_limited' && run.retryablePreClick === true && run.accepted === false) || legacyPreClickRun(run)))
+        .sort((a, b) => a.createdAt - b.createdAt);
+      let retried = 0;
+      for (const run of runs) {
+        if (this.stopping || this.store.accessPause(profileId)) break;
+        const tab = this.store.data.tabs[run.tabKey];
+        const view = tab && this.store.tabView(run.tabKey);
+        if (!tab || !view || view.freshness.stale || view.activity !== 'idle' || !view.composerReady ||
+            tab.closed || tab.frozen || tab.discarded || tab.observationError || tab.documentId !== run.documentIdAtSend ||
+            !browser?.tabIds?.includes(tab.tabId) || browser.browserSessionId !== tab.browserSessionId ||
+            this.clients.get(profileId)?.readyState !== 1) continue;
+        const legacy = legacyPreClickRun(run);
+        if (legacy) {
+          // Mark the retry as outcome-unknown before dispatching it. A daemon
+          // restart after this point must not click the prompt a second time.
+          run.phase = 'submission_unknown';
+          run.submissionError = 'Legacy pre-click recovery is in progress';
+          delete run.error;
+          run.legacyRecoveryAttempted = true;
+        }
+        run.recoveryAttempts = (run.recoveryAttempts || 0) + 1;
+        run.updatedAt = this.store.now();
+        this.store.changed(); await this.store.save();
+        try {
+          const commandId = randomUUID();
+          // before_submit only receives this runId. Keep it equal to the new
+          // command receipt so an older background worker can authorize the
+          // retry without relying on the original, already-finished receipt.
+          const result = await this.command(profileId, 'submit', {
+            tabId: tab.tabId, documentId: tab.documentId, prompt: run.prompt, runId: commandId,
+            expectedModel: run.selectedAtSend?.label,
+          }, TEXT_SUBMIT_TIMEOUT_MS, commandId);
+          this.store.submissionResult(run.id, result);
+        } catch (error) {
+          if (error.code === 'ACCESS_PAUSED') {
+            this.store.submissionResult(run.id, { notSubmitted: true, preClick: true, accessPaused: true, error: error.message });
+          } else this.store.submissionResult(run.id, null, error.message);
+        }
+        await this.store.save(); retried++;
+        if (this.store.accessPause(profileId) || ['submission_unknown', 'error'].includes(run.phase)) break;
+      }
+      return { retried };
+    });
+    this.submissionRetries.set(profileId, job);
+    job.finally(() => {
+      if (this.submissionRetries.get(profileId) === job) this.submissionRetries.delete(profileId);
+    }).catch(() => {});
+    return job;
+  }
+
+  async refreshRecoverableSubmissions() {
+    if (this.stopping) return;
+    const profiles = new Set(Object.values(this.store.data.runs)
+      .filter(run => (run.phase === 'rate_limited' && run.retryablePreClick === true && run.accepted === false) || legacyPreClickRun(run))
+      .map(run => run.profileId));
+    await Promise.all([...profiles].map(async profileId => {
+      if (!this.store.accessPause(profileId)) await this.retryRateLimitedSubmissions(profileId);
+    }));
+  }
+
   async recoverAccess(profileId) {
     return this.withLock(`access-retry:${profileId}`, async () => {
       const pause = this.store.data.accessPauses[profileId];
@@ -159,7 +239,13 @@ export class BridgeService {
         if (failure) throw failure.reason;
         if (this.stopping || this.browserStates.get(profileId) !== browser ||
             browser.tabIds.some(id => !tabIds.includes(id))) throw new Error('Browser inventory changed during recovery');
-        return this.store.resumeAccess(profileId, { attemptAt });
+        const resumed = this.store.resumeAccess(profileId, { attemptAt });
+        let retry = {};
+        if (resumed.resumed) {
+          try { retry = await this.retryRateLimitedSubmissions(profileId); }
+          catch (error) { retry = { retried: 0, retryError: error.message.slice(0, 500) }; }
+        }
+        return { ...resumed, ...retry };
       } catch (error) {
         pause.retryState = 'waiting'; pause.lastError = error.message.slice(0, 500);
         return { resumed: false, waiting: true, reason: pause.lastError };
@@ -372,6 +458,21 @@ export class BridgeService {
     return tab;
   }
 
+  async targetWithRefresh(tabKey, options = {}) {
+    try {
+      return this.target(tabKey, options);
+    } catch (error) {
+      if (error.message !== 'Page state is stale; refresh or reconnect first') throw error;
+      const tab = this.store.data.tabs[tabKey];
+      const browser = tab && this.browserStates.get(tab.profileId);
+      const socket = tab && this.clients.get(tab.profileId);
+      const inventoryMatches = browser?.browserSessionId === tab?.browserSessionId && browser?.tabIds?.includes(tab?.tabId);
+      if (!tab || !browser || !inventoryMatches || socket?.readyState !== 1) throw error;
+      await this.command(tab.profileId, 'probe', { tabId: tab.tabId, documentId: tab.documentId }, 2500);
+      return this.target(tabKey, options);
+    }
+  }
+
   async dispatch(method, params = {}, caller = null) {
     const tracked = ['send', 'new_chat', 'models', 'select_model', 'download', 'recover_images', 'stop'].includes(method) ||
       (method === 'tabs' && ['new', 'close'].includes(params.action)) || (method === 'result' && (params.includeAssets || params.loadImages)) ||
@@ -472,7 +573,7 @@ export class BridgeService {
 
   async execute(method, params = {}, task = null) {
     switch (method) {
-      case 'health': return { ok: true, service: 'chatgpt-web-bridge', protocol: 1, version: '0.2.2', schedulerVersion: 2, accessRecoveryVersion: 1, connectedProfiles: [...this.clients.keys()], connections: this.connectionViews(), revision: this.store.data.revision };
+      case 'health': return { ok: true, service: 'chatgpt-web-bridge', protocol: 1, version: '0.2.2', schedulerVersion: 2, accessRecoveryVersion: 2, connectedProfiles: [...this.clients.keys()], connections: this.connectionViews(), revision: this.store.data.revision };
       case 'refresh_observers': {
         if (this.pending.size) throw new Error('Wait for outstanding page commands before updating observers');
         const profiles = params.profileId ? [params.profileId] : [...this.clients.keys()];
@@ -582,7 +683,7 @@ export class BridgeService {
           recentOperations: this.store.data.operations.filter(operation => operation.profileId === profileId).slice(-30) };
       }
       case 'new_chat': return this.withLock(params.tabKey, async () => {
-        const tab = this.target(params.tabKey);
+        const tab = await this.targetWithRefresh(params.tabKey);
         if (tab.draftLength) throw new Error('Existing draft was left intact');
         const result = await this.command(tab.profileId, 'read', { tabId: tab.tabId, documentId: tab.documentId, assistantId: { operation: 'new_chat' } }, 8000);
         return { tabKey: params.tabKey, ...result };
@@ -605,7 +706,7 @@ export class BridgeService {
         const { metadata, payload } = await prepareAttachments(params.attachments);
         if (metadata.length && !this.store.data.requests[params.requestId]) {
           const tab = this.store.tabView(params.tabKey);
-          if (!(tab.adapterVersion >= 45 && tab.contentVersion >= 6)) throw new Error('Attachments require adapter 45 and content 6; update setup and reload the extension and target page');
+          if (!(tab.adapterVersion >= 46 && tab.contentVersion >= 6)) throw new Error('Attachments require adapter 46 and content 6; update setup and reload the extension and target page');
         }
         const { run, existing } = await this.withLock(`allocation:${profileId}`, async () => {
           if (!this.store.data.requests[params.requestId]) this.scheduler.authorize(profileId, 'send', params, params.tabKey);
@@ -621,9 +722,13 @@ export class BridgeService {
         const submit = async () => {
           try {
             const result = await this.command(tab.profileId, 'submit', { tabId: tab.tabId, documentId: tab.documentId, prompt: run.prompt, runId: run.id,
-              ...(payload.length ? { attachments: payload } : {}), expectedModel: params.expectedModel || run.selectedAtSend?.label }, payload.length ? 100000 : 7000, run.id);
+              ...(payload.length ? { attachments: payload } : {}), expectedModel: params.expectedModel || run.selectedAtSend?.label }, payload.length ? 100000 : TEXT_SUBMIT_TIMEOUT_MS, run.id);
             this.store.submissionResult(run.id, result);
-          } catch (error) { this.store.submissionResult(run.id, null, error.message); }
+          } catch (error) {
+            if (error.code === 'ACCESS_PAUSED') this.store.submissionResult(run.id,
+              { notSubmitted: true, preClick: true, accessPaused: true, error: error.message });
+            else this.store.submissionResult(run.id, null, error.message);
+          }
           await this.store.save();
         };
         // Uploads can outlast an RPC. The persisted unresolved run retains tab
@@ -652,9 +757,14 @@ export class BridgeService {
             const read = await this.command(tab.profileId, 'read', { tabId: tab.tabId, documentId: tab.documentId, assistantId: target }, 5000);
             if (read.assistantId !== assistantId || typeof read.text !== 'string') throw new Error('Response identity or text could not be verified');
             const current = this.store.runView(run.id);
+            const parsedImageQuota = parseImageGenerationQuota(read.text, current.completedAt || Date.now());
+            const imageQuota = current.imageQuota?.source === 'absolute_text' && current.imageQuota.resetAt
+              ? current.imageQuota : parsedImageQuota || current.imageQuota;
             const result = { assistantId, text: read.text, images: read.images || [], assets: read.assets || [],
-              complete: current.phase === 'completed' && current.resultAssistantId === assistantId, observedAt: new Date().toISOString() };
+              complete: current.phase === 'completed' && current.resultAssistantId === assistantId,
+              ...(imageQuota ? { imageQuota } : {}), observedAt: new Date().toISOString() };
             if (assistantId === (current.resultAssistantId || current.responseAssistantId)) {
+              if (imageQuota) this.store.data.runs[run.id].imageQuota = imageQuota;
               this.store.data.runs[run.id].responseCache = result;
               this.store.changed(); await this.store.save();
             }

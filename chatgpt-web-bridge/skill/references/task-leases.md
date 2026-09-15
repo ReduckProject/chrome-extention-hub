@@ -20,6 +20,6 @@ MCP 未加载新工具或旧 schema 没有 leaseId 时，把相同 JSON 写入 U
 - 服务重启和从 0.2.0 升级保留任务、leaseId、队列、run、requestId 和发送时间。activeTasks 中超过 5 分钟未活动的任务显示 overdue，仍不自动交给别人；由原任务恢复并收尾。
 - 升级前未纳管 run 仅由其原任务通过 acquire 的 adoptRunId 建立占用，只绑定原 tab 和 run，不重新发送。
 - 只有用户明确取消本任务时，才可 `task({action:"abandon",profileId,leaseId,confirmAbandon:true})` 放弃占用。它不关 tab、不清草稿、不停止生成、不改变 unknown；仍在生成的页面只阻止该页复用，其它 tab 可继续。
-- accessPause 作用于整个 profile，按 [限流恢复协议](access-recovery.md) 等待 5 分钟自动检查并继续原步骤；不得因限流结束批次或丢弃后续提示词，等待不消耗排队轮询次数或导致排队过期。解除本地暂停不是网站恢复证明；已提交请求先查原 run，不盲目重发。
+- accessPause 作用于整个 profile，按 [限流恢复协议](access-recovery.md) 等待 5 分钟自动检查并继续原步骤；明确记录的纯文本点击前失败由 bridge 自动恢复原 run，其它已提交或不确定请求仍先查原 run，不盲目重发。不得因限流结束批次或丢弃后续提示词，等待不消耗排队轮询次数或导致排队过期。解除本地暂停不是网站恢复证明。
 
 配置项 scheduling.minSubmissionIntervalMs（默认 10000）控制 profile 发送间隔，scheduling.postCompletionCooldownMs（默认 10000）控制对应 tab 完成后的等待。修改后重启服务，不打印含认证密钥的完整配置。

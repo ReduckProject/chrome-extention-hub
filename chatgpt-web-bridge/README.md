@@ -121,15 +121,15 @@ chatgpt_send({
 
 桥接器每条消息最多接收 10 个文件、总计 20 MiB（按解码后的字节计算），文件名须互不重复。服务读取文件或解码直接传入的内容并计算 SHA-256，通过已认证的本机连接将字节交给扩展；网页使用文件输入框或粘贴事件上传，不需要改写系统剪贴板。网页自身的文件格式、账号和模型限制仍适用。历史 run 保存文件名、类型、大小、哈希及本地来源的路径，不保存文件正文或 base64。
 
-附件发送会立即返回持久化的 `runId`，最初可能为 `submitting`。继续通过 `status` / `wait` 查询，再用 `result` 获取回答。网页最多等待 90 秒确认附件卡片齐全、上传进度结束且发送按钮可用，然后点击发送；上传失败、超时、草稿或模型被修改时不会点击发送，保留草稿供检查。`submission_unknown` 仍须查询原 run，不能换 requestId 重发。
+附件发送会立即返回持久化的 `runId`，最初可能为 `submitting`。继续通过 `status` / `wait` 查询，再用 `result` 获取回答。网页最多等待 90 秒确认附件卡片齐全、上传进度结束且发送按钮可用，然后点击发送；上传失败、超时、草稿或模型被修改时不会点击发送，保留草稿供检查。纯文本如果由 bridge 刚刚写入草稿、并在点击前明确遇到限流，adapter 会清掉这次自有草稿，服务在恢复后用同一个 run/request 自动重试；人工或被修改的草稿不会覆盖。`submission_unknown` 仍须查询原 run，不能换 requestId 重发。
 
 同一 requestId 的重查也校验附件来源、文件名、类型及内容；直接传入的纯 base64 和 data URL 在解码内容及元数据一致时视为同一请求。本地路径方式须保持原文件可读且内容不变；文件变更或增删附件会被拒绝，重复请求不会再次上传。文件已经移动或删除时，直接用原 `runId` 查询。附件草稿会阻止新聊天、关闭页面和释放占用，避免丢失尚未发送的内容。
 
-此功能要求 **adapter 45 / content 6**。升级源码后运行 `npm run setup`，重新加载 Chrome 扩展及需要发送附件的目标页面，并重启桥接服务、重新加载 MCP 工具定义。旧观察器会明确拒绝附件请求。附件流程已通过模拟 DOM 和本机服务集成测试，尚未进行真实 ChatGPT 上传验收。
+当前功能使用 **adapter 50 / content 6**；附件最低要求 adapter 46，图片额度外部提示和长回答采集需要 adapter 50。升级源码后运行 `npm run setup`，重新加载 Chrome 扩展及需要发送附件的目标页面，并重启桥接服务、重新加载 MCP 工具定义。旧观察器会明确拒绝附件请求。附件流程已通过模拟 DOM 和本机服务集成测试，尚未进行真实 ChatGPT 上传验收。
 
 ## 查询网页回答
 
-`chatgpt_result({runId})` 默认读取绑定到该任务的 assistant 正文和图片信息，不读取其他聊天或其他回答。回答正在输出时也能查询已有内容，`result.complete:false` 表示这份内容尚未确认完整。普通文字拒绝作为网页正文返回，不额外猜测拒绝分类。例如回答已经结束且没有图片时，返回字段节选为：
+`chatgpt_result({runId})` 默认读取绑定到该任务的 assistant 正文和图片信息，不读取其他聊天或其他回答。回答正在输出时也能查询已有内容，`result.complete:false` 表示这份内容尚未确认完整。完成判定以网页原生控件为准：可用的 Stop 控件表示仍在执行；当前图片渲染阶段即使没有 Stop，也会由 assistant turn 内的 `role=progressbar` 保持 `generating`，不会根据 assistant 文案或 response stream 单独判定完成。只有网页实时控件退出执行后才按正常完成语义处理。普通文字拒绝作为网页正文返回，不额外猜测拒绝分类。例如回答已经结束且没有图片时，返回字段节选为：
 
 ```json
 {
@@ -147,6 +147,10 @@ chatgpt_send({
 
 `result.images` 包含网页中实际观察到的图片 URL、尺寸、alt、`loaded` 和 `loadState:loaded|pending|error`，也包括小图及加载失败的图片。默认读取这些信息不下载图片或计算哈希，因此媒体问题不会阻断正文读取。`includeAssets:true` 才额外读取已加载的同源图片字节并计算 SHA-256，成功的哈希位于 `assets`；单张失败在该图片的 `assetError` 中说明。`includeText:false` 保留为仅查询 run 元数据的兼容参数。
 
+图片额度耗尽时，`result.imageQuota` 会保留网页原文并返回结构化时间：`resetAt` 是 ISO 绝对时间，`resetAtOffset` / `resetAtLocal` 是桥接器本机时区的可读时间，`timeZone` 标明时区。页面同时给出“明天 02:04”和“4 小时后”时优先使用前者；只有相对时长时才按回答完成时的观测时间换算，并将 `source` 标记为 `relative_text`、`precision` 标记为 `relative`，不把推算冒充网页给出的精确分钟。若网页没有重置时间，`resetAt` 为 `null`、`source` 为 `unavailable`。
+
+例如，`你已达到 Plus 套餐的图像生成请求上限。上限将在 4小时 后重置` 会返回 `result.imageQuota.resetAt`，而不是只让调用方自行解析 `4小时`。页面外层或长 assistant 回答中的额度提示会由 adapter 50 的 `imageQuotaText` 一并采集；升级后运行 `npm run setup` 并刷新观察器。
+
 已查询过的正文和图片信息会缓存。原页面离开或断线后，可返回 `resultSource:cache` 及该份内容的 `observedAt`、`complete`，并用 `resultError` 说明为何不能实时读取；对于已完成且 `resultLength` 与 `resultPreview` 长度相同的短回答，即使从未查询过原文，也会以 `resultSource:run_preview` 返回已观测的完整文本（例如生图额度用尽提示）。较长回答的预览可能被截断，未产生或从未缓存过的这类回答仍可能返回 `result:null`，不会拿其他回答代替。缓存不是已下载原图，原图保存仍以 `verifiedDownloads` 为准。
 
 ## 任务占用与提交节奏
@@ -157,13 +161,13 @@ chatgpt_send({
 
 completed 仅表示回答结束；通常整批必要结果保存、归档完成后，以 `task({action:"release",profileId,leaseId,resultsSaved:true})` 释放。若 tab 已被确认关闭且没有未完成 run，服务会自动将任务转为 `released`；若仍有 `generating`、`submission_unknown` 等未完成 run，则转为 `orphaned`，移出 active lease 但保留 run 和告警，不能复用原 taskId。占用、队列和发送时间持久化，进程重启不会绕过限制；过期只清理无人继续等待的队列项，不自动抢占仍有当前 tab 或未决 run 的 active 任务。新任务不会在后台自动发送，普通 status/result/wait 不需要 leaseId。用户明确取消时可以 abandon 自己的占用，保留网页和未确认 run 的原状态。
 
-旧 MCP schema 缺少新工具或 leaseId 参数时，在子项目目录用同一服务的 `node src/cli.mjs task --input <UTF-8 JSON 文件>` 及相应动作方法操作；仅任务占用协议不需重新加载 Chrome 扩展。当前扩展为 0.1.4 / adapter 45 / content 6，服务及 MCP 为 0.2.2（schedulerVersion:2 / accessRecoveryVersion:1）。附件上传需更新扩展及目标页面。
+旧 MCP schema 缺少新工具或 leaseId 参数时，在子项目目录用同一服务的 `node src/cli.mjs task --input <UTF-8 JSON 文件>` 及相应动作方法操作；仅任务占用协议不需重新加载 Chrome 扩展。当前扩展为 0.1.4 / adapter 50 / content 6，服务及 MCP 为 0.2.2（schedulerVersion:2 / accessRecoveryVersion:2）。附件上传及图片额度重置时间采集需更新扩展及目标页面。
 
 ## 逐张生成与结果保存
 
 状态观察、`status`（含 `refresh:true`）及默认 `result` 只读取已有页面，不刷新会话、不主动加载图片。需要获取后台 lazy 图片时，在回答 completed 后明确调用一次 `result({runId,loadImages:true,leaseId})`，再间隔 10–20 秒读取默认 result，最多检查 3 次；`eager/pending` 不重复启动加载。哈希读取及原图分块传输共用页面内字节缓存，最多 4 个资源、64 MiB、5 分钟，避免每个 512 KiB 分块重新请求完整图片。
 
-网页显示“请求过于频繁／暂时限制访问对话记录”时，同 profile 共享 accessPause。0.2.2 起等待 5 分钟后自动读取页面、确认旧限流弹窗并再次观察，仍受限则再等 5 分钟；autoResume:true、resumeRequired:false，无需手动批准恢复。被挡住的动作返回 HTTP 200 / state:waiting_for_access / taskContinues:true，不作为 MCP 错误或 CLI 失败。调用方必须用 access({action:"wait",profileId,timeoutMs:25000}) 保持任务等待，恢复后继续原步骤和剩余提示词，不能结束批次；已有 run/request ID 先核对，服务不会盲目重放请求。等待不消耗空闲页检查次数或导致排队过期。详见 [限流等待与继续执行](skill/references/access-recovery.md)。
+网页显示“请求过于频繁／暂时限制访问对话记录”时，同 profile 共享 accessPause。0.2.2 起等待 5 分钟后自动读取页面、确认旧限流弹窗并再次观察，仍受限则再等 5 分钟；autoResume:true、resumeRequired:false，无需手动批准恢复。被挡住的动作返回 HTTP 200 / state:waiting_for_access / taskContinues:true，不作为 MCP 错误或 CLI 失败。调用方必须用 access({action:"wait",profileId,timeoutMs:25000}) 保持任务等待，恢复后继续原步骤和剩余提示词，不能结束批次；对于 bridge 明确记录的纯文本“点击前失败”，服务会自动清理自有草稿并在恢复后重试同一 run/request，不需要 MCP 重新发一条请求；submission_unknown 仍绝不自动重放。等待不消耗空闲页检查次数或导致排队过期。详见 [限流等待与继续执行](skill/references/access-recovery.md)。
 
 `status({tabKey,diagnostics:true})` 只读取指定页面已缓冲的 Resource Timing，请求 URL 不含查询值，返回时间、路径、响应码等元数据。缓冲可能不完整，不能单靠时序确定调用方。服务另保存最近 400 次会产生页面操作的 RPC 审计；诊断最多返回最近 30 次相关操作，包括下发的页面命令、调用进程报告的 PID（旧客户端可能缺失）和结果，排除提示词、正文及认证信息。网页自身、手动操作或其他工具的请求不属于桥接器审计范围。
 
@@ -171,7 +175,7 @@ completed 仅表示回答结束；通常整批必要结果保存、归档完成�
 
 Skill 按目标 Chrome profile 内全部当前 ChatGPT tab 计数，跨浏览器窗口合计，包含未上报和休眠 tab，排除已关闭历史及其他网站。数量大于等于 4 个时只复用空闲页；没有空闲页就每等待 20 秒检查一次，初次检查后最多轮询 5 次（约 100 秒）。第 5 次检查后仍达到 4 个且无空闲页则中断任务并汇报，不继续开 tab。小于 4 个时优先复用本任务已有空闲页，没有才逐个新建，每次新建前重新检查数量；并行任务也不能批量越过阈值。
 
-可复用页面须连接和状态新鲜、idle、无草稿及未确认生成、必要结果已保存，且未被其它任务占用。用 `chatgpt_new_chat({tabKey,leaseId})` 在同一 tab 新建聊天，检查 `confirmed:true`，重新确认模型再提交。临时展开的侧栏会恢复折叠；用户原先展开的侧栏保持原状，`sidebarRestored:false` 表示未恢复。
+可复用页面须连接和状态新鲜、idle、无草稿及未确认生成、必要结果已保存，且未被其它任务占用。用 `chatgpt_new_chat({tabKey,leaseId})` 在同一 tab 新建聊天，检查 `confirmed:true`，重新确认模型再提交；若服务缓存恰好过期但目标仍在当前扩展连接和浏览器 inventory 中，bridge 会先对这个精确 tab 做一次被动 probe 后继续，不会把 stale 当成需要用户手工重连。临时展开的侧栏会恢复折叠；用户原先展开的侧栏保持原状，`sidebarRestored:false` 表示未恢复。
 
 记录每个 tab 的 openedByThisTask 和完整身份；新建聊天不会改变 tab 的来源。多图任务中间继续复用同一页。服务端强制执行新建前的四个 tab 阈值与每任务单页占用；整个任务及所需保存／归档完成后，显式 release 释放占用。
 
@@ -183,7 +187,7 @@ Skill 按目标 Chrome profile 内全部当前 ChatGPT tab 计数，跨浏览器
 4. 有需要的已加载图片时，持有 leaseId 下载并验证原图；在本地冷却结束后才新建下一聊天。
 5. 整批结果保存和归档完成后，显式 release 释放占用。
 
-`submission_unknown` 表示网页是否接受尚未确认。先查询或用**相同 ID、相同参数**重试，不能换 ID 重发。重复请求返回 existing:true 和原 runId。已有草稿不会被覆盖。
+`submission_unknown` 表示网页是否接受尚未确认。先查询或用**相同 ID、相同参数**重试，不能换 ID 重发。重复请求返回 existing:true 和原 runId。程序自有的发送前失败草稿可由 bridge 清理并恢复；其它已有草稿不会被覆盖。
 
 ## 关闭标签页
 

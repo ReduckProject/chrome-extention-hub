@@ -1,4 +1,5 @@
 (async () => {
+  const requiredAdapterVersion = 50;
   if (globalThis.chatGPTBridgeContentInstalled) return;
   globalThis.chatGPTBridgeContentInstalled = true;
   const documentId = crypto.randomUUID();
@@ -8,7 +9,7 @@
   try {
     // Explicit inventory injection already loads the current adapter first.
     // It must also repair pages while an older worker lacks load_adapter.
-    if (!(globalThis.ChatGPTBridgeAdapter?.version >= 42 && globalThis.ChatGPTBridgeAdapter?.snapshot)) {
+    if (!(globalThis.ChatGPTBridgeAdapter?.version >= requiredAdapterVersion && globalThis.ChatGPTBridgeAdapter?.snapshot)) {
       const loaded = await chrome.runtime.sendMessage({ type: 'load_adapter' });
       if (!loaded?.ok) throw new Error(loaded?.error || 'Background did not acknowledge adapter loading; reload the extension');
     }
