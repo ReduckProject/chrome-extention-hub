@@ -48,4 +48,5 @@ This project is indexed by GitNexus as **chrome-extention-hub** (992 symbols, 27
 - Any commit that changes runtime files under `chatgpt-web-bridge/extension/` must also increment `chatgpt-web-bridge/extension/manifest.json` `version` before the extension is rebuilt/reloaded.
 - For ordinary incremental builds, increment the final numeric component by 1 (for example `0.1.4` -> `0.1.5`) unless the user explicitly requests a different version.
 - Bump the extension version once per build/release batch, not once per changed file. Test-only or documentation-only changes that do not change the extension bundle do not require a bump.
+- After bumping or changing extension runtime files, run `npm run setup` from `chatgpt-web-bridge/` so `runtime/extension/` is regenerated from `extension/`; Chrome loads the runtime bundle, so refreshing Chrome alone is not sufficient. Verify `extension/manifest.json` and `runtime/extension/manifest.json` report the same version before asking the user to reload the extension.
 
