@@ -53,6 +53,7 @@ export class BridgeService {
     this.clients = new Map();
     this.browserStates = new Map();
     this.pending = new Map();
+    this.replayCommands = new Map();
     this.locks = new Map();
     this.operationContext = new AsyncLocalStorage();
     this.runProbes = new Map();
@@ -258,9 +259,10 @@ export class BridgeService {
   extension(ws) {
     let profileId = null;
     const helloTimer = setTimeout(() => ws.close(1008, 'Authentication required'), 4000);
-    ws.on('message', raw => {
+    ws.on('message', async raw => {
+      let eventId = null;
       try {
-        const message = JSON.parse(raw.toString());
+        let message = JSON.parse(raw.toString());
         if (!profileId) {
           if (message.type !== 'hello' || !tokenEquals(message.token, this.config.token) || !/^[a-zA-Z0-9-]{16,80}$/.test(message.profileId || '')) {
             ws.close(1008, 'Invalid authentication'); return;
@@ -273,8 +275,20 @@ export class BridgeService {
           this.browserStates.set(profileId, { browserSessionId: message.browserSessionId,
             connectedAt: Date.now(), inventoryAt: null, tabIds: null, errors: new Map() });
           this.store.connect(profileId);
-          ws.send(JSON.stringify({ type: 'welcome', protocol: 1 }));
+          ws.send(JSON.stringify({ type: 'welcome', protocol: 2 }));
+          for (const pending of this.pending.values()) if (pending.profileId === profileId && pending.message?.expiresAt > Date.now()) {
+            ws.send(JSON.stringify(pending.message));
+          }
+          for (const [id, replay] of this.replayCommands) {
+            if (replay.profileId !== profileId) continue;
+            if (!(replay.message?.expiresAt > Date.now())) { this.replayCommands.delete(id); continue; }
+            ws.send(JSON.stringify(replay.message));
+          }
           return;
+        }
+        if (message.type === 'journal') {
+          if (typeof message.eventId !== 'string' || !message.eventId || !message.payload || typeof message.payload !== 'object') return;
+          eventId = message.eventId; message = message.payload;
         }
         if (message.type === 'snapshot') {
           const key = `${profileId}:${message.snapshot?.browserSessionId || 'legacy'}:${message.snapshot?.tabId}`;
@@ -288,7 +302,7 @@ export class BridgeService {
             if (message.snapshot.observationError) browser.errors.set(message.snapshot.tabId, message.snapshot.observationError);
             else browser.errors.delete(message.snapshot.tabId);
           }
-          this.store.save().catch(error => this.logError(error));
+          await this.store.save();
           // A newly observed document must not reinject observers into every
           // other tab. Connection setup and explicit refresh_observers own that.
         } else if (message.type === 'invalidate' || message.type === 'inventory') {
@@ -320,9 +334,10 @@ export class BridgeService {
             }
           }
           this.scheduler.reconcileClosedTasks(profileId);
-          this.store.changed(); this.store.save().catch(error => this.logError(error));
+          this.store.changed(); await this.store.save();
         } else if (message.type === 'result') {
           const pending = this.pending.get(message.id);
+          const replay = this.replayCommands.get(message.id);
           if (pending?.profileId === profileId) {
             clearTimeout(pending.timer); this.pending.delete(message.id);
             if (message.error) {
@@ -334,6 +349,13 @@ export class BridgeService {
               } else pending.reject(new Error(errorText));
             }
             else pending.resolve(message.result);
+          } else if (replay?.profileId === profileId) {
+            this.replayCommands.delete(message.id);
+            const run = this.store.data.runs[message.id];
+            if (run && replay.message?.command === 'submit') {
+              this.store.submissionResult(run.id, message.error ? null : message.result, message.error || null);
+              await this.store.save();
+            }
           }
         } else if (message.type === 'download') {
           const run = this.store.data.runs[message.runId];
@@ -342,10 +364,11 @@ export class BridgeService {
           if (!value || !Number.isInteger(value.id)) return;
           const index = run.downloads.findIndex(d => d.id === value.id);
           if (index < 0) run.downloads.push(value); else run.downloads[index] = value;
-          this.store.changed(); this.store.save().catch(error => this.logError(error));
+          this.store.changed(); await this.store.save();
         } else if (message.type === 'heartbeat') {
           ws.send(JSON.stringify({ type: 'heartbeat', at: Date.now() }));
         }
+        if (eventId) ws.send(JSON.stringify({ type: 'journal_ack', eventIds: [eventId] }));
       } catch (error) { this.logError(error); }
     });
     ws.on('close', () => {
@@ -355,6 +378,7 @@ export class BridgeService {
         this.browserStates.delete(profileId);
         for (const [id, pending] of this.pending) if (pending.profileId === profileId) {
           clearTimeout(pending.timer); this.pending.delete(id);
+          if (pending.message?.expiresAt > Date.now()) this.replayCommands.set(id, { profileId, message: pending.message });
           pending.reject(new Error('Extension disconnected; command outcome may be unknown'));
         }
       }
@@ -426,14 +450,20 @@ export class BridgeService {
     if (!passive && !recovery && command !== 'stop') this.store.assertAccessAllowed(profileId);
     const ws = this.clients.get(profileId);
     if (!ws || ws.readyState !== 1) return Promise.reject(new Error('Chrome extension is not connected'));
+    const browser = this.browserStates.get(profileId);
+    const tab = Number.isInteger(params.tabId) && browser?.browserSessionId
+      ? this.store.data.tabs[`${profileId}:${browser.browserSessionId}:${params.tabId}`] : null;
+    const commandParams = params.documentId && Number.isInteger(tab?.navigationEpoch)
+      ? { ...params, navigationEpoch: tab.navigationEpoch } : params;
+    const message = { type: 'command', id, command, params: commandParams, expiresAt: Date.now() + timeoutMs };
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id); reject(new Error(`${command} observation timed out; execution outcome may be unknown`));
       }, timeoutMs);
-      this.pending.set(id, { resolve, reject, timer, profileId });
+      this.pending.set(id, { resolve, reject, timer, profileId, message });
       this.operationContext.getStore()?.browserCommands.push({ at: Date.now(), command,
         operation: params.assistantId?.operation, tabId: params.tabId });
-      ws.send(JSON.stringify({ type: 'command', id, command, params, expiresAt: Date.now() + timeoutMs }), error => {
+      ws.send(JSON.stringify(message), error => {
         if (error) { clearTimeout(timer); this.pending.delete(id); reject(error); }
       });
     });
@@ -573,7 +603,7 @@ export class BridgeService {
 
   async execute(method, params = {}, task = null) {
     switch (method) {
-      case 'health': return { ok: true, service: 'chatgpt-web-bridge', protocol: 1, version: '0.2.2', schedulerVersion: 2, accessRecoveryVersion: 2, connectedProfiles: [...this.clients.keys()], connections: this.connectionViews(), revision: this.store.data.revision };
+      case 'health': return { ok: true, service: 'chatgpt-web-bridge', protocol: 2, version: '0.2.2', schedulerVersion: 2, accessRecoveryVersion: 2, connectedProfiles: [...this.clients.keys()], connections: this.connectionViews(), revision: this.store.data.revision };
       case 'refresh_observers': {
         if (this.pending.size) throw new Error('Wait for outstanding page commands before updating observers');
         const profiles = params.profileId ? [params.profileId] : [...this.clients.keys()];

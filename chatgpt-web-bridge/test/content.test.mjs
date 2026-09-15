@@ -37,9 +37,9 @@ test('the first snapshot waits for the current adapter and duplicate bootstrap i
   assert.equal(f.snapshots.length, 0); assert.equal(f.listeners.length, 0);
   f.loaded(); await pending;
   assert.equal(f.snapshots.length, 1); assert.equal(f.snapshots[0].adapterVersion, 50);
-  assert.equal(f.snapshots[0].contentVersion, 6); assert.equal(f.listeners.length, 1);
+  assert.equal(f.snapshots[0].contentVersion, 7); assert.equal(f.listeners.length, 1);
   const probed = await new Promise(resolve => f.listeners[0]({ type: 'command', command: 'probe' }, { id: 'fixture-extension' }, resolve));
-  assert.equal(probed.result.adapterVersion, 50); assert.equal(probed.result.contentVersion, 6);
+  assert.equal(probed.result.adapterVersion, 50); assert.equal(probed.result.contentVersion, 7);
   await f.run(); assert.equal(f.listeners.length, 1); assert.equal(f.counts().loadCount, 1);
 });
 
@@ -58,7 +58,7 @@ test('explicitly preloaded current adapter recovers observations without a new w
   f.context.ChatGPTBridgeAdapter = { version: 50, snapshot: () => ({ adapterVersion: 50, activity: 'idle' }) };
   await f.run();
   assert.equal(f.counts().loadCount, 0); assert.equal(f.snapshots.length, 1);
-  assert.equal(f.snapshots[0].adapterVersion, 50); assert.equal(f.snapshots[0].contentVersion, 6);
+  assert.equal(f.snapshots[0].adapterVersion, 50); assert.equal(f.snapshots[0].contentVersion, 7);
   assert.equal(f.snapshots[0].observationError, undefined); assert.equal(f.listeners.length, 1);
 });
 
@@ -86,4 +86,17 @@ test('submit forwards attachment payload and expiry and confirms the background 
     expectedModel: 'Thinking', attachments, expiresAt: 1234, runId: 'upload-run' }, { id: 'fixture-extension' }, resolve));
   assert.equal(result.result.accepted, true); assert.deepEqual(forwarded, ['', 'Thinking', attachments, 1234]);
   assert.equal(beforeSend.runId, 'upload-run');
+});
+
+test('navigation epoch rejects commands created for an older SPA location', async () => {
+  const f = fixture(); f.context.ChatGPTBridgeAdapter = { version: 50, snapshot: () => ({ adapterVersion: 50 }) };
+  await f.run();
+  const first = f.snapshots.at(-1); assert.equal(first.navigationEpoch, 0);
+  f.context.location.href = 'https://chatgpt.com/c/next';
+  const stale = await new Promise(resolve => f.listeners[0]({ type: 'command', command: 'probe', documentId: 'document-fixture', navigationEpoch: 0 },
+    { id: 'fixture-extension' }, resolve));
+  assert.match(stale.error, /navigation epoch changed/);
+  const fresh = await new Promise(resolve => f.listeners[0]({ type: 'command', command: 'probe', documentId: 'document-fixture', navigationEpoch: 1 },
+    { id: 'fixture-extension' }, resolve));
+  assert.equal(fresh.result.navigationEpoch, 1);
 });

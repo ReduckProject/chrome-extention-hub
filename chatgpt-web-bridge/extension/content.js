@@ -3,6 +3,11 @@
   if (globalThis.chatGPTBridgeContentInstalled) return;
   globalThis.chatGPTBridgeContentInstalled = true;
   const documentId = crypto.randomUUID();
+  let navigationEpoch = 0, navigationUrl = location.href;
+  function currentNavigationEpoch() {
+    if (location.href !== navigationUrl) { navigationUrl = location.href; navigationEpoch++; lastSignature = undefined; }
+    return navigationEpoch;
+  }
   // Chrome can retain the manifest's old content-script source after an unpacked
   // extension's files are updated. Load the current adapter in this document
   // before reporting any state; never reinject other tabs to repair this one.
@@ -17,18 +22,18 @@
   } catch (error) {
     globalThis.chatGPTBridgeContentInstalled = false;
     chrome.runtime.sendMessage({ type: 'snapshot', snapshot: { url: location.href, documentId,
-      contentVersion: 6, adapterVersion: null, activity: 'unknown', composerReady: false,
+      contentVersion: 7, adapterVersion: null, activity: 'unknown', composerReady: false,
       bootstrapError: error.message,
       observationError: `Adapter bootstrap failed: ${error.message}`,
       contentSignature: 'adapter_bootstrap_failed' } }).catch(() => {});
     return;
   }
-  globalThis.chatGPTBridgeContentVersion = 6;
+  globalThis.chatGPTBridgeContentVersion = 7;
   const adapter = globalThis.ChatGPTBridgeAdapter;
   let timer, lastSignature;
   function emit(force = false) {
     try {
-      const state = { ...adapter.snapshot(), documentId, contentVersion: 6 };
+      const state = { ...adapter.snapshot(), documentId, navigationEpoch: currentNavigationEpoch(), contentVersion: 7 };
       const signature = JSON.stringify(state);
       if (force || signature !== lastSignature) {
         lastSignature = signature;
@@ -48,9 +53,11 @@
     if (sender.id !== chrome.runtime.id || message.type !== 'command') return false;
     (async () => {
       if (message.documentId && message.documentId !== documentId) throw new Error('Page document changed; refresh status before acting');
+      const commandEpoch = currentNavigationEpoch();
+      if (message.navigationEpoch !== undefined && message.navigationEpoch !== commandEpoch) throw new Error('Page navigation epoch changed; refresh status before acting');
       let result;
       switch (message.command) {
-        case 'probe': result = { ...adapter.snapshot(), documentId, contentVersion: 6 }; break;
+        case 'probe': result = { ...adapter.snapshot(), documentId, navigationEpoch: commandEpoch, contentVersion: 7 }; break;
         case 'models': result = await adapter.models(); break;
         case 'new_chat': result = await adapter.newChat(); break;
         case 'select_model': result = await adapter.selectModel(message.label); break;
@@ -65,6 +72,7 @@
         case 'click_download': result = adapter.clickDownload(message.assistantId, message.index); break;
         default: throw new Error('Unknown page command');
       }
+      if (currentNavigationEpoch() !== commandEpoch) throw new Error('Page navigated while command was executing; result discarded');
       emit(true);
       return result;
     })().then(result => respond({ result }), error => respond({ error: error.message }));

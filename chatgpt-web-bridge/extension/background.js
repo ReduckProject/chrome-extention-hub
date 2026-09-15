@@ -6,6 +6,58 @@ let armedDownload = null;
 const allowed = url => { try { const u = new URL(url); return u.protocol === 'https:' && u.hostname === 'chatgpt.com'; } catch { return false; } };
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 const send = value => { if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(value)); };
+const journalKey = 'bridgeJournalV1', commandReceiptPrefix = 'commandReceipt:';
+let journalTask = Promise.resolve();
+async function readJournal() {
+  const stored = await chrome.storage.session.get(journalKey);
+  return Array.isArray(stored[journalKey]) ? stored[journalKey] : [];
+}
+function publish(payload) {
+  const entry = { type: 'journal', eventId: crypto.randomUUID(), createdAt: Date.now(), payload };
+  journalTask = journalTask.then(async () => {
+    const entries = await readJournal();
+    entries.push(entry);
+    if (entries.length > 500) entries.splice(0, entries.length - 500);
+    await chrome.storage.session.set({ [journalKey]: entries });
+    send(entry);
+  }).catch(() => {});
+  return journalTask;
+}
+function drainJournal() {
+  journalTask = journalTask.then(async () => { for (const entry of await readJournal()) send(entry); }).catch(() => {});
+  return journalTask;
+}
+function acknowledgeJournal(eventIds) {
+  const accepted = new Set(Array.isArray(eventIds) ? eventIds : []);
+  if (!accepted.size) return Promise.resolve();
+  journalTask = journalTask.then(async () => {
+    const entries = (await readJournal()).filter(entry => !accepted.has(entry.eventId));
+    await chrome.storage.session.set({ [journalKey]: entries });
+  }).catch(() => {});
+  return journalTask;
+}
+async function executeDurable(message) {
+  const key = `${commandReceiptPrefix}${message.id}`;
+  const stored = await chrome.storage.session.get(key);
+  const prior = stored[key];
+  if (prior?.state === 'finished') {
+    if (prior.error) throw new Error(prior.error);
+    return prior.result;
+  }
+  const replaySafe = ['probe', 'read', 'models'].includes(message.command);
+  if (prior?.state === 'started' && !replaySafe && message.command !== 'submit') {
+    throw new Error(`Command ${message.command} outcome is unknown after worker restart`);
+  }
+  await chrome.storage.session.set({ [key]: { state: 'started', command: message.command, startedAt: prior?.startedAt || Date.now(), expiresAt: message.expiresAt } });
+  try {
+    const result = await execute(message);
+    await chrome.storage.session.set({ [key]: { state: 'finished', command: message.command, finishedAt: Date.now(), result } });
+    return result;
+  } catch (error) {
+    await chrome.storage.session.set({ [key]: { state: 'finished', command: message.command, finishedAt: Date.now(), error: error.message } });
+    throw error;
+  }
+}
 const conversationListRuleId = 1001;
 const conversationListRule = {
   id: conversationListRuleId,
@@ -97,7 +149,7 @@ async function relay(tab, snapshot) {
   const ids = await getIdentity();
   const value = { ...snapshot, tabId: tab.id, browserSessionId: ids.browserSessionId, frozen: !!tab.frozen, discarded: !!tab.discarded, observedAt: Date.now() };
   observations.set(tab.id, value);
-  send({ type: 'snapshot', snapshot: value });
+  publish({ type: 'snapshot', snapshot: value });
 }
 async function content(tabId, command, params = {}) {
   await page(tabId);
@@ -113,13 +165,13 @@ async function probe(tabId) {
 }
 async function inventory({ inject = false } = {}) {
   const tabs = await chrome.tabs.query({ url: 'https://chatgpt.com/*' });
-  send({ type: 'inventory', ...(await getIdentity()), tabIds: tabs.map(t => t.id) });
+  publish({ type: 'inventory', ...(await getIdentity()), tabIds: tabs.map(t => t.id) });
   await Promise.allSettled(tabs.map(async tab => {
     if (inject && !tab.frozen && !tab.discarded) {
       await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['adapter.js', 'content.js'] });
     }
     try { await probe(tab.id); }
-    catch (error) { send({ type: 'invalidate', tabId: tab.id, ...(await getIdentity()), reason: error.message }); }
+    catch (error) { publish({ type: 'invalidate', tabId: tab.id, ...(await getIdentity()), reason: error.message }); }
   }));
 }
 function locked(key, action) {
@@ -166,7 +218,7 @@ async function execute(message) {
       if (current.url !== params.url || current.pendingUrl) throw new Error('Page is navigating; no tab was closed');
       await chrome.tabs.remove(params.tabId);
       observations.delete(params.tabId);
-      send({ type: 'invalidate', ...ids, tabId: params.tabId, closed: true, reason: 'Tab closed' });
+      await publish({ type: 'invalidate', ...ids, tabId: params.tabId, closed: true, reason: 'Tab closed' });
       return { closed: true, tabId: params.tabId, ...ids };
     }
     // The receipt is written before touching the send button. A lost reply never licenses another click.
@@ -199,10 +251,11 @@ function connect() {
     current.onmessage = event => {
       let message;
       try { message = JSON.parse(event.data); } catch { return; }
-      if (message.type === 'welcome') { inventory({ inject: true }).catch(() => {}); restoreDownloads().catch(() => {}); return; }
+      if (message.type === 'welcome') { inventory({ inject: true }).catch(() => {}); restoreDownloads().catch(() => {}); drainJournal(); return; }
+      if (message.type === 'journal_ack') { acknowledgeJournal(message.eventIds); return; }
       if (message.type !== 'command') return;
-      execute(message).then(result => send({ type: 'result', id: message.id, result }),
-        error => send({ type: 'result', id: message.id, error: error.message }));
+      executeDurable(message).then(result => publish({ type: 'result', id: message.id, result }),
+        error => publish({ type: 'result', id: message.id, error: error.message }));
     };
     current.onclose = () => {
       if (socket !== current) return;
@@ -247,14 +300,14 @@ chrome.downloads.onCreated.addListener(item => {
   trackedDownloads.set(item.id, association);
   chrome.storage.local.set({ [`download-id:${item.id}`]: association }).catch(() => {});
   const record = { ...item, correlation: association.correlation, originalVerified: false };
-  send({ type: 'download', runId: pending.runId, download: record });
+  publish({ type: 'download', runId: pending.runId, download: record });
   armedDownload = null; pending.resolve(record);
 });
 chrome.downloads.onChanged.addListener(async delta => {
   const association = trackedDownloads.get(delta.id) || (await chrome.storage.local.get(`download-id:${delta.id}`))[`download-id:${delta.id}`];
   if (!association) return;
   const [item] = await chrome.downloads.search({ id: delta.id });
-  if (item) send({ type: 'download', runId: association.runId, download: { ...item, correlation: association.correlation, originalVerified: false } });
+  if (item) publish({ type: 'download', runId: association.runId, download: { ...item, correlation: association.correlation, originalVerified: false } });
 });
 async function restoreDownloads() {
   const values = await chrome.storage.local.get(null);
@@ -263,7 +316,7 @@ async function restoreDownloads() {
     const id = Number(key.slice('download-id:'.length));
     if (!Number.isInteger(id)) continue;
     const [item] = await chrome.downloads.search({ id });
-    if (item) send({ type: 'download', runId: association.runId, download: { ...item, correlation: association.correlation, originalVerified: false } });
+    if (item) publish({ type: 'download', runId: association.runId, download: { ...item, correlation: association.correlation, originalVerified: false } });
   }
 }
 chrome.runtime.onMessage.addListener((message, sender, respond) => {
@@ -306,12 +359,12 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
 });
 chrome.tabs.onUpdated.addListener((tabId, change, tab) => {
   if (!allowed(tab.url)) return;
-  if (change.discarded || change.frozen) getIdentity().then(ids => send({ type: 'invalidate', ...ids, tabId, reason: 'Tab suspended or discarded' }));
+  if (change.discarded || change.frozen) getIdentity().then(ids => publish({ type: 'invalidate', ...ids, tabId, reason: 'Tab suspended or discarded' }));
   if (change.status === 'complete') probe(tabId).catch(() => {});
 });
 chrome.tabs.onRemoved.addListener(tabId => {
   observations.delete(tabId);
-  getIdentity().then(ids => send({ type: 'invalidate', ...ids, tabId, closed: true, reason: 'Tab closed' }));
+  getIdentity().then(ids => publish({ type: 'invalidate', ...ids, tabId, closed: true, reason: 'Tab closed' }));
 });
 chrome.alarms.onAlarm.addListener(alarm => {
   if (alarm.name === 'bridge-reconnect') connect();

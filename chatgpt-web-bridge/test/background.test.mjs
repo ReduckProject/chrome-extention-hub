@@ -73,7 +73,7 @@ test('close removes only the identified idle tab and reports its removal', async
   const result = await closeTab(f);
   assert.equal(result.closed, true); assert.equal(result.tabId, 1);
   assert.deepEqual(f.removed, [1]); assert.equal(await f.exec('observations.has(1)'), false);
-  assert.ok(f.sockets[0].sent.some(m => m.type === 'invalidate' && m.closed && m.tabId === 1));
+  assert.ok(f.sockets[0].sent.some(m => m.type === 'journal' && m.payload?.type === 'invalidate' && m.payload.closed && m.payload.tabId === 1));
 });
 
 test('close rejects wrong identity, unsaved results and a changed page without removing any tab', async () => {
@@ -167,4 +167,27 @@ test('WebSocket close schedules reconnection without blocking the worker', async
   await exec('conversationListBlockUntil = Date.now() - 1');
   await timers.find(timer => timer.ms === 30000).callback();
   assert.deepEqual(ruleUpdates.map(update => update.addRules?.length || 0), [0, 1, 0]);
+});
+
+test('journal survives disconnect and drains the same event identity after welcome', async () => {
+  const f = fixture(); await f.exec('getIdentity()'); await new Promise(resolve => setImmediate(resolve));
+  await f.exec("publish({type:'snapshot',snapshot:{tabId:1}})");
+  const stored = f.storage.session.bridgeJournalV1; assert.equal(stored.length, 1);
+  const id = stored[0].eventId;
+  f.sockets[0].readyState = 1; f.sockets[0].onopen();
+  f.sockets[0].onmessage({ data: JSON.stringify({ type: 'welcome', protocol: 2 }) });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.ok(f.sockets[0].sent.some(m => m.type === 'journal' && m.eventId === id));
+  f.sockets[0].onmessage({ data: JSON.stringify({ type: 'journal_ack', eventIds: [id] }) });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.storage.session.bridgeJournalV1.some(entry => entry.eventId === id), false);
+});
+
+test('durable command receipt replays a finished command without a second side effect', async () => {
+  const f = fixture();
+  const message = { id: 'durable-send', command: 'submit', expiresAt: Date.now() + 5000,
+    params: { tabId: 1, prompt: 'test', runId: 'durable-run' } };
+  const first = await f.exec(`executeDurable(${JSON.stringify(message)})`);
+  const second = await f.exec(`executeDurable(${JSON.stringify(message)})`);
+  assert.equal(first.accepted, true); assert.equal(second.accepted, true); assert.equal(f.clicks.length, 1);
 });
